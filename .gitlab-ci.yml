@@ -1,0 +1,81 @@
+# Portable build and validation rules.
+stages:
+  - test
+
+
+workflow:
+  auto_cancel:
+    on_new_commit: conservative
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+# The reference writer/reader, and the packaging invariants that keep the
+# schema shipped as a wheel data-file.
+# NOTE: python/tests/test_reference_writer.py cross-checked this schema
+# against vibe-qc's copy and now skips ("canonical schema not present
+# (standalone checkout)"). That is correct here -- qvf must not depend on
+# vibe-qc -- so the check runs in the other direction instead: vibe-qc and
+# vibe-view each fetch this repository at a pinned tag and assert their
+# vendored schema matches, then run the corpus below.
+
+python-tests:
+  stage: test
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  cache:
+    - key: pip-qvf-python313
+      paths:
+        - .cache/pip/
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends git
+  script:
+    - python .githooks/test_privacy_hook.py -q
+    - pip install -e "python/[validate]" pytest
+    - python -m pytest python/tests -q
+
+# The corpus is the format's real contract: 12 archives, each with an
+# expected-result file naming the sections and values a conformant consumer
+# must decode. A consumer in any language can implement the same loop.
+
+conformance:
+  stage: test
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  script:
+    - pip install -e "python/[validate]"
+    - python conformance/run_conformance.py
+
+# Zero external dependencies -- only the C++17 standard library.
+
+cpp-tests:
+  stage: test
+  image: debian:12-slim
+  tags:
+    - docker
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends g++ cmake ninja-build
+  script:
+    - cmake -S cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build-cpp
+    - ctest --test-dir build-cpp --output-on-failure
+
+# The single-header amalgamation is generated; a stale copy is a silent
+# divergence from the sources an adopter would otherwise vendor.
+
+amalgamation-current:
+  stage: test
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  script:
+    - python scripts/amalgamate.py --check

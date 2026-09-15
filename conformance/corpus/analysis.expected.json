@@ -1,0 +1,44 @@
+{
+  "archive": "analysis.qvf",
+  "description": "Analysis sections: atom_properties (float64 [n_atoms]), bond_orders, scf_history.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "bond_orders",
+    "scf_history",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.34,
+      "tol": 1e-09
+    },
+    {
+      "section": "bond_orders",
+      "member": "bond_orders",
+      "json_pointer": [
+        "pairs",
+        0,
+        "order"
+      ],
+      "equals": 0.98,
+      "tol": 1e-09
+    },
+    {
+      "section": "scf_history",
+      "member": "iterations",
+      "json_pointer": [
+        "iterations",
+        1,
+        "energy_eh"
+      ],
+      "equals": -75.9,
+      "tol": 1e-09
+    }
+  ]
+}

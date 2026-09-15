@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use the QVF format or this toolkit, please cite it as below."
+title: "QVF: the Quantum Visualization Format — specification and reference implementation"
+abstract: >
+  QVF is an open container format for quantum-chemistry visualization and
+  analysis data: a zip archive with a typed, versioned JSON manifest and
+  per-section payloads. This repository carries the normative
+  specification, the JSON schema, the registry of canonical section
+  kinds, a conformance corpus, and reference writer/reader
+  implementations in Python and zero-dependency C++17 with a C ABI. It is
+  licensed Apache-2.0 so that any code can adopt the format without
+  adopting vibe-qc.
+type: software
+authors:
+  - family-names: Peintinger
+    given-names: Michael F.
+    website: "https://vibe-qc.com/"
+version: 0.1.0
+url: "https://vibe-qc.com/docs/qvf/"
+repository-code: "https://github.com/vibe-qc/qvf"
+license: Apache-2.0
+keywords:
+  - file format
+  - quantum chemistry
+  - interoperability
+  - wavefunction

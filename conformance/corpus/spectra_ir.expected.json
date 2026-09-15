@@ -1,0 +1,63 @@
+{
+  "archive": "spectra_ir.qvf",
+  "description": "IR spectrum (cm^-1 / km*mol^-1) with root provenance + dipole metadata.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "spectra.ir",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        0
+      ],
+      "equals": 2143.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "intensities",
+        0
+      ],
+      "equals": 500.0,
+      "tol": 1e-09
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "functional"
+      ],
+      "equals": "PBE"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "scf_energy",
+        "value"
+      ],
+      "equals": -113.3,
+      "tol": 1e-09
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "scf_energy",
+        "units"
+      ],
+      "equals": "Eh"
+    },
+    {
+      "manifest_pointer": [
+        "dipole_moment",
+        "total_debye"
+      ],
+      "equals": 0.11,
+      "tol": 1e-09
+    }
+  ]
+}

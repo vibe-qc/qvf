@@ -1,0 +1,62 @@
+{
+  "archive": "job_spec.qvf",
+  "description": "job.spec: a pending container \u2014 structure + declarative job request (provenance.run_status = 'pending'), the executable-input half of run.record.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "job.spec",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "pending"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "job_type"
+      ],
+      "equals": "periodic"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "method"
+      ],
+      "equals": "rks"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "kpoints",
+        1
+      ],
+      "equals": 4
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "tasks",
+        0
+      ],
+      "equals": "single_point"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "options",
+        "cutoff_ha"
+      ],
+      "equals": 300.0,
+      "tol": 1e-09
+    }
+  ]
+}

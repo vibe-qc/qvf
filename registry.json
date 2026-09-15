@@ -1,0 +1,108 @@
+{
+  "format": "QVF",
+  "description": "Machine-readable registry of QVF canonical section kinds and registered vendor namespaces. Governed per GOVERNANCE.md; the canonical_kinds list is drift-guarded against spec/qvf_manifest.schema.json.",
+  "steward": {
+    "name": "vibe-qc",
+    "url": "https://vibe-qc.com",
+    "note": "QVF was created by and is stewarded by the vibe-qc project. The spec and reference implementations are Apache-2.0 and the format is producer-neutral; see GOVERNANCE.md."
+  },
+  "spec_version": "1",
+  "schema_id": "https://vibe-qc.org/spec/qvf/1/manifest.schema.json",
+  "producible_versions": [1],
+  "readable_versions": [1, 2],
+  "version_decisions": [
+    {
+      "version": 2,
+      "status": "withdrawn",
+      "decided": "2026-07-10",
+      "emitted_by": "vibe-qc v0.10.0 - v0.15.x (periodic reaction.path only)",
+      "summary": "Withdrawn: the whole schema-visible delta was one optional member (`lattice` on `reaction.path`), which is the additive case and must not bump qvf_version. `lattice` is now an optional member of v1; a periodic reaction path is detected by its presence.",
+      "compatibility": "Producers MUST NOT emit qvf_version 2. Consumers SHOULD accept it and treat it as 1 (archives already exist in the wild). qvf_manifest_v2.schema.json is retained as a frozen artifact resolving its $id; it is a strict superset of v1.",
+      "see": "GOVERNANCE.md#version-history-and-decisions"
+    }
+  ],
+  "canonical_kinds": [
+    "structure",
+    "bonds",
+    "bond_orders",
+    "volume.density",
+    "volume.orbital",
+    "volume.spin",
+    "volume.elf",
+    "volume.difference",
+    "volume.potential",
+    "volume.rdg",
+    "volume.generic",
+    "wavefunction.gto",
+    "basis.ao",
+    "atom_properties",
+    "trajectory",
+    "reaction.path",
+    "reaction.waypoints",
+    "scan.surface",
+    "vibrations",
+    "spectra.ir",
+    "spectra.raman",
+    "spectra.uvvis",
+    "spectra.ecd",
+    "spectra.vcd",
+    "spectra.nmr",
+    "spectra.epr",
+    "spectra.generic",
+    "bands",
+    "dos.total",
+    "dos.projected",
+    "dos.coop",
+    "dos.cohp",
+    "structure.symmetry",
+    "scf_history",
+    "citations",
+    "equation_of_state",
+    "fermi_surface",
+    "phonon_bands",
+    "phonon_dos",
+    "topology.qtaim",
+    "run.record",
+    "job.spec"
+  ],
+  "reserved_kinds": [
+    "volume.orbital_projection",
+    "topology.elf_basins",
+    "projections.lcao"
+  ],
+  "vendor_namespaces": [
+    {
+      "namespace": "x_vibeqc",
+      "owner": "vibe-qc",
+      "url": "https://vibe-qc.com",
+      "purpose": "First-party vendor data that is not part of the visualization contract: restart-only per-k complex Bloch wavefunctions (x_vibeqc.bloch_wavefunction) and live-checkpoint hints."
+    },
+    {
+      "namespace": "x_orca",
+      "owner": "ORCA",
+      "url": "https://www.faccts.de/orca/",
+      "status": "reserved",
+      "purpose": "ORCA-specific data with no canonical kind. (EPR started here as x_orca.epr and was promoted to the canonical spectra.epr kind.)"
+    }
+  ],
+  "promotions": [
+    {
+      "kind": "job.spec",
+      "from": null,
+      "promoted_in": "1 (2026-07)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). Declarative specification of the calculation an archive requests (job_type, method, basis, functional, charge, multiplicity, kpoints, tasks, options), making a QVF archive an executable input a runner can execute and update in place. Complements run.record — the request vs. the record of what ran. Carries data, never code."
+    },
+    {
+      "kind": "run.record",
+      "from": null,
+      "promoted_in": "1 (2026-07)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). Carries the verbatim program input, full log/output, and auxiliary attachments of one program invocation, making a QVF archive a self-contained record of a calculation. Producer-neutral: the section's `program` field names the code that ran, independent of root `source.program`."
+    },
+    {
+      "kind": "spectra.epr",
+      "from": "x_orca.epr",
+      "promoted_in": "1 (2026-07)",
+      "note": "Promoted by maintainer decision ahead of the two-producer threshold to give ORCA a canonical target for EPR (g-tensor / hyperfine / zero-field-splitting)."
+    }
+  ]
+}

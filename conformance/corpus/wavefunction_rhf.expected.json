@@ -1,0 +1,59 @@
+{
+  "archive": "wavefunction_rhf.qvf",
+  "description": "Restricted wavefunction.gto; coefficients on N_i-normalized primitives (the N_i divide is the key contract; see spec Appendix A.1).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 4
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        0,
+        "coefficients",
+        0
+      ],
+      "equals": 0.8418624873205295,
+      "tol": 1e-09
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        0,
+        "pure"
+      ],
+      "equals": true
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "spin"
+      ],
+      "equals": "restricted"
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    }
+  ]
+}

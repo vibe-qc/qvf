@@ -1,0 +1,32 @@
+{
+  "archive": "spectra_epr.qvf",
+  "description": "Canonical spectra.epr: g-tensor / hyperfine / ZFS; g dimensionless, A and D in MHz.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "spectra.epr",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "spectra_epr",
+      "member": "spectrum",
+      "json_pointer": [
+        "g_tensor",
+        "principal",
+        2
+      ],
+      "equals": 2.0089,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_epr",
+      "member": "spectrum",
+      "json_pointer": [
+        "zero_field_splitting",
+        "d_mhz"
+      ],
+      "equals": 1200.0,
+      "tol": 1e-09
+    }
+  ]
+}

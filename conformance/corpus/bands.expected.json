@@ -1,0 +1,41 @@
+{
+  "archive": "bands.qvf",
+  "description": "Band structure; eigenvalues [n_spin, n_kpoints, n_bands] in eV.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "bands",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "bands0",
+      "member": "kpath",
+      "json_pointer": [
+        "n_bands"
+      ],
+      "equals": 3
+    },
+    {
+      "section": "bands0",
+      "member": "eigenvalues",
+      "binary_index": [
+        0,
+        0,
+        0
+      ],
+      "equals": -5.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "bands0",
+      "member": "eigenvalues",
+      "binary_index": [
+        0,
+        7,
+        2
+      ],
+      "equals": 5.0,
+      "tol": 1e-09
+    }
+  ]
+}

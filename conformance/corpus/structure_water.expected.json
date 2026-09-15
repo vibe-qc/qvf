@@ -1,0 +1,66 @@
+{
+  "archive": "structure_water.qvf",
+  "description": "Minimal molecular structure (H2O) with explicit bonds; Angstrom.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "qvf_version"
+      ],
+      "equals": 1
+    },
+    {
+      "manifest_pointer": [
+        "source",
+        "program"
+      ],
+      "equals": "qvf-conformance"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        0,
+        "symbol"
+      ],
+      "equals": "O"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "position",
+        1
+      ],
+      "equals": 0.7572,
+      "tol": 1e-09
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        0,
+        "atomic_number"
+      ],
+      "equals": 8
+    },
+    {
+      "section": "structure",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        0,
+        "order"
+      ],
+      "equals": 1.0,
+      "tol": 1e-09
+    }
+  ]
+}

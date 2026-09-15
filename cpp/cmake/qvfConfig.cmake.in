@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+# qvf has zero external dependencies, so there is nothing to find here — just
+# pull in the exported target(s).
+include("${CMAKE_CURRENT_LIST_DIR}/qvfTargets.cmake")
+
+check_required_components(qvf)

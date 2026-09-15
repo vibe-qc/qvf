@@ -1,0 +1,42 @@
+{
+  "archive": "volume_density.qvf",
+  "description": "volume.density grid; origin + voxel_vectors in bohr, float32 [nx,ny,nz].",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.density"
+  ],
+  "checks": [
+    {
+      "section": "rho",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 6
+    },
+    {
+      "section": "rho",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        0,
+        0
+      ],
+      "equals": 0.5,
+      "tol": 1e-09
+    },
+    {
+      "section": "rho",
+      "member": "data",
+      "binary_index": [
+        1,
+        2,
+        3
+      ],
+      "equals": 0.2393694370985031,
+      "tol": 1e-06
+    }
+  ]
+}

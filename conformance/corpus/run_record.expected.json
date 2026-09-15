@@ -1,0 +1,62 @@
+{
+  "archive": "run_record.qvf",
+  "description": "run.record: verbatim program input + full log + attachment, making the archive a self-contained record of the calculation.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "run.record",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "program"
+      ],
+      "equals": "democode"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "program_version"
+      ],
+      "equals": "1.0.0"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "exit_status"
+      ],
+      "equals": 0
+    },
+    {
+      "section": "run_record",
+      "member": "input",
+      "decode": "utf8",
+      "equals": "! RHF STO-3G TightSCF\n* xyz 0 1\nO  0.0000  0.0000  0.1173\nH  0.0000  0.7572 -0.4692\nH  0.0000 -0.7572 -0.4692\n*\n"
+    },
+    {
+      "section": "run_record",
+      "member": "log",
+      "decode": "utf8",
+      "contains": "FINAL SINGLE POINT ENERGY  -74.965901"
+    },
+    {
+      "section": "run_record",
+      "member": "files",
+      "json_pointer": [
+        "input",
+        "filename"
+      ],
+      "equals": "water.inp"
+    },
+    {
+      "section": "run_record",
+      "member": "attachment.geom",
+      "decode": "utf8",
+      "contains": "water"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "archive": "vendor.qvf",
+  "description": "Vendor namespace (x_demo.*) with an extensions governance declaration.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "x_demo.custom"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "extensions",
+        "x_demo",
+        "version"
+      ],
+      "equals": "1.0"
+    },
+    {
+      "section": "x_demo_custom",
+      "member": "payload",
+      "json_pointer": [
+        "answer"
+      ],
+      "equals": 42
+    }
+  ]
+}

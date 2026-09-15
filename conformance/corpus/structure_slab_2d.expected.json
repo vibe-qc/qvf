@@ -1,0 +1,56 @@
+{
+  "archive": "structure_slab_2d.qvf",
+  "description": "2-D slab (graphene): pbc [true, true, false], dimensionality 2. Lattice row 2 is a non-physical synthesized normal, present only so the matrix stays full-rank 3x3; it is not a cell edge.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "pbc",
+        0
+      ],
+      "equals": true
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "pbc",
+        1
+      ],
+      "equals": true
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "pbc",
+        2
+      ],
+      "equals": false
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "dimensionality"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        2,
+        2
+      ],
+      "equals": 15.875,
+      "tol": 1e-09
+    }
+  ]
+}

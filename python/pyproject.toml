@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qvf-writer"
+version = "0.1.0"
+description = "Standalone reference writer/reader for the QVF (Quantum Visualization Format) quantum-chemistry container"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "vibe-qc authors", email = "mpei@vibe-qc.com" }]
+keywords = ["quantum-chemistry", "qvf", "file-format", "wavefunction", "spectra"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+# Full JSON-Schema structural validation (semantic checks always run without it).
+validate = ["jsonschema>=4"]
+
+[project.urls]
+Homepage = "https://vibe-qc.com/docs/qvf/"
+Documentation = "https://vibe-qc.com/docs/qvf/"
+Source = "https://github.com/vibe-qc/qvf"
+
+[project.scripts]
+qvf-validate = "qvf_reader:_main_entrypoint"
+
+[tool.setuptools]
+py-modules = ["qvf_writer", "qvf_reader"]
+license-files = ["LICENSE", "NOTICE"]
+
+[tool.setuptools.data-files]
+# Installed relative to sys.prefix; _find_schema() probes here in a wheel.
+"share/qvf-writer" = ["qvf_manifest.schema.json"]

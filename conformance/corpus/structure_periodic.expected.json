@@ -1,0 +1,30 @@
+{
+  "archive": "structure_periodic.qvf",
+  "description": "Periodic structure (MgO) with a cubic lattice; row vectors, Angstrom.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "pbc",
+        0
+      ],
+      "equals": true
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        0,
+        0
+      ],
+      "equals": 4.2,
+      "tol": 1e-09
+    }
+  ]
+}

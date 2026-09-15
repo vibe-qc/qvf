@@ -1,0 +1,13 @@
+# Local source archives stay in dist/ or an explicit external output directory.
+dist/
+cpp/build/
+__pycache__/
+*.pyc
+*.qvf
+# …but the conformance golden corpus is committed frozen test vectors.
+!conformance/corpus/*.qvf
+.pytest_cache/
+# Python packaging build artifacts.
+build/
+*.egg-info/
+python/dist/

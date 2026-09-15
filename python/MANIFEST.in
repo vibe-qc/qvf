@@ -1,0 +1,5 @@
+include README.md
+include qvf_manifest.schema.json
+recursive-include examples *.py
+include LICENSE
+include NOTICE
