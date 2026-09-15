@@ -28,6 +28,51 @@
   },
   {
     "changed": false,
+    "export_sha256": "f656be4b71b9b20d441ac3c02238324d7fec3c53dcaa735cadb8d653b08b1cad",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/bug.yml",
+    "reasons": [],
+    "source_blob": "f29506a539a5dbb2b092d6d6d7568377cb05f046",
+    "source_sha256": "f656be4b71b9b20d441ac3c02238324d7fec3c53dcaa735cadb8d653b08b1cad"
+  },
+  {
+    "changed": false,
+    "export_sha256": "2fc95c13d0494f2482184b1bfa3d5457a886dd66504ba56931958d9ef1b0f2c9",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/config.yml",
+    "reasons": [],
+    "source_blob": "830e79480d1fc9e6e5f0ebb8cef1d6fc02e90dd8",
+    "source_sha256": "2fc95c13d0494f2482184b1bfa3d5457a886dd66504ba56931958d9ef1b0f2c9"
+  },
+  {
+    "changed": false,
+    "export_sha256": "ea1335f43e41628562ec17abb24974d8cda1add7265c9fba1c614012c39d1ca9",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/feature.yml",
+    "reasons": [],
+    "source_blob": "8543e05c0a0fb5c149102fb29e172898b586ee45",
+    "source_sha256": "ea1335f43e41628562ec17abb24974d8cda1add7265c9fba1c614012c39d1ca9"
+  },
+  {
+    "changed": false,
+    "export_sha256": "f0f7e865ffa5a63b7908decddeacbb1d662984cd95c0c224981d1599d61aef96",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/question.yml",
+    "reasons": [],
+    "source_blob": "fb9b5e66f73ddc6e26e9f85e67e4784ba7a75f6b",
+    "source_sha256": "f0f7e865ffa5a63b7908decddeacbb1d662984cd95c0c224981d1599d61aef96"
+  },
+  {
+    "changed": false,
+    "export_sha256": "0228edb9555fa55544df38e9a2773ca37ef15005a97361fed9983efdffce513f",
+    "mode": "100644",
+    "path": ".github/pull_request_template.md",
+    "reasons": [],
+    "source_blob": "b16bee358adf63a7664c3c4318f03223b63a90fb",
+    "source_sha256": "0228edb9555fa55544df38e9a2773ca37ef15005a97361fed9983efdffce513f"
+  },
+  {
+    "changed": false,
     "export_sha256": "0138b6d8aef41a479f1604cd6d9f8cd05b7da999ad499f340e0efaaa98f6bae9",
     "mode": "100644",
     "path": ".gitignore",

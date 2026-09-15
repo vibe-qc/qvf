@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a format, validator, reader, writer or installation problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Report security problems privately using SECURITY.md.
+        Before attaching files, remove credentials, private machine/account names and personal paths.
+  - type: input
+    id: release
+    attributes:
+      label: Release and commit
+      description: Include the QVF version, affected producer or reader version, and commit ID if known.
+    validations:
+      required: true
+  - type: input
+    id: operating_system
+    attributes:
+      label: Operating system and architecture
+      placeholder: "For example: Ubuntu 24.04, x86-64"
+    validations:
+      required: true
+  - type: dropdown
+    id: install_route
+    attributes:
+      label: Installation route
+      options:
+        - C++ CMake install
+        - pip or wheel
+        - Source build
+        - Container
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: minimal_input
+    attributes:
+      label: Minimal input and reproduction command
+      description: Include the smallest QVF file or input that reproduces the problem, the schema version, and exact producer/validator/reader commands.
+    validations:
+      required: true
+  - type: textarea
+    id: output_manifest
+    attributes:
+      label: Output and system manifest
+      description: Attach relevant validator/reader logs and the producer .out and .system manifest after reviewing them for private data. If the producer does not create either file, explain that here.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: For numerical differences, give the reference, units, settings and tolerance.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Include the error or numerical difference and whether an earlier release worked.
+    validations:
+      required: true
