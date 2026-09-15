@@ -25,9 +25,22 @@ def load_terms(root: Path) -> tuple[str, ...]:
     if not selected or not Path(selected).is_absolute():
         raise ValueError("configured private-policy file needs an absolute external path")
     try:
-        path = Path(selected).resolve(strict=True)
+        supplied = Path(selected)
+        path = supplied.resolve(strict=True)
         if path.is_relative_to(root.resolve()):
             raise ValueError("private-policy file must be outside the source checkout")
+        # Check both names: neither a symlink into Git nor a symlink out of
+        # a checkout is an external configuration interface. Include other
+        # worktrees, linked-worktree markers and bare object stores.
+        for candidate in (supplied, path):
+            for parent in candidate.parents:
+                marker = parent / ".git"
+                if (parent.name.casefold() == ".git" or marker.exists()
+                        or marker.is_symlink()
+                        or ((parent / "HEAD").is_file()
+                            and (parent / "objects").is_dir()
+                            and (parent / "refs").is_dir())):
+                    raise ValueError("private-policy file must be outside Git repositories and object stores")
         terms = tuple(line.strip().casefold() for line in path.read_text(encoding="utf-8").splitlines()
                       if line.strip())
     except (OSError, UnicodeError) as error:

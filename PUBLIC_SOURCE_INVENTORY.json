@@ -10,21 +10,21 @@
   },
   {
     "changed": false,
-    "export_sha256": "5d8608ff2f79fab14e814767fe9ff903aed1efe1d0dee73f1ed82a27467817d1",
+    "export_sha256": "2cc5fa2b52cc88e9b8dcfa2581d8f99d572d1ab709ca45464eadecbbbc46a47a",
     "mode": "100644",
     "path": ".githooks/private_terms.py",
     "reasons": [],
-    "source_blob": "d4b565260067abd0ad2165ea5c28ef2f34fe67c4",
-    "source_sha256": "5d8608ff2f79fab14e814767fe9ff903aed1efe1d0dee73f1ed82a27467817d1"
+    "source_blob": "96c393c4ddd903b994c6bf8472386860af8e6c57",
+    "source_sha256": "2cc5fa2b52cc88e9b8dcfa2581d8f99d572d1ab709ca45464eadecbbbc46a47a"
   },
   {
     "changed": false,
-    "export_sha256": "5623397bd57e41608e7ed3c991cc4fe94303adc9a543f4e63788924faecacb65",
+    "export_sha256": "d6e10ca3b5f43133ddcdcf0db9889998fb17ae8249be0acd0cce765c4e409011",
     "mode": "100644",
     "path": ".githooks/test_privacy_hook.py",
     "reasons": [],
-    "source_blob": "8abbd4d0917a2fd974f5b9e52bc83fd492ae03f2",
-    "source_sha256": "5623397bd57e41608e7ed3c991cc4fe94303adc9a543f4e63788924faecacb65"
+    "source_blob": "b0b2e04ffbc7d9da4a21d532ae78f7dee2521d27",
+    "source_sha256": "d6e10ca3b5f43133ddcdcf0db9889998fb17ae8249be0acd0cce765c4e409011"
   },
   {
     "changed": false,
@@ -102,12 +102,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "b572bc26a0ba851d1b34d504bd15d6ebca33e7ea0402cb64cb2d235d2c41acb1",
+    "export_sha256": "1d374ff945fdcc1c525656440642f3bfb852a4282d46ad028ae03aa16d8bc264",
     "mode": "100644",
     "path": "CONTRIBUTING.md",
     "reasons": [],
-    "source_blob": "4e6911f01e66be0953a60d7fb8f03b70a6bbaf60",
-    "source_sha256": "b572bc26a0ba851d1b34d504bd15d6ebca33e7ea0402cb64cb2d235d2c41acb1"
+    "source_blob": "65225cad2f42f07d114af19f7576ba0f873d3eac",
+    "source_sha256": "1d374ff945fdcc1c525656440642f3bfb852a4282d46ad028ae03aa16d8bc264"
   },
   {
     "changed": false,
@@ -135,6 +135,15 @@
     "reasons": [],
     "source_blob": "01b2155afa9a6c439ab886e94b95d24cafe27773",
     "source_sha256": "7b22d9caca4aaae069c19079ec0b69979d6a88187d29d2e818e13914a481a963"
+  },
+  {
+    "changed": false,
+    "export_sha256": "a3554f5e5ec2b9eb201dd1d2283da587c38bc9364da06ac010232c1225c40b9c",
+    "mode": "100644",
+    "path": "PUBLICATION.md",
+    "reasons": [],
+    "source_blob": "bcb420f5dcd670ea8807e5ccfcecaaf4c087e81b",
+    "source_sha256": "a3554f5e5ec2b9eb201dd1d2283da587c38bc9364da06ac010232c1225c40b9c"
   },
   {
     "changed": false,
@@ -812,16 +821,5 @@
     "reasons": [],
     "source_blob": "af66c50bf21d16779233c98a34ecfe1ec4259d98",
     "source_sha256": "709b181453c62635d6661717c0dbd8d20a10aeef744db89513fa9d9af56b7ea9"
-  },
-  {
-    "changed": true,
-    "export_sha256": "d34592f56daf8f916bc03a218bc4b816eaf420e1eb06f6dd1e860ed55a637ede",
-    "mode": "100644",
-    "path": "PUBLICATION.md",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
   }
 ]

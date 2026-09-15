@@ -1,6 +1,7 @@
 """Exercise the real staged-content hook in isolated disposable repositories."""
 
 import os
+import importlib.util
 import shutil
 import subprocess
 import tempfile
@@ -103,6 +104,44 @@ class PrivacyHookTests(unittest.TestCase):
         for policy in ("missing", "", "in-tree"):
             with self.subTest(policy=policy):
                 self.check_staged("portable example", False, policy)
+
+    def test_policy_rejects_other_repositories_and_symlink_interfaces(self):
+        spec = importlib.util.spec_from_file_location("private_terms", HOOKS / "private_terms.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory(prefix="privacy-locations-") as temporary:
+            base = Path(temporary).resolve()
+            root = base / "source"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            external = base / "private-terms"
+            external.write_text("private-policy-fixture\n")
+            other = base / "other"
+            subprocess.run(["git", "init", "-q", str(other)], check=True)
+            linked = base / "linked"
+            linked.mkdir()
+            (linked / ".git").write_text("gitdir: ../other/.git/worktrees/linked\n")
+            bare = base / "objects-store"
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+            blocked = []
+            for directory in (other, other / ".git", linked, bare):
+                policy = directory / "private-terms"
+                policy.write_text("private-policy-fixture\n")
+                blocked.append(policy)
+            into = base / "link-into-repository"
+            into.symlink_to(blocked[0])
+            outward = other / "link-to-external"
+            outward.symlink_to(external)
+            blocked.extend((into, outward))
+            for policy in blocked:
+                with self.subTest(location=policy.relative_to(base)):
+                    with patch.dict(os.environ, {"VIBE_PRIVACY_TERMS_FILE": str(policy)}):
+                        with self.assertRaisesRegex(ValueError, "outside Git"):
+                            module.load_terms(root)
+            with patch.dict(os.environ, {"VIBE_PRIVACY_TERMS_FILE": str(external)}):
+                self.assertEqual(module.load_terms(root), ("private-policy-fixture",))
 
 
 
