@@ -778,16 +778,5 @@
     ],
     "source_blob": null,
     "source_sha256": null
-  },
-  {
-    "changed": true,
-    "export_sha256": "0a7cf02b4c1e5182227f0431290c1b8dd3d1aa6fc08021495f95cc73057e0f92",
-    "mode": "100644",
-    "path": "PUBLIC_RELEASE_SOURCE.json",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
   }
 ]
