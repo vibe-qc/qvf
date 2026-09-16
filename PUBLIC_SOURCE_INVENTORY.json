@@ -91,12 +91,19 @@
   },
   {
     "changed": false,
+    "export_sha256": "70b544ee41f37469de2ef5987d45c4c837737992390371f64b90a0f6d3d30c81",
+    "mode": "100644",
+    "path": "AGENTS.md",
+    "reasons": [],
+    "source_blob": "323d3aaf1f5790cd8352b7ee390c96e5fdd72865",
+    "source_sha256": "70b544ee41f37469de2ef5987d45c4c837737992390371f64b90a0f6d3d30c81"
+  },
+  {
+    "changed": false,
     "export_sha256": "96399bfda801844f84537cf9d7351eb924fd9c7544f782d2a99bd9500e526ac0",
     "mode": "100644",
     "path": "CITATION.cff",
-    "reasons": [
-      "public citation repository URL"
-    ],
+    "reasons": [],
     "source_blob": "4dc4ba2555afae28983a2443bc9ab6c4953430fc",
     "source_sha256": "96399bfda801844f84537cf9d7351eb924fd9c7544f782d2a99bd9500e526ac0"
   },
@@ -690,9 +697,7 @@
     "export_sha256": "ca262012b641496c02d24bdeed704162cbd632415adee03093bc275642d8c56d",
     "mode": "100644",
     "path": "python/pyproject.toml",
-    "reasons": [
-      "public package repository URL"
-    ],
+    "reasons": [],
     "source_blob": "561de8a4e02297750551e488350d1d94f1a18c14",
     "source_sha256": "ca262012b641496c02d24bdeed704162cbd632415adee03093bc275642d8c56d"
   },
