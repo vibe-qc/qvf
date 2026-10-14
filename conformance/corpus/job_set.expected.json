@@ -1,0 +1,123 @@
+{
+  "archive": "job_set.qvf",
+  "description": "A job set halfway through (spec \u00a7 5.9): two structures with their identity (water, and the hydroxyl radical with multiplicity 2), one job.spec for each naming its structure with a section-level structure_ref (and the same in the payload). The water job has run: its run.record names it with job_ref and states run_status converged, and the Mulliken charges it produced carry run_ref and structure_ref. No run.record names the hydroxyl job, so it is pending, and provenance.run_status of the set is running.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "job.spec",
+    "run.record",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "running"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "multiplicity"
+      ],
+      "equals": 1
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "multiplicity"
+      ],
+      "equals": 2
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "kind"
+      ],
+      "equals": "job.spec"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "structure_ref"
+      ],
+      "equals": "structure_s6"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "structure_ref"
+      ],
+      "equals": "structure_oh"
+    },
+    {
+      "section": "job_water",
+      "member": "spec",
+      "json_pointer": [
+        "structure_ref"
+      ],
+      "equals": "structure_s6"
+    },
+    {
+      "section": "job_oh",
+      "member": "spec",
+      "json_pointer": [
+        "multiplicity"
+      ],
+      "equals": 2
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "job_ref"
+      ],
+      "equals": "job_water"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "run_status"
+      ],
+      "equals": "converged"
+    },
+    {
+      "section": "run_water",
+      "member": "log",
+      "decode": "utf8",
+      "contains": "converged"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "run_ref"
+      ],
+      "equals": "run_water"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "structure_ref"
+      ],
+      "equals": "structure_s6"
+    },
+    {
+      "section": "charges_water",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.66,
+      "tol": 1e-12
+    }
+  ]
+}

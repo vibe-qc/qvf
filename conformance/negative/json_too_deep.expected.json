@@ -1,0 +1,10 @@
+{
+  "archive": "json_too_deep.qvf",
+  "description": "A JSON member nesting 100 arrays, over the depth cap of 64.",
+  "expect": [
+    {
+      "code": "E_JSON_TOO_DEEP",
+      "severity": "error"
+    }
+  ]
+}

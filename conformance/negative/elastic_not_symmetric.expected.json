@@ -1,0 +1,10 @@
+{
+  "archive": "elastic_not_symmetric.qvf",
+  "description": "A properties.elastic stiffness whose entry (0, 1) is 8.8 GPa and entry (1, 0) 9.9 GPa; the matrix must be symmetric to within 1e-6 of its largest entry (spec \u00a7 5.13).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

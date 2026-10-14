@@ -1,0 +1,10 @@
+{
+  "archive": "section_id_duplicate.qvf",
+  "description": "Two sections share the id 'structure'.",
+  "expect": [
+    {
+      "code": "E_SECTION_ID_DUPLICATE",
+      "severity": "error"
+    }
+  ]
+}

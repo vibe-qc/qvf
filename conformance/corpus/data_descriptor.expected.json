@@ -1,0 +1,68 @@
+{
+  "archive": "data_descriptor.qvf",
+  "description": "Members written in streaming mode: every local header carries the data-descriptor flag (bit 3) with zero CRC and zero sizes, a data descriptor follows each member's data, and only the central directory knows the sizes, so a reader must use the central directory. The same calculation as zip64.qvf; all members are DEFLATEd, manifest.json included.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "spectra.ir",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "qvf_version"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "position",
+        1
+      ],
+      "equals": 0.7572,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        1,
+        "j"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        2
+      ],
+      "equals": 0.35,
+      "tol": 1e-12
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        2
+      ],
+      "equals": 3756.0,
+      "tol": 1e-09
+    }
+  ]
+}

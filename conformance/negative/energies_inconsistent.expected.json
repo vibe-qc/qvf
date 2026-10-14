@@ -1,0 +1,10 @@
+{
+  "archive": "energies_inconsistent.qvf",
+  "description": "energies.total, stated for the method provenance.method names, differs from provenance.scf_energy by 5.9e-3 hartree; the two must agree within 1e-8 hartree (spec \u00a7 3.6).",
+  "expect": [
+    {
+      "code": "E_ROOT_INCONSISTENT",
+      "severity": "error"
+    }
+  ]
+}

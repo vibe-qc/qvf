@@ -1,0 +1,14 @@
+{
+  "archive": "compression_ratio.qvf",
+  "description": "A 64 KiB run of zeros deflated to well under 1 KiB: a ratio over the explicit application cap (100 with a 4 KiB exemption floor here). The default ratio policy is disabled; this is valid QVF.",
+  "limits": {
+    "max_ratio": 100,
+    "ratio_exempt_bytes": 4096
+  },
+  "expect": [
+    {
+      "code": "E_COMPRESSION_RATIO",
+      "severity": "error"
+    }
+  ]
+}

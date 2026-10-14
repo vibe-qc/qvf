@@ -1,0 +1,10 @@
+{
+  "archive": "qtaim_point_type.qvf",
+  "description": "A topology.qtaim critical point of type 'bond'; the type is one of bcp, rcp, ccp, ncp (spec \u00a7 5.7).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

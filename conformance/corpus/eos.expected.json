@@ -1,0 +1,81 @@
+{
+  "archive": "eos.qvf",
+  "description": "equation_of_state: volumes (Angstrom^3) and energies (eV) on a third-order Birch-Murnaghan curve; the fit payload carries model, V0, E0, B0 (GPa) and B0_prime.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "equation_of_state",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "eos",
+      "member": "fit",
+      "json_pointer": [
+        "model"
+      ],
+      "equals": "birch_murnaghan"
+    },
+    {
+      "section": "eos",
+      "member": "fit",
+      "json_pointer": [
+        "V0"
+      ],
+      "equals": 74.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "eos",
+      "member": "fit",
+      "json_pointer": [
+        "B0"
+      ],
+      "equals": 160.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "eos",
+      "member": "fit",
+      "json_pointer": [
+        "B0_prime"
+      ],
+      "equals": 4.1,
+      "tol": 1e-12
+    },
+    {
+      "section": "eos",
+      "member": "fit",
+      "json_pointer": [
+        "n_points"
+      ],
+      "equals": 7
+    },
+    {
+      "section": "eos",
+      "member": "volumes",
+      "binary_index": [
+        3
+      ],
+      "equals": 75.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "eos",
+      "member": "energies",
+      "binary_index": [
+        3
+      ],
+      "equals": -12.299402494193085,
+      "tol": 1e-12
+    },
+    {
+      "section": "eos",
+      "member": "energies",
+      "binary_index": [
+        0
+      ],
+      "equals": -11.675860505669108,
+      "tol": 1e-12
+    }
+  ]
+}

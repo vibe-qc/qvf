@@ -1,0 +1,13 @@
+{
+  "archive": "json_too_large.qvf",
+  "description": "A JSON member larger than the JSON size cap (lowered to 2 KiB here; the reference value is 256 MiB).",
+  "limits": {
+    "max_json_bytes": 2048
+  },
+  "expect": [
+    {
+      "code": "E_JSON_TOO_LARGE",
+      "severity": "error"
+    }
+  ]
+}

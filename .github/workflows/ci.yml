@@ -1,0 +1,184 @@
+# Continuous integration for the public GitHub mirror.
+#
+# .gitlab-ci.yml is the in-house Linux pipeline. This workflow runs the same
+# checks and widens them to macOS, Windows (MSVC) and more Python versions.
+# When a check is added or changed, change both files.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push or PR update cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The reference Python writer/reader and the packaging invariants.
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the oldest supported (requires-python), 3.14 the newest.
+        # If the runner image ever lacks 3.14, use 3.13 here and say so.
+        python-version: ["3.9", "3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Privacy hook self-test
+        run: python .githooks/test_privacy_hook.py -q
+      - name: Install
+        run: pip install -e "python/[validate]" pytest
+      - name: Tests
+        run: python -m pytest python/tests -q
+
+  # The conformance corpus is the format's contract; run the reference runner.
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pip install -e "python/[validate]"
+      - name: Run conformance corpus
+        run: python conformance/run_conformance.py
+
+  # Zero-dependency C++17 library: build and test on every platform with
+  # warnings as errors. Warning flags go in through CXXFLAGS (not
+  # -DCMAKE_CXX_FLAGS) so CMake keeps its own MSVC defaults such as /EHsc.
+  cpp:
+    name: cpp (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-gcc
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            cxxflags: -Wall -Wextra -Werror
+          - name: ubuntu-clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+            cxxflags: -Wall -Wextra -Werror
+          - name: macos-clang
+            os: macos-latest
+            cxxflags: -Wall -Wextra -Werror
+          - name: windows-msvc
+            os: windows-latest
+            cxxflags: /W4 /WX
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CXXFLAGS: ${{ matrix.cxxflags }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
+      # --config / -C matter for multi-config generators (Visual Studio) and
+      # are ignored by single-config ones.
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      # The conformance runner over the positive, negative and legacy corpora
+      # (ctest runs it too, as qvf_conformance; this prints the per-archive
+      # report). Visual Studio puts the binary in a per-configuration folder.
+      - name: Conformance runner
+        shell: bash
+        run: |
+          runner=build/run_conformance
+          [ -f "$runner" ] || runner=build/Release/run_conformance.exe
+          "$runner" conformance/corpus --negative conformance/negative --legacy conformance/legacy
+
+  # The same C++ build and tests under AddressSanitizer + UndefinedBehavior-
+  # Sanitizer, then the C++ reader over every conformance archive.
+  # -fno-sanitize-recover makes an UBSan finding fail the job rather than only
+  # print a diagnostic.
+  sanitizers:
+    name: sanitizers (clang, ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+      CFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g
+      CXXFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      # ctest also ran the conformance runner (qvf_conformance) under the
+      # sanitizers; this reads every positive archive, zip64.qvf and
+      # data_descriptor.qvf included.
+      - name: Read every conformance archive
+        run: |
+          status=0
+          for f in conformance/corpus/*.qvf; do
+            echo "== $f"
+            ./build/read_qvf "$f" || status=1
+          done
+          exit $status
+
+  # cpp/qvf_single.hpp is generated; a stale copy silently diverges from the
+  # sources an adopter would otherwise vendor.
+  js:
+    name: JavaScript reader (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - run: npm ci
+        working-directory: js
+      - run: npm run build
+        working-directory: js
+      - run: npm run typecheck
+        working-directory: js
+      - run: npm test
+        working-directory: js
+
+  amalgamation:
+    name: amalgamation up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check
+        run: python scripts/amalgamate.py --check
+      # The tables generated from the schema (C++, TypeScript, Python) must
+      # match it: python scripts/gen_kinds.py regenerates them.
+      - name: Generated tables up to date
+        run: python scripts/gen_kinds.py --check

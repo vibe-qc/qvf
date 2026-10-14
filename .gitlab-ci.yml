@@ -41,9 +41,13 @@ python-tests:
     - pip install -e "python/[validate]" pytest
     - python -m pytest python/tests -q
 
-# The corpus is the format's real contract: 12 archives, each with an
+# The corpus is the format's real contract: a set of archives, each with an
 # expected-result file naming the sections and values a conformant consumer
-# must decode. A consumer in any language can implement the same loop.
+# must decode. A consumer in any language can implement the same loop. The
+# runner then rejects every must-fail archive of conformance/negative/ with
+# its expected finding code (the C++ validator does the same under ctest), and
+# every archive of conformance/legacy/ (qvf_version 2) with E_VERSION. The
+# cpp-tests job below runs the same corpora through the C++ runner.
 
 conformance:
   stage: test
@@ -54,13 +58,17 @@ conformance:
     - pip install -e "python/[validate]"
     - python conformance/run_conformance.py
 
-# Zero external dependencies -- only the C++17 standard library.
+# Zero external dependencies -- only the C++17 standard library. Warnings are
+# errors here and in .github/workflows/ci.yml, which also covers clang, macOS and
+# MSVC. Keep the two files in sync when a check is added or changed.
 
 cpp-tests:
   stage: test
   image: debian:12-slim
   tags:
     - docker
+  variables:
+    CXXFLAGS: "-Wall -Wextra -Werror"
   before_script:
     - apt-get update
     - apt-get install -y --no-install-recommends g++ cmake ninja-build
@@ -68,6 +76,69 @@ cpp-tests:
     - cmake -S cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release
     - cmake --build build-cpp
     - ctest --test-dir build-cpp --output-on-failure
+    # The conformance runner over the positive, negative and legacy corpora
+    # (ctest runs it too, as qvf_conformance; this prints the per-archive report).
+    - ./build-cpp/run_conformance conformance/corpus --negative conformance/negative --legacy conformance/legacy
+
+# The same build and tests under AddressSanitizer + UndefinedBehaviorSanitizer,
+# then the C++ reader over every conformance archive. -fno-sanitize-recover makes
+# an UBSan finding fail the job instead of only printing a diagnostic.
+#
+# This job needs a sanitizer runtime from LLVM 18 or newer: older runtimes
+# (Debian 12's clang 14 among them) crash at process start with a bare
+# SIGSEGV and no report on hosts whose kernel uses high ASLR entropy
+# (vm.mmap_rnd_bits=32), and only on some runs, so the corpus loop failed on a
+# different archive every pipeline. Debian 13 ships clang 19. The runtime
+# package is versioned after the installed clang, so it is resolved at run
+# time. If LeakSanitizer ever cannot run under the runner's seccomp profile,
+# set ASAN_OPTIONS=detect_leaks=0 for this job.
+
+cpp-sanitizers:
+  stage: test
+  image: debian:13-slim
+  tags:
+    - docker
+  variables:
+    CC: clang
+    CXX: clang++
+    CFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+    CXXFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+    UBSAN_OPTIONS: print_stacktrace=1
+  before_script:
+    - apt-get update
+    # libclang-rt-<N>-dev carries the sanitizer runtimes (only a Recommends of
+    # clang); g++ supplies the libstdc++ headers clang compiles against.
+    - apt-get install -y --no-install-recommends clang g++ cmake ninja-build
+    - apt-get install -y --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+  script:
+    - cmake -S cpp -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    - cmake --build build-san
+    - ctest --test-dir build-san --output-on-failure
+    # ctest also ran the conformance runner (qvf_conformance) under the
+    # sanitizers; this reads every positive archive, zip64.qvf and
+    # data_descriptor.qvf included.
+    - |
+      status=0
+      for f in conformance/corpus/*.qvf; do
+        echo "== $f"
+        ./build-san/read_qvf "$f" || status=1
+      done
+      exit $status
+
+# The JavaScript reader (js/, @qvf/core) is an independent implementation;
+# its test suite runs the positive and negative conformance corpora.
+
+js-tests:
+  stage: test
+  image: node:22-slim
+  tags:
+    - docker
+  script:
+    - cd js
+    - npm ci
+    - npm run build
+    - npm run typecheck
+    - npm test
 
 # The single-header amalgamation is generated; a stale copy is a silent
 # divergence from the sources an adopter would otherwise vendor.
@@ -79,3 +150,6 @@ amalgamation-current:
     - docker
   script:
     - python scripts/amalgamate.py --check
+    # The tables generated from the schema (C++, TypeScript, Python) must match
+    # it: python scripts/gen_kinds.py regenerates them.
+    - python scripts/gen_kinds.py --check

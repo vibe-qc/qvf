@@ -1,0 +1,10 @@
+{
+  "archive": "path_dotdot.qvf",
+  "description": "Member path 'structure/../../structure.json' contains a '..' segment (spec \u00a7 2.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_PATH",
+      "severity": "error"
+    }
+  ]
+}

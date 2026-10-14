@@ -2,6 +2,7 @@
 // kind plus a vendor section. Used by the cross-language parity check: the
 // emitted archive is validated by python/qvf_reader.py (jsonschema). Data is
 // synthetic. Run:  ./write_all_kinds out.qvf
+#include <array>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,19 @@ int main(int argc, char** argv) {
     w.add_volume("volume.generic", grid, v32, "custom");
     w.add_volume("volume.potential", grid, v64);
     w.add_volume("volume.rdg", grid, v32);
+    w.add_volume("volume.laplacian", grid, v32);
     w.add_volume_difference(grid, v32, dens, homo, "rho - homo");
+    // vector [nx, ny, nz, 3], complex [nx, ny, nz, 2] ([re, im]) and a series
+    // [n, nx, ny, nz] of two densities 0.5 fs apart (spec § 5.2)
+    w.add_volume("volume.vector", grid, tensor_f32(std::vector<double>(192, 0.1), {4, 4, 4, 3}),
+                 "gradient");
+    w.add_volume("volume.complex", grid,
+                 tensor_f64(std::vector<double>(128, 0.1), {4, 4, 4, 2}));
+    Json time_axis = Json::object();
+    time_axis.set("kind", "time").set("values", Json::from_doubles({0.0, 0.5}))
+             .set("units", "fs");
+    w.add_volume_series(grid, tensor_f32(std::vector<double>(128, 0.1), {2, 4, 4, 4}),
+                        time_axis, "rho(t)");
 
     // basis.ao
     Json ao_meta = Json::object();
@@ -77,6 +90,31 @@ int main(int argc, char** argv) {
     w.add_reaction_waypoints(tid, wp);
     w.add_reaction_path(tmeta, coordsT);
 
+    // A periodic MD trajectory (spec § 5.5): float32 coords, one cell per frame
+    // in rows and Å (the structure convention), velocities, the energy gradient
+    // (forces are its negative), times and temperatures.
+    {
+        std::vector<Lattice> cells;
+        for (int k = 0; k < 5; ++k)
+            cells.push_back(Lattice::from_rows_angstrom(
+                {{{{9.0 + 0.01 * k, 0, 0}}, {{0.3, 9.0, 0}}, {{0.2, 0.4, 9.0}}}}));
+        Json mdmeta = Json::object();
+        mdmeta.set("symbols", Json::from_strings({"O", "H", "H"}))
+            .set("kind", "md").set("ensemble", "npt").set("timestep_fs", 0.5)
+            .set("pbc", Json::array().push_back(true).push_back(true).push_back(true));
+        const Tensor md_coords = tensor_f32(coords, {5, 3, 3});
+        const Tensor vel = tensor_f64(std::vector<double>(45, 0.001), {5, 3, 3});
+        const Tensor grad = tensor_f64(std::vector<double>(45, 0.0), {5, 3, 3});
+        const Tensor times = tensor_f64({0.0, 0.5, 1.0, 1.5, 2.0}, {5});
+        const Tensor temps = tensor_f64({300, 301, 299, 300, 302}, {5});
+        TrajectoryExtras md;
+        md.velocities = &vel;
+        md.gradient = &grad;
+        md.times = &times;
+        md.temperatures = &temps;
+        w.add_trajectory(mdmeta, md_coords, cells, md, "md");
+    }
+
     // scan.surface
     Json smeta = Json::object();
     smeta.set("axis_a_label", "r1").set("axis_b_label", "r2");
@@ -112,10 +150,18 @@ int main(int argc, char** argv) {
     epr.set("zero_field_splitting", zfs);
     w.add_spectrum("spectra.epr", epr);
 
-    // bands
+    // bands (two spin channels: rank-4 fat-band projections + occupations)
     Json kpath = Json::object();
-    kpath.set("n_spin", 1).set("n_kpoints", 10).set("n_bands", 4);
-    w.add_bands(kpath, tensor_f64(std::vector<double>(40, 0.0), {1, 10, 4}));
+    Json kchans = Json::array();
+    { Json c = Json::object();
+      c.set("atom", 0).set("l", 1).set("label", "O-2p");
+      kchans.push_back(c); }
+    kpath.set("n_spin", 2).set("n_kpoints", 10).set("n_bands", 4)
+         .set("fermi", 0.0).set("channels", kchans);
+    Tensor bproj = tensor_f64(std::vector<double>(2 * 10 * 4, 0.5), {2, 10, 4, 1});
+    Tensor bocc = tensor_f64(std::vector<double>(2 * 10 * 4, 1.0), {2, 10, 4});
+    w.add_bands(kpath, tensor_f64(std::vector<double>(80, 0.0), {2, 10, 4}),
+                &bproj, &bocc);
 
     // dos.total / projected / coop / cohp
     Json dmeta = Json::object();
@@ -133,10 +179,10 @@ int main(int argc, char** argv) {
     Json coopmeta = Json::object();
     coopmeta.set("pairs", Json::array());
     w.add_dos_coop_cohp("dos.coop", tensor_f64({-1, 0, 1}, {3}),
-                        tensor_f64({0, 0, 0}, {1, 3}), tensor_f64({0, 0, 0}, {1, 3}),
+                        tensor_f64({0, 0, 0}, {1, 3}), tensor_f64({0}, {1}),
                         coopmeta);
     w.add_dos_coop_cohp("dos.cohp", tensor_f64({-1, 0, 1}, {3}),
-                        tensor_f64({0, 0, 0}, {1, 3}), tensor_f64({0, 0, 0}, {1, 3}),
+                        tensor_f64({0, 0, 0}, {1, 3}), tensor_f64({0}, {1}),
                         coopmeta);
 
     // structure.symmetry / scf_history / citations
@@ -171,7 +217,14 @@ int main(int argc, char** argv) {
     Json jspec = Json::object();
     jspec.set("job_type", "molecular").set("method", "rhf")
          .set("basis", "sto-3g").set("charge", 0).set("multiplicity", 1)
-         .set("tasks", Json::from_strings({"single_point"}));
+         .set("tasks", Json::from_strings({"single_point"}))
+         .set("structure_ref", "structure").set("dispersion", "d3bj");
+    Json jscf = Json::object();
+    jscf.set("convergence", 1e-8).set("max_iterations", 100);
+    jspec.set("scf", jscf);
+    Json jres = Json::object();      // hints, not requirements
+    jres.set("n_cores", 4).set("walltime_s", 3600.0);
+    jspec.set("resources", jres);
     w.add_job_spec(jspec);
 
     // fermi_surface / phonon_bands / phonon_dos / equation_of_state
@@ -202,6 +255,116 @@ int main(int argc, char** argv) {
       pts.push_back(p); }
     cps.set("points", pts);
     w.add_topology_qtaim(cps);
+
+    // forces (energy gradient, hartree/bohr; forces = -gradient) / hessian
+    // (hartree/bohr^2) / root energies block
+    Json fmeta = Json::object();
+    fmeta.set("structure_ref", "structure").set("method", "rhf")
+         .set("convention", "gradient");
+    w.add_forces(tensor_f64({0, 0, 0.02, 0, 0.01, -0.01, 0, -0.01, -0.01}, {3, 3}),
+                 nullptr, fmeta);
+    std::vector<double> hess(81, 0.0);
+    for (size_t k = 0; k < 9; ++k) hess[k * 9 + k] = 0.5;
+    Json hmeta = Json::object();
+    hmeta.set("structure_ref", "structure")
+         .set("atom_masses_amu", Json::from_doubles({15.999, 1.008, 1.008}));
+    w.add_hessian(tensor_f64(hess, {9, 9}), hmeta);
+    Json etotal = Json::object();
+    etotal.set("value", -74.9629).set("units", "hartree");
+    Json energies = Json::object();
+    energies.set("total", etotal).set("method", "rhf");
+    w.set_energies(energies);
+
+    // excited_states with the NTO pair and the transition density of its
+    // state 1 (spec § 5.2, § 5.3, § 5.12)
+    for (const char* role : {"hole", "particle"}) {
+        WavefunctionGTO nto = wf;
+        nto.orbital_kind = "nto";
+        nto.mo_coefficients = {1, 4, {0.5, 0.5, 0.5, 0.5}};
+        nto.energies = {};
+        nto.occupations = {1.0};
+        nto.state_ref = "excited_states";
+        nto.state_index = 1;
+        nto.nto_role = role;
+        nto.section_id = std::string("nto_") + role;
+        w.add_wavefunction_gto(nto);
+    }
+    w.add_volume_transition_density(grid, v32, "excited_states", 1, "S1", "tden");
+    w.add_excited_states(
+        Json::parse(R"([{"index":1,"excitation_energy":7.4,"oscillator_strength":0.05,)"
+                    R"("transition_dipole":[0.5,0,0],)"
+                    R"("contributions":[{"from_mo":1,"to_mo":2,"weight":0.97}],)"
+                    R"("nto_ref":"nto_hole","density_ref":"tden"}])"),
+        Json::parse(R"({"method":"tddft","n_states":1})"), "wf");
+
+    // property kinds (spec § 5.13): the electric dipole restates the root
+    // dipole_moment set below; one Born tensor per atom of the 3-atom structure.
+    w.add_electric_properties(Json::parse(
+        "{\"origin\":\"center_of_mass\","
+        "\"dipole\":{\"vector\":[0,0,1.86],\"total\":1.86,\"units\":\"debye\"},"
+        "\"quadrupole\":{\"matrix\":[[1,0,0],[0,-0.5,0],[0,0,-0.5]],"
+        "\"traceless\":true,\"convention\":\"buckingham\"},"
+        "\"polarizability\":{\"matrix\":[[8.6,0,0],[0,9.1,0],[0,0,9.5]],"
+        "\"isotropic\":9.066667}}"));
+    w.add_elastic_properties(Json::parse(
+        "{\"stiffness\":[[36.4,8.8,8.8,0,0,0],[8.8,36.4,8.8,0,0,0],[8.8,8.8,36.4,0,0,0],"
+        "[0,0,0,8,0,0],[0,0,0,0,8,0],[0,0,0,0,0,8]],"
+        "\"bulk_modulus_gpa\":18,\"average\":\"voigt\"}"));
+    w.add_dielectric_properties(Json::parse(
+        "{\"electronic\":[[2,0,0],[0,2,0],[0,0,2]],\"ionic\":[[1,0,0],[0,1,0],[0,0,1]],"
+        "\"static\":[[3,0,0],[0,3,0],[0,0,3]],"
+        "\"born_charges\":[[[-0.8,0,0],[0,-0.8,0],[0,0,-0.8]],"
+        "[[0.4,0,0],[0,0.4,0],[0,0,0.4]],[[0.4,0,0],[0,0.4,0],[0,0,0.4]]]}"));
+
+    // wavefunction.bloch (provisional, spec § 5.3.1): Bloch orbitals of a
+    // periodic hydrogen chain at Gamma and X, over one s shell per atom
+    w.add_structure({{"H", 1, {{0, 0, 0}}}, {"H", 1, {{0.8, 0, 0}}}},
+                    {{true, false, false}},
+                    {{{2.0, 0, 0}}, {{0, 10.0, 0}}, {{0, 0, 10.0}}}, {}, "chain");
+    WavefunctionBloch bloch;
+    bloch.shells = {Shell{0, 0, {0.4166}, {1.0}, true}, Shell{1, 0, {0.4166}, {1.0}, true}};
+    bloch.structure_ref = "chain";
+    bloch.kpoints = {{{0, 0, 0}}, {{0.5, 0, 0}}};
+    bloch.weights = {0.5, 0.5};
+    bloch.n_mo = 2;
+    bloch.mo_coefficients = {0.5, 0, 0.5, 0, 0.9, 0, -0.9, 0,
+                             0.6, 0.1, 0.6, -0.1, 0.8, 0.2, -0.8, 0.2};
+    bloch.energies = {-0.72, 1.98, -0.58, -0.28};
+    bloch.occupations = {2, 0, 2, 0};
+    w.add_wavefunction_bloch(bloch);
+
+    // chemical identity and reaction.scheme (spec § 5.1, § 5.14): water from
+    // hydrogen and triplet oxygen, the species as structure sections
+    const std::array<bool, 3> molecule{{false, false, false}};
+    const std::vector<std::array<double, 3>> no_cell;
+    w.add_structure({{"H", 1, {{0, 0, 0}}}, {"H", 1, {{0.74, 0, 0}}}}, molecule, no_cell, {},
+                    "h2");
+    w.add_structure({{"O", 8, {{0, 0, 0}}}, {"O", 8, {{1.21, 0, 0}}}}, molecule, no_cell, {},
+                    "o2");
+    w.set_structure_identity("structure", Json::parse(
+        R"({"charge": 0, "multiplicity": 1, "name": "water", "smiles": "O",)"
+        R"( "inchi": "InChI=1S/H2O/h1H2", "inchikey": "XLYOFNOQVPJJNP-UHFFFAOYSA-N"})"));
+    w.set_structure_identity("h2", Json::parse(R"({"charge": 0, "multiplicity": 1})"));
+    w.set_structure_identity("o2", Json::parse(R"({"charge": 0, "multiplicity": 3})"));
+    w.set_section_field("structure", "label", "3");
+    w.add_reaction_scheme(
+        Json::parse(R"([{"id": "r1", "label": "a",)"
+                    R"( "reactants": [{"structure_ref": "h2", "coefficient": 2}, "o2"],)"
+                    R"( "products": [{"structure_ref": "structure", "coefficient": 2}],)"
+                    R"( "conditions": ["spark"], "yield_percent": 100}])"),
+        "water synthesis");
+
+    // preview (spec § 5.15): a 1x1 PNG thumbnail and an SVG rendering
+    const std::vector<uint8_t> png = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0x9c, 0x63, 0x30, 0x48, 0x38, 0x00, 0x00, 0x02, 0x14, 0x01, 0x51, 0x7a, 0xb3, 0xac,
+        0x5e, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+    const std::string svg =
+        R"(<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">)"
+        R"(<rect width="1" height="1" fill="#3060c0"/></svg>)";
+    w.add_preview(png, std::vector<uint8_t>(svg.begin(), svg.end()), "scheme");
 
     // vendor section (x_orca.epr) + extensions governance
     // Vendor escape hatch: a genuinely non-canonical payload (EPR itself is now

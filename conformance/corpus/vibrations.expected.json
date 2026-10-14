@@ -1,0 +1,78 @@
+{
+  "archive": "vibrations.qvf",
+  "description": "vibrations: planar NH3 with one imaginary mode, written as a negative wavenumber (cm^-1); displacements [n_modes, n_atoms, 3].",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "vibrations"
+  ],
+  "checks": [
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "frequencies",
+        0
+      ],
+      "equals": -893.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "imaginary",
+        0
+      ],
+      "equals": true
+    },
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "frequencies",
+        5
+      ],
+      "equals": 3720.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "ir_intensities",
+        0
+      ],
+      "equals": 512.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "symmetry_labels",
+        0
+      ],
+      "equals": "A2''"
+    },
+    {
+      "section": "vib",
+      "member": "metadata",
+      "json_pointer": [
+        "n_modes"
+      ],
+      "equals": 6
+    },
+    {
+      "section": "vib",
+      "member": "displacements",
+      "binary_index": [
+        0,
+        1,
+        2
+      ],
+      "equals": -0.55,
+      "tol": 1e-12
+    }
+  ]
+}

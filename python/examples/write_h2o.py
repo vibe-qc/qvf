@@ -77,6 +77,11 @@ def main(out: str = "h2o.qvf") -> None:
     w.set_provenance(method="RHF", basis="STO-3G", charge=0, multiplicity=1,
                      n_electrons=10, scf_converged=True, n_scf_iterations=3,
                      scf_energy_eh=-74.9630)
+    # What produced the result (spec § 3.2): the typed fields are checked.
+    w.set_provenance(software=[{"name": "democode", "version": "1.0.0"}],
+                     git_commit="9f2b6c1d4e7a", n_threads=4, n_mpi_ranks=1,
+                     started_utc="2026-10-07T12:00:00Z",
+                     finished_utc="2026-10-07T12:00:03Z")
     w.set_dipole_moment(total_debye=1.86, vector_debye=[0.0, 0.0, 1.86],
                         origin="center_of_mass")
     w.add_citations("@article{example2026,\n  title = {A calculation},\n"

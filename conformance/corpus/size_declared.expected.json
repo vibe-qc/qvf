@@ -1,0 +1,114 @@
+{
+  "archive": "size_declared.qvf",
+  "description": "Every member spec carries the optional size, the uncompressed byte count of its ZIP entry (spec \u00a7 4.2): JSON members (structure, bonds, the volume grid, the run.record files index), binary members (the volume data, a vendor int64 array), the opaque citations.references and the run.record input, log and attachment. A validator checks each size against the ZIP central directory before reading the member. The root declares byte_order 'little' (spec \u00a7 2.2). The checks compare the sizes of the binary and opaque members, whose bytes are fixed; a JSON member's size depends on its producer's formatting.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "citations",
+    "run.record",
+    "structure",
+    "volume.density",
+    "x_conformance.sizes"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "byte_order"
+      ],
+      "equals": "little"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "data",
+        "size"
+      ],
+      "equals": 96
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "members",
+        "references",
+        "size"
+      ],
+      "equals": 109
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "members",
+        "input",
+        "size"
+      ],
+      "equals": 77
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "members",
+        "log",
+        "size"
+      ],
+      "equals": 52
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "members",
+        "attachment.geom",
+        "size"
+      ],
+      "equals": 60
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "members",
+        "counts",
+        "size"
+      ],
+      "equals": 24
+    },
+    {
+      "section": "rho",
+      "member": "data",
+      "binary_index": [
+        1,
+        2,
+        3
+      ],
+      "equals": 0.9583333333333334,
+      "tol": 1e-07
+    },
+    {
+      "section": "citations",
+      "member": "references",
+      "decode": "utf8",
+      "contains": "\u00c5ngstr\u00f6m"
+    },
+    {
+      "section": "run",
+      "member": "files",
+      "json_pointer": [
+        "log",
+        "filename"
+      ],
+      "equals": "water.out"
+    },
+    {
+      "section": "x_sizes",
+      "member": "counts",
+      "binary_index": [
+        0
+      ],
+      "equals": 8
+    }
+  ]
+}

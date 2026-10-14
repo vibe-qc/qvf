@@ -1,0 +1,171 @@
+{
+  "archive": "volume_series.qvf",
+  "description": "volume.series: the density of a stretching H2 molecule at frames 0, 2 and 4 of a five-frame trajectory, float32 [n, nx, ny, nz]; the axis member names the frames (kind frame, values 0-based frame indices, not slab indices), labels each slab, and names the trajectory through trajectory_ref. The grid shape is the trailing three extents of data.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "trajectory",
+    "volume.series"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "members",
+        "data",
+        "shape"
+      ],
+      "equals": [
+        3,
+        4,
+        4,
+        6
+      ]
+    },
+    {
+      "section": "rho_frames",
+      "member": "axis",
+      "json_pointer": [
+        "kind"
+      ],
+      "equals": "frame"
+    },
+    {
+      "section": "rho_frames",
+      "member": "axis",
+      "json_pointer": [
+        "values"
+      ],
+      "equals": [
+        0,
+        2,
+        4
+      ]
+    },
+    {
+      "section": "rho_frames",
+      "member": "axis",
+      "json_pointer": [
+        "labels",
+        2
+      ],
+      "equals": "r = 1.10 \u00c5"
+    },
+    {
+      "section": "rho_frames",
+      "member": "axis",
+      "json_pointer": [
+        "trajectory_ref"
+      ],
+      "equals": "trajectory"
+    },
+    {
+      "section": "trajectory",
+      "member": "coords",
+      "binary_index": [
+        4,
+        1,
+        2
+      ],
+      "equals": 0.55,
+      "tol": 1e-12
+    },
+    {
+      "section": "rho_frames",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 4
+    },
+    {
+      "section": "rho_frames",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 4
+    },
+    {
+      "section": "rho_frames",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 6
+    },
+    {
+      "section": "rho_frames",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.35,
+      "tol": 1e-12
+    },
+    {
+      "section": "rho_frames",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.9,
+      "tol": 1e-12
+    },
+    {
+      "section": "rho_frames",
+      "member": "data",
+      "binary_index": [
+        0,
+        1,
+        2,
+        2
+      ],
+      "equals": 0.2687000632286072,
+      "tol": 1e-06
+    },
+    {
+      "section": "rho_frames",
+      "member": "data",
+      "binary_index": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "equals": 0.2258559614419937,
+      "tol": 1e-06
+    },
+    {
+      "section": "rho_frames",
+      "member": "data",
+      "binary_index": [
+        2,
+        1,
+        2,
+        2
+      ],
+      "equals": 0.1807287186384201,
+      "tol": 1e-06
+    },
+    {
+      "section": "rho_frames",
+      "member": "data",
+      "binary_index": [
+        2,
+        3,
+        0,
+        5
+      ],
+      "equals": 0.0030174003913998604,
+      "tol": 1e-06
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "archive": "volume_orbital.qvf",
+  "description": "volume.orbital: a signed orbital amplitude (the data change sign across the molecule) on an anisotropic 5x4x6 float32 grid in bohr; origin and voxel_vectors in bohr.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.orbital"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "label"
+      ],
+      "equals": "LUMO (sigma_u)"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "data",
+        "dtype"
+      ],
+      "equals": "float32"
+    },
+    {
+      "section": "lumo",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 5
+    },
+    {
+      "section": "lumo",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 4
+    },
+    {
+      "section": "lumo",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 6
+    },
+    {
+      "section": "lumo",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.6,
+      "tol": 1e-12
+    },
+    {
+      "section": "lumo",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.8,
+      "tol": 1e-12
+    },
+    {
+      "section": "lumo",
+      "member": "data",
+      "binary_index": [
+        2,
+        1,
+        0
+      ],
+      "equals": 0.3181116580963135,
+      "tol": 1e-06
+    },
+    {
+      "section": "lumo",
+      "member": "data",
+      "binary_index": [
+        2,
+        1,
+        5
+      ],
+      "equals": -0.3181116580963135,
+      "tol": 1e-06
+    },
+    {
+      "section": "lumo",
+      "member": "data",
+      "binary_index": [
+        4,
+        3,
+        2
+      ],
+      "equals": 0.04205608367919922,
+      "tol": 1e-06
+    }
+  ]
+}

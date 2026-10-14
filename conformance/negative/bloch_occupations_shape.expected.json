@@ -1,0 +1,10 @@
+{
+  "archive": "bloch_occupations_shape.qvf",
+  "description": "wavefunction.bloch occupations of shape [2, 2, 3] beside mo_coefficients [2, 2, 2, 2, 2]; occupations must be [n_k, n_spin, n_mo] = [2, 2, 2] (spec \u00a7 5.3.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}
