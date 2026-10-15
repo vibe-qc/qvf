@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The QVF type declaration for macOS (QVF spec § 2.4, File identification).
+
+  Copy the <dict> below into the UTImportedTypeDeclarations array of an
+  application's Info.plist, or into UTExportedTypeDeclarations in the one
+  application of a family that exports the type. Keep it identical in every
+  application, so that macOS resolves .qvf files to the same type whichever
+  of them is installed. A document-type entry (CFBundleDocumentTypes) then
+  names the type through LSItemContentTypes = (com.vibe-qc.qvf).
+
+  License: Apache-2.0.
+-->
+<plist version="1.0">
+<dict>
+	<key>UTTypeIdentifier</key>
+	<string>com.vibe-qc.qvf</string>
+	<key>UTTypeDescription</key>
+	<string>QVF quantum-chemistry archive</string>
+	<key>UTTypeConformsTo</key>
+	<array>
+		<string>public.zip-archive</string>
+		<string>public.content</string>
+	</array>
+	<key>UTTypeTagSpecification</key>
+	<dict>
+		<key>public.filename-extension</key>
+		<array>
+			<string>qvf</string>
+		</array>
+		<key>public.mime-type</key>
+		<array>
+			<string>application/vnd.vibe-qc.qvf+zip</string>
+		</array>
+	</dict>
+</dict>
+</plist>

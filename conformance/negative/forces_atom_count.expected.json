@@ -1,0 +1,10 @@
+{
+  "archive": "forces_atom_count.qvf",
+  "description": "A forces gradient with 2 rows for a 3-atom structure named by meta.structure_ref; gradient must be [n_atoms, 3] (spec \u00a7 5.10).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

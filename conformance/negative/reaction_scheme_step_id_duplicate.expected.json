@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_step_id_duplicate.qvf",
+  "description": "Two steps of a reaction.scheme share the id r1; step ids are unique within the payload (spec \u00a7 5.14).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

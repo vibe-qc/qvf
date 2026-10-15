@@ -1,0 +1,10 @@
+{
+  "archive": "section_malformed.qvf",
+  "description": "A sections entry that is not an object.",
+  "expect": [
+    {
+      "code": "E_SECTION_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

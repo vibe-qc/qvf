@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_energies_reserved.qvf",
+  "description": "A reaction.scheme step with the key energies, which spec \u00a7 5.14 reserves for a later revision; the strict step payload rejects it until then. Only a validator that runs the JSON Schema reports it.",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

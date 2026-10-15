@@ -1,0 +1,87 @@
+{
+  "archive": "qtaim.qvf",
+  "description": "topology.qtaim ($defs/QtaimPayload) of water: three nuclear and two bond critical points and the bond paths through the BCPs, positions declared in Angstrom (units.position), overlaying the structure; synthetic values.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "topology.qtaim"
+  ],
+  "checks": [
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "units",
+        "position"
+      ],
+      "equals": "angstrom"
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        0,
+        "type"
+      ],
+      "equals": "ncp"
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        3,
+        "type"
+      ],
+      "equals": "bcp"
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        3,
+        "position",
+        1
+      ],
+      "equals": 0.5788,
+      "tol": 1e-09
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        4,
+        "atom_pair",
+        1
+      ],
+      "equals": 2
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        3,
+        "laplacian"
+      ],
+      "equals": -2.4521,
+      "tol": 1e-09
+    },
+    {
+      "section": "qtaim",
+      "member": "critical_points",
+      "json_pointer": [
+        "bond_paths",
+        1,
+        "path",
+        2,
+        1
+      ],
+      "equals": -0.7572,
+      "tol": 1e-09
+    }
+  ]
+}

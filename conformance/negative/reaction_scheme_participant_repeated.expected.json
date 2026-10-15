@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_participant_repeated.qvf",
+  "description": "A reaction.scheme step that lists water_a twice among its reactants; a structure occurs once per role of a step, and a coefficient says how many (spec \u00a7 5.14).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

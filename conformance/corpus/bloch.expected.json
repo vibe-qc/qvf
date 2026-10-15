@@ -1,0 +1,272 @@
+{
+  "archive": "bloch.qvf",
+  "description": "A dimerised hydrogen chain (pbc along x only) with wavefunction.bloch orbitals at \u0393 and X: weights 1/2 and 1/2, two spin channels with different on-site energies, coefficients float64 [n_k, n_spin, n_mo, n_ao, 2] that are real at \u0393 and carry the gauge phase e^{i\u03c0/3} at X, energies in hartree and per-k occupations [n_k, n_spin, n_mo]. The orbitals satisfy C\u2020S(k)C = 1 for the Bloch sum of spec \u00a7 5.3.1. The bands section lists the same two k-points, and its eigenvalues are the orbital energies in eV (spec \u00a7 5.3.1, \u00a7 5.6).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "bands",
+    "structure",
+    "wavefunction.bloch"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "kind"
+      ],
+      "equals": "wavefunction.bloch"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "mo_coefficients",
+        "shape"
+      ],
+      "equals": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "energies",
+        "shape"
+      ],
+      "equals": [
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "section": "wf_bloch",
+      "member": "kpoints",
+      "json_pointer": [
+        "kpoints",
+        1,
+        0
+      ],
+      "equals": 0.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "kpoints",
+      "json_pointer": [
+        "weights",
+        1
+      ],
+      "equals": 0.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "kpoints",
+      "json_pointer": [
+        "labels",
+        1
+      ],
+      "equals": "X"
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "spin"
+      ],
+      "equals": "unrestricted"
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "n_spin"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "complex"
+      ],
+      "equals": true
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "k_point_convention"
+      ],
+      "equals": "fractional"
+    },
+    {
+      "section": "wf_bloch",
+      "member": "basis",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "wf_bloch",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "exponents",
+        0
+      ],
+      "equals": 0.4166,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        1,
+        0,
+        1,
+        0
+      ],
+      "equals": 0.47432077551415835,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        0,
+        1,
+        0,
+        1
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_coefficients",
+      "binary_index": [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "equals": 0.3406982022469921,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_coefficients",
+      "binary_index": [
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "equals": 0.5901065963391672,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "mo_coefficients",
+      "binary_index": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "equals": 0.7960201742290648,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "energies",
+      "binary_index": [
+        0,
+        0,
+        0
+      ],
+      "equals": -0.7217172037681957,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "energies",
+      "binary_index": [
+        1,
+        1,
+        1
+      ],
+      "equals": -0.2606909767114343,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "occupations",
+      "binary_index": [
+        1,
+        1,
+        0
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_bloch",
+      "member": "occupations",
+      "binary_index": [
+        1,
+        1,
+        1
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "bands",
+      "member": "eigenvalues",
+      "binary_index": [
+        1,
+        1,
+        0
+      ],
+      "equals": -14.523486486244256,
+      "tol": 1e-09
+    },
+    {
+      "section": "bands",
+      "member": "eigenvalues",
+      "binary_index": [
+        0,
+        0,
+        1
+      ],
+      "equals": 53.96756772924673,
+      "tol": 1e-09
+    },
+    {
+      "section": "bands",
+      "member": "kpath",
+      "json_pointer": [
+        "labels",
+        1
+      ],
+      "equals": "X"
+    }
+  ]
+}

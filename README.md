@@ -11,10 +11,12 @@ viewer hints in a single random-access file, instead of a scatter of Cube, XYZ,
 Molden, XSF, log, and program-specific sidecar files.
 
 This toolkit lets **any** quantum-chemistry code produce valid `.qvf` archives
-without depending on vibe-qc. It is licensed **Apache-2.0** (see `LICENSE`), so
+without depending on vibe-qc. Within the vibe-qc family (vibe-qc, vibe-view,
+vibe-sketch, vibe-queue) QVF is the standard format the programs read, write
+and hand each other; see [GOVERNANCE.md](GOVERNANCE.md#qvf-in-the-vibe-qc-family). It is licensed **Apache-2.0** (see `LICENSE`), so
 it can be linked into proprietary as well as open-source codes.
 
-Toolkit version **0.1.0**, implementing **QVF v1** (`qvf_version = 1`).
+Toolkit version **0.3.0**, implementing **QVF v1** (`qvf_version = 1`).
 
 ## What's in here
 
@@ -22,6 +24,7 @@ Toolkit version **0.1.0**, implementing **QVF v1** (`qvf_version = 1`).
 |------|-----------|
 | [`spec/qvf-format-spec.md`](spec/qvf-format-spec.md) | The standalone, normative QVF format specification. |
 | [`spec/qvf_manifest.schema.json`](spec/qvf_manifest.schema.json) | The machine-readable JSON Schema for `manifest.json` (single source of truth). |
+| [`spec/file-type/`](spec/file-type/) | The `.qvf` file-type declarations every program copies: the macOS UTI (`com.vibe-qc.qvf`) and the freedesktop.org media type (`application/vnd.vibe-qc.qvf+zip`). |
 | [`python/qvf_writer.py`](python/qvf_writer.py) | Reference **writer** in Python. Depends only on the standard library + NumPy. |
 | [`python/qvf_reader.py`](python/qvf_reader.py) | Reference **reader / validator** in Python — self-check your archives. |
 | [`cpp/`](cpp/) | Zero-dependency **C++17 writer library** (`qvf::QvfWriter`) you can link into your code. Vendors its own ZIP + SHA-256; no external build deps. |
@@ -29,6 +32,10 @@ Toolkit version **0.1.0**, implementing **QVF v1** (`qvf_version = 1`).
 | [`docs/orca_integration.md`](docs/orca_integration.md) | Worked mapping from an engine's data (GBW-style wavefunction, spectra, properties) onto QVF sections. |
 | [`GOVERNANCE.md`](GOVERNANCE.md) + [`registry.json`](registry.json) | How QVF is stewarded, versioned, and evolved — an open standard created and stewarded by vibe-qc; the registry of canonical kinds + vendor namespaces. |
 | [`conformance/`](conformance/) | Golden corpus + runner so any producer/consumer can self-certify. |
+| [`ROADMAP.md`](ROADMAP.md) | Phased plan for the format and the library; entry point to the planning docs below. |
+| [`docs/format_review.md`](docs/format_review.md) | Coverage matrix, defects, additive proposals, and the v2 ledger. |
+| [`docs/library_design.md`](docs/library_design.md) | Target architecture of libqvf: container, model, validation, facades, bindings. |
+| [`docs/work_packages.md`](docs/work_packages.md) | Implementation briefs (WP-nn) with a Definition of Done. |
 
 ## 60-second Python example
 
@@ -104,6 +111,12 @@ Run the bundled validator against anything you write:
 ```sh
 python python/qvf_reader.py h2o.qvf     # prints a validation report; non-zero exit on error
 ```
+
+Every finding carries a stable code (`E_SHA256_MISMATCH`, `W_ORPHAN_MEMBER`, …)
+from spec Appendix B, shared by the Python, C++ and JavaScript validators. The
+[`conformance/`](conformance/) suite certifies both directions: a golden corpus
+every consumer must decode, and a negative corpus of must-fail archives — one
+per validation rule — every validator must reject with the expected code.
 
 A conforming producer must satisfy the checklist in
 [`spec/qvf-format-spec.md`](spec/qvf-format-spec.md) § "Producer conformance".

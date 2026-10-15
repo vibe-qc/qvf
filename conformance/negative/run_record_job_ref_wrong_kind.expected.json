@@ -1,0 +1,10 @@
+{
+  "archive": "run_record_job_ref_wrong_kind.qvf",
+  "description": "A run.record whose job_ref names the structure section instead of a job.spec section (spec \u00a7 5.8).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

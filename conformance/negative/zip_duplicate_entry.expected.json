@@ -1,0 +1,10 @@
+{
+  "archive": "zip_duplicate_entry.qvf",
+  "description": "structure/structure.json occurs twice in the ZIP with different bytes; readers disagree on which entry wins (spec \u00a7 2.1).",
+  "expect": [
+    {
+      "code": "E_ZIP_DUPLICATE_ENTRY",
+      "severity": "error"
+    }
+  ]
+}

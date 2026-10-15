@@ -1,0 +1,68 @@
+{
+  "archive": "zip64.qvf",
+  "description": "ZIP64 forced on small members: a ZIP64 extra field in every local header and every central-directory record (sizes and local-header offset saturated), a ZIP64 end-of-central-directory record and locator, and a saturated end record. The member bytes are those of an ordinary archive of the same calculation (water: structure with bonds, atom_properties, IR spectrum).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "spectra.ir",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "qvf_version"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "position",
+        1
+      ],
+      "equals": 0.7572,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        1,
+        "j"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        2
+      ],
+      "equals": 0.35,
+      "tol": 1e-12
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        2
+      ],
+      "equals": 3756.0,
+      "tol": 1e-09
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "payload_grid_shape.qvf",
+  "description": "A volume.density grid whose shape has two entries instead of three ($defs/VolumeGridPayload, spec \u00a7 5.2).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

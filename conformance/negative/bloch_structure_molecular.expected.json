@@ -1,0 +1,10 @@
+{
+  "archive": "bloch_structure_molecular.qvf",
+  "description": "A wavefunction.bloch section whose basis.structure_ref names a molecular structure (no periodic axis in pbc); Bloch orbitals need a periodic structure (spec \u00a7 5.3.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

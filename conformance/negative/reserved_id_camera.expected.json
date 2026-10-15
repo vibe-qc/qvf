@@ -1,0 +1,10 @@
+{
+  "archive": "reserved_id_camera.qvf",
+  "description": "A section id 'camera', a reserved viewer_defaults member (spec \u00a7 3.1, \u00a7 3.4).",
+  "expect": [
+    {
+      "code": "E_RESERVED_ID",
+      "severity": "error"
+    }
+  ]
+}

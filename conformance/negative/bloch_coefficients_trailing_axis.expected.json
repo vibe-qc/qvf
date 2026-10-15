@@ -1,0 +1,14 @@
+{
+  "archive": "bloch_coefficients_trailing_axis.qvf",
+  "description": "wavefunction.bloch mo_coefficients of shape [2, 2, 2, 2, 1]: the last axis must be the (real, imaginary) pair, of length 2 (spec \u00a7 5.3.1). Every validator reports the shape; one with a JSON Schema engine also reports the manifest schema violation.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    },
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "archive": "job_set_methods.qvf",
+  "description": "A pending job set on water at three levels of theory (spec \u00a7 5.9): Hartree-Fock with functional null, GFN2-xTB with functional and basis null, the method taking neither, and PBE0/def2-SVP. null states that the method takes no such input; an absent key would leave the choice to the engine.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "job.spec",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "pending"
+    },
+    {
+      "section": "job_rhf",
+      "member": "spec",
+      "json_pointer": [
+        "functional"
+      ],
+      "equals": null
+    },
+    {
+      "section": "job_rhf",
+      "member": "spec",
+      "json_pointer": [
+        "basis"
+      ],
+      "equals": "def2-svp"
+    },
+    {
+      "section": "job_xtb",
+      "member": "spec",
+      "json_pointer": [
+        "method"
+      ],
+      "equals": "gfn2_xtb"
+    },
+    {
+      "section": "job_xtb",
+      "member": "spec",
+      "json_pointer": [
+        "functional"
+      ],
+      "equals": null
+    },
+    {
+      "section": "job_xtb",
+      "member": "spec",
+      "json_pointer": [
+        "basis"
+      ],
+      "equals": null
+    },
+    {
+      "section": "job_pbe0",
+      "member": "spec",
+      "json_pointer": [
+        "functional"
+      ],
+      "equals": "pbe0"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "structure_ref"
+      ],
+      "equals": "structure"
+    }
+  ]
+}

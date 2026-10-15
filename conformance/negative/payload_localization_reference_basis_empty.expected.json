@@ -1,0 +1,10 @@
+{
+  "archive": "payload_localization_reference_basis_empty.qvf",
+  "description": "Localized orbitals whose mo_metadata names the IAO reference basis with an empty string; localization_reference_basis is a non-empty name ($defs/MoMetadataPayload, spec \u00a7 5.3).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

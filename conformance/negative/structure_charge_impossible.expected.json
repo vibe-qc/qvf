@@ -1,0 +1,10 @@
+{
+  "archive": "structure_charge_impossible.qvf",
+  "description": "A water structure section with charge 0 and multiplicity 2: ten electrons cannot leave one unpaired, because the unpaired electrons must have the parity of the electron count (spec \u00a7 5.1, Chemical identity).",
+  "expect": [
+    {
+      "code": "E_CHARGE_MULTIPLICITY",
+      "severity": "error"
+    }
+  ]
+}

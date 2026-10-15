@@ -1,0 +1,105 @@
+{
+  "archive": "units_declared.qvf",
+  "description": "Declared units (spec \u00a7 4.3): a volume grid restating bohr, a trajectory metadata restating hartree and angstrom, a spectra.uvvis whose x values are stored in nm (x_units) rather than the kind's eV, QTAIM positions in bohr, and provenance.scf_energy in the unit name 'hartree'. Consumers read every value in its declared unit.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "spectra.uvvis",
+    "structure",
+    "topology.qtaim",
+    "trajectory",
+    "volume.density"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "scf_energy",
+        "units"
+      ],
+      "equals": "hartree"
+    },
+    {
+      "section": "rho",
+      "member": "grid",
+      "json_pointer": [
+        "units",
+        "origin"
+      ],
+      "equals": "bohr"
+    },
+    {
+      "section": "rho",
+      "member": "grid",
+      "json_pointer": [
+        "units",
+        "voxel_vectors"
+      ],
+      "equals": "bohr"
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "units",
+        "energies"
+      ],
+      "equals": "hartree"
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "units",
+        "coords"
+      ],
+      "equals": "angstrom"
+    },
+    {
+      "section": "uvvis_nm",
+      "member": "spectrum",
+      "json_pointer": [
+        "x_units"
+      ],
+      "equals": "nm"
+    },
+    {
+      "section": "uvvis_nm",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        0
+      ],
+      "equals": 167.6,
+      "tol": 1e-09
+    },
+    {
+      "section": "uvvis_nm",
+      "member": "spectrum",
+      "json_pointer": [
+        "y_units"
+      ],
+      "equals": "dimensionless"
+    },
+    {
+      "section": "aim",
+      "member": "critical_points",
+      "json_pointer": [
+        "units",
+        "position"
+      ],
+      "equals": "bohr"
+    },
+    {
+      "section": "aim",
+      "member": "critical_points",
+      "json_pointer": [
+        "points",
+        1,
+        "position",
+        1
+      ],
+      "equals": 1.0911,
+      "tol": 1e-09
+    }
+  ]
+}

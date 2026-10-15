@@ -10,6 +10,18 @@
   "schema_id": "https://vibe-qc.org/spec/qvf/1/manifest.schema.json",
   "producible_versions": [1],
   "readable_versions": [1, 2],
+  "file_type": {
+    "extension": ".qvf",
+    "media_type": "application/vnd.vibe-qc.qvf+zip",
+    "uti": "com.vibe-qc.qvf",
+    "uti_conforms_to": [
+      "public.zip-archive",
+      "public.content"
+    ],
+    "description": "QVF quantum-chemistry archive",
+    "declarations": "spec/file-type/",
+    "note": "Spec § 2.4 (File identification). Every program that reads or writes QVF declares these values exactly, so the desktop associates .qvf files with one type. The media type is in the IANA vendor tree with the +zip suffix; it is not yet registered with IANA."
+  },
   "version_decisions": [
     {
       "version": 2,
@@ -17,7 +29,7 @@
       "decided": "2026-07-10",
       "emitted_by": "vibe-qc v0.10.0 - v0.15.x (periodic reaction.path only)",
       "summary": "Withdrawn: the whole schema-visible delta was one optional member (`lattice` on `reaction.path`), which is the additive case and must not bump qvf_version. `lattice` is now an optional member of v1; a periodic reaction path is detected by its presence.",
-      "compatibility": "Producers MUST NOT emit qvf_version 2. Consumers SHOULD accept it and treat it as 1 (archives already exist in the wild). qvf_manifest_v2.schema.json is retained as a frozen artifact resolving its $id; it is a strict superset of v1.",
+      "compatibility": "Producers MUST NOT emit qvf_version 2. Consumers SHOULD accept it and treat it as 1 (archives already exist in the wild): validators check such an archive against the current v1 schema and report the warning W_VERSION_WITHDRAWN (spec § 3.1). spec/legacy/qvf_manifest_v2.schema.json is retained as a frozen artifact only so that its $id resolves: it is qvf 0.1.0's v1 schema with qvf_version 1 or 2, no validator uses it, and it is not a superset of the current v1 schema.",
       "see": "GOVERNANCE.md#version-history-and-decisions"
     }
   ],
@@ -33,7 +45,12 @@
     "volume.potential",
     "volume.rdg",
     "volume.generic",
+    "volume.laplacian",
+    "volume.vector",
+    "volume.complex",
+    "volume.series",
     "wavefunction.gto",
+    "wavefunction.bloch",
     "basis.ao",
     "atom_properties",
     "trajectory",
@@ -63,7 +80,16 @@
     "phonon_dos",
     "topology.qtaim",
     "run.record",
-    "job.spec"
+    "job.spec",
+    "forces",
+    "hessian",
+    "excited_states",
+    "volume.transition_density",
+    "properties.electric",
+    "properties.elastic",
+    "properties.dielectric",
+    "reaction.scheme",
+    "preview"
   ],
   "reserved_kinds": [
     "volume.orbital_projection",
@@ -75,7 +101,7 @@
       "namespace": "x_vibeqc",
       "owner": "vibe-qc",
       "url": "https://vibe-qc.com",
-      "purpose": "First-party vendor data that is not part of the visualization contract: restart-only per-k complex Bloch wavefunctions (x_vibeqc.bloch_wavefunction) and live-checkpoint hints."
+      "purpose": "First-party vendor data that is not part of the visualization contract: restart-only per-k complex Bloch wavefunctions (x_vibeqc.bloch_wavefunction; its coefficient layout was promoted provisionally to the canonical wavefunction.bloch) and live-checkpoint hints."
     },
     {
       "namespace": "x_orca",
@@ -83,9 +109,93 @@
       "url": "https://www.faccts.de/orca/",
       "status": "reserved",
       "purpose": "ORCA-specific data with no canonical kind. (EPR started here as x_orca.epr and was promoted to the canonical spectra.epr kind.)"
+    },
+    {
+      "namespace": "x_vibesketch",
+      "owner": "vibe-sketch",
+      "url": "https://vibe-qc.com/vibe-sketch/docs/",
+      "purpose": "The editable document of the vibe-sketch structure and reaction sketcher: x_vibesketch.document, not critical, its namespace declared in extensions, with the JSON members document (the vibe-sketch/1 document, its Ketcher KET drawing included), species (each species' identifiers, charge, multiplicity and structure section, those without a 3-D structure included) and sdf (the species as an SD file). The meaning of a sketch has canonical carriers: the chemical identity of each species on its structure section, the scheme as reaction.scheme, the jobs as job.spec sections and the picture, a PNG thumbnail and the scheme as SVG, as preview; the drawing itself has no canonical kind (spec § 9)."
     }
   ],
   "promotions": [
+    {
+      "kind": "reaction.scheme",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). A reaction scheme in one strict JSON payload: steps in reading order, each relating structure sections as reactants, reagents and products (with stoichiometric coefficients) under a forward, equilibrium, retrosynthetic or resonance arrow, with the conditions as written and the yield. Roles are chemical whatever the arrow. The step key energies is reserved for reaction energies. Added together with the optional chemical identity of structure sections (charge, multiplicity, name, smiles, inchi, inchikey)."
+    },
+    {
+      "kind": "preview",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). A picture of the archive for file managers and quick-look panels: a required raster thumbnail (image/png or image/jpeg) and an optional larger or vector image (image/svg+xml, image/png or image/jpeg), both opaque binary members with the new member-spec field media_type. The archive's picture is the thumbnail of the first preview section; SVG is self-contained and inert."
+    },
+    {
+      "kind": "excited_states",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The excited states of a TD-DFT, CIS, ADC or EOM-CC calculation in one strict JSON payload: per state its index, excitation and total energy, multiplicity, symmetry, oscillator and rotatory strength, electric and magnetic transition dipoles, dominant orbital excitations, and references to its natural transition orbitals (wavefunction.gto sections) and its transition or difference density (a volume section). A one-dimensional spectrum names the section through states_ref."
+    },
+    {
+      "kind": "volume.transition_density",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The transition density between the reference state and one excited state on a volume grid (e/bohr^3, same members as volume.density); optional section fields excited_states_ref and state_index name the state. Added together with excited_states."
+    },
+    {
+      "kind": "properties.electric",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). Electric multipole moments and polarizabilities in one strict JSON payload: dipole (debye), quadrupole (debye-angstrom, Buckingham or Cartesian), octupole, polarizability and hyperpolarizability (atomic units). A dipole restated beside the root dipole_moment block must agree with it within 1e-6 debye."
+    },
+    {
+      "kind": "properties.elastic",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The 6x6 stiffness matrix of a periodic system in Voigt notation (GPa) with optional compliance (1/GPa) and the Voigt, Reuss or Hill isotropic moduli, in one strict JSON payload; the matrices must be symmetric."
+    },
+    {
+      "kind": "properties.dielectric",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The electronic, ionic and static dielectric tensors, the Born effective charges (one 3x3 tensor per atom, in e) and the piezoelectric tensor (C/m^2) of a periodic system in one strict JSON payload; static equals electronic plus ionic."
+    },
+    {
+      "kind": "forces",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The nuclear energy gradient (float64 [n_atoms, 3], hartree/bohr; forces are its negative) and, for periodic systems, the stress tensor (float64 [3, 3], hartree/bohr^3) at one geometry, with an optional strict meta payload. Added together with the root energies block."
+    },
+    {
+      "kind": "hessian",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The Cartesian Hessian (float64 [3N, 3N], hartree/bohr^2) at one geometry, with an optional strict meta payload (mass weighting, projection, atom masses); a vibrations section may name it through hessian_ref."
+    },
+    {
+      "kind": "volume.laplacian",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). The Laplacian of the electron density, nabla^2 rho in e/bohr^5, on a volume grid (float32/64 [nx, ny, nz]); the charge concentration and depletion map of QTAIM analyses, which producers had to write as volume.generic before. Added together with the periodic grid semantics (periodic, includes_endpoint, structure_ref)."
+    },
+    {
+      "kind": "volume.vector",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). A Cartesian vector field on a volume grid (float32/64 [nx, ny, nz, 3], last axis x, y, z), such as a density gradient, an electric field or a current density; its unit is declared as grid.units.data when the vocabulary names it. Added together with the periodic grid semantics (periodic, includes_endpoint, structure_ref)."
+    },
+    {
+      "kind": "volume.complex",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). A complex scalar field on a volume grid (float32/64 [nx, ny, nz, 2], last axis [re, im]), such as a complex orbital or a Bloch function at one k-point. Added together with the periodic grid semantics (periodic, includes_endpoint, structure_ref)."
+    },
+    {
+      "kind": "volume.series",
+      "from": null,
+      "promoted_in": "1 (2026-10)",
+      "note": "Added directly by maintainer decision (GOVERNANCE.md, Change process: clear ecosystem need + reference consumer). A series of n scalar fields on one grid (float32/64 [n, nx, ny, nz]) with a required strict axis payload (time, frame, state or custom; values, units, labels, trajectory_ref). Supersedes, without deprecating, the frame_volumes + volume_grid members of reaction.path. Added together with the periodic grid semantics (periodic, includes_endpoint, structure_ref)."
+    },
     {
       "kind": "job.spec",
       "from": null,
@@ -103,6 +213,13 @@
       "from": "x_orca.epr",
       "promoted_in": "1 (2026-07)",
       "note": "Promoted by maintainer decision ahead of the two-producer threshold to give ORCA a canonical target for EPR (g-tensor / hyperfine / zero-field-splitting)."
+    },
+    {
+      "kind": "wavefunction.bloch",
+      "from": "x_vibeqc.bloch_wavefunction",
+      "promoted_in": "1 (2026-10)",
+      "status": "provisional",
+      "note": "Promoted by maintainer decision ahead of the two-producer threshold (format review P15, decision 5), so that periodic producers have a canonical target for k-resolved Bloch orbitals: the shared Gaussian basis of wavefunction.gto, a kpoints payload (fractional k-points, weights), complex mo_coefficients float64 [n_k, n_spin, n_mo, n_ao, 2] with energies and occupations [n_k, n_spin, n_mo], and the Bloch sum stated in spec 5.3.1. Provisional: it becomes final when a second, independent producer (for example CP2K, CRYSTAL or a PySCF-PBC adapter) ships it, and any revision that producer needs before then is additive, as for every canonical kind. The vendor layout's restricted coefficient payload maps onto it without a data change; its spin-density restart payload stays in the vendor namespace (GOVERNANCE.md)."
     }
   ]
 }

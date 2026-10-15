@@ -1,0 +1,144 @@
+{
+  "archive": "wavefunction_uhf.qvf",
+  "description": "Unrestricted wavefunction.gto (spin unrestricted): a lithium atom with two alpha and one beta electron. mo_metadata carries alpha and beta objects (no top-level energies or occupations) and the coefficients are two separate members, mo_coefficients_alpha and mo_coefficients_beta. Illustrative numbers, not a converged UHF.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "spin"
+      ],
+      "equals": "unrestricted"
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 5
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "n_mo"
+      ],
+      "equals": 5
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "occupations",
+        1
+      ],
+      "equals": 1.0
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "occupations",
+        1
+      ],
+      "equals": 0.0
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "energies",
+        0
+      ],
+      "equals": -2.4777,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "energies",
+        0
+      ],
+      "equals": -2.4325,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "mo_coefficients_alpha",
+        "shape"
+      ],
+      "equals": [
+        5,
+        5
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "mo_coefficients_beta",
+        "shape"
+      ],
+      "equals": [
+        5,
+        5
+      ]
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients_alpha",
+      "binary_index": [
+        0,
+        1
+      ],
+      "equals": 0.09983341664682815,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients_alpha",
+      "binary_index": [
+        1,
+        0
+      ],
+      "equals": -0.09983341664682815,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients_beta",
+      "binary_index": [
+        0,
+        1
+      ],
+      "equals": 0.21822962308086932,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients_beta",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 0.9758974493306055,
+      "tol": 1e-12
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "archive": "volume_vector_trailing_axis.qvf",
+  "description": "A volume.vector whose data is [2, 2, 2, 2]; a vector field is [nx, ny, nz, 3] (spec \u00a7 5.2). A validator with a JSON Schema engine also reports E_SCHEMA.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    },
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

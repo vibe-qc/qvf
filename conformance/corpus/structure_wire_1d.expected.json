@@ -1,0 +1,63 @@
+{
+  "archive": "structure_wire_1d.qvf",
+  "description": "1-D periodic wire (a carbon chain): pbc [false, true, false], so the periodic axis is y and is not the leading one; dimensionality 1. Rows 0 and 2 of lattice_vectors are synthesized normals of different lengths (14.0 and 17.5 Angstrom), not cell edges.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "pbc"
+      ],
+      "equals": [
+        false,
+        true,
+        false
+      ]
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "dimensionality"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        1,
+        1
+      ],
+      "equals": 2.46,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        0,
+        0
+      ],
+      "equals": 14.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        2,
+        2
+      ],
+      "equals": 17.5,
+      "tol": 1e-12
+    }
+  ]
+}
