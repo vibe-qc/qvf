@@ -1,0 +1,92 @@
+{
+  "archive": "volume_rdg.qvf",
+  "description": "volume.rdg: the dimensionless reduced density gradient of a neon pair (float32, 5x5x6 grid in bohr); small between the atoms.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.rdg"
+  ],
+  "checks": [
+    {
+      "section": "rdg",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 5
+    },
+    {
+      "section": "rdg",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 5
+    },
+    {
+      "section": "rdg",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 6
+    },
+    {
+      "section": "rdg",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.8,
+      "tol": 1e-12
+    },
+    {
+      "section": "rdg",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.9,
+      "tol": 1e-12
+    },
+    {
+      "section": "rdg",
+      "member": "data",
+      "binary_index": [
+        2,
+        2,
+        2
+      ],
+      "equals": 0.0944284200668335,
+      "tol": 1e-06
+    },
+    {
+      "section": "rdg",
+      "member": "data",
+      "binary_index": [
+        0,
+        4,
+        5
+      ],
+      "equals": 0.8997620940208435,
+      "tol": 1e-06
+    },
+    {
+      "section": "rdg",
+      "member": "data",
+      "binary_index": [
+        4,
+        1,
+        3
+      ],
+      "equals": 0.6391626596450806,
+      "tol": 1e-06
+    }
+  ]
+}

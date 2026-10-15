@@ -1,0 +1,10 @@
+{
+  "archive": "critical_undeclared.qvf",
+  "description": "A critical vendor section whose namespace x_test is not declared in root extensions (spec \u00a7 7.4).",
+  "expect": [
+    {
+      "code": "E_CRITICAL_UNDECLARED",
+      "severity": "error"
+    }
+  ]
+}

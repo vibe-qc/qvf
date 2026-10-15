@@ -1,0 +1,10 @@
+{
+  "archive": "trajectory_ref_wrong_kind.qvf",
+  "description": "reaction.waypoints.trajectory_ref names an existing section of kind structure instead of a trajectory section (spec \u00a7 5.5).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

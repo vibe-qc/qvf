@@ -1,0 +1,10 @@
+{
+  "archive": "dtype_unknown.qvf",
+  "description": "A binary member with an unknown dtype.",
+  "expect": [
+    {
+      "code": "E_DTYPE",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_path_v2.qvf",
+  "description": "A periodic reaction.path (fixed [3, 3] lattice member) stamped qvf_version 2, as vibe-qc v0.10 - v0.15 wrote it before the bump was withdrawn (GOVERNANCE.md, 2026-07-10). Apart from the version and the v2 schema_uri it is a valid v1 archive. Consumers SHOULD read it as version 1, and validators check it as version 1 and report the warning W_VERSION_WITHDRAWN, so the archive is valid: the warning records that producers must not write version 2 (spec \u00a7 3.1).",
+  "expect": [
+    {
+      "code": "W_VERSION_WITHDRAWN",
+      "severity": "warning"
+    }
+  ]
+}

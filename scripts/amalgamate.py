@@ -56,17 +56,20 @@ def build() -> str:
     # --- always-visible declarations (writer + reader public API) --------
     parts.append("\n// ===== qvf/json.hpp =====\n")
     parts.append(_read("include/qvf/json.hpp"))
-    for rel in ("include/qvf/qvf.hpp", "include/qvf/qvf_reader.hpp"):
+    for rel in ("include/qvf/kinds_generated.hpp", "include/qvf/units.hpp",
+                "include/qvf/container.hpp", "include/qvf/model.hpp",
+                "include/qvf/qvf.hpp", "include/qvf/qvf_reader.hpp"):
         parts.append(f"\n// ===== {rel} (public API) =====\n")
         parts.append(_strip_local_includes(_read(rel)))
 
     # --- implementation, compiled once -----------------------------------
     parts.append("\n#ifdef QVF_IMPLEMENTATION\n")
-    for rel in ("src/qvf_sha256.hpp", "src/qvf_deflate.hpp", "src/qvf_inflate.hpp",
-                "src/qvf_zip.hpp", "src/qvf_unzip.hpp"):
+    for rel in ("src/qvf_sha256.hpp", "src/qvf_crc32.hpp", "src/qvf_deflate.hpp",
+                "src/qvf_inflate.hpp", "src/qvf_zip.hpp", "src/qvf_unzip.hpp",
+                "src/qvf_schema_table.hpp", "src/qvf_schema_check.hpp"):
         parts.append(f"\n// ===== {rel} =====\n")
         parts.append(_strip_local_includes(_read(rel)))
-    for rel in ("src/qvf.cpp", "src/qvf_reader.cpp"):
+    for rel in ("src/qvf_container.cpp", "src/qvf.cpp", "src/qvf_reader.cpp"):
         parts.append(f"\n// ===== {rel} =====\n")
         parts.append(_strip_local_includes(_read(rel)))
     parts.append("\n#endif  // QVF_IMPLEMENTATION\n")

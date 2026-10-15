@@ -1,0 +1,96 @@
+{
+  "archive": "wavefunction_localized.qvf",
+  "description": "Two hydrogen molecules 3 \u00c5 apart with their intrinsic bond orbitals (orbital_kind ibo), one per molecule: each the normalized bonding combination of the molecule's two s functions, so atom_populations puts half of each orbital on each of its atoms, n_centres is 2 and the centroids are the bond midpoints in bohr. mo_metadata names the localization_method and the localization_reference_basis, the minimal basis the IAOs were built from (minao), and the IAO charges are the canonical iao_charge member of an atom_properties section (spec \u00a7 5.3, \u00a7 5.7). The orbital energies are illustrative.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "orbital_kind"
+      ],
+      "equals": "ibo"
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "localization_method"
+      ],
+      "equals": "ibo"
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "localization_reference_basis"
+      ],
+      "equals": "minao"
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "atom_populations",
+        1,
+        2
+      ],
+      "equals": 0.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "centroids_bohr",
+        1,
+        0
+      ],
+      "equals": 5.6691783737999994,
+      "tol": 1e-09
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "n_centres"
+      ],
+      "equals": [
+        2,
+        2
+      ]
+    },
+    {
+      "section": "wf_ibo",
+      "member": "mo_coefficients",
+      "binary_index": [
+        1,
+        3
+      ],
+      "equals": 0.6027698725819514,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_ibo",
+      "member": "basis",
+      "json_pointer": [
+        "n_electrons"
+      ],
+      "equals": 4
+    },
+    {
+      "section": "iao_charges",
+      "member": "iao_charge",
+      "binary_index": [
+        2
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    }
+  ]
+}

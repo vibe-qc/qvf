@@ -1,0 +1,160 @@
+{
+  "archive": "spectra_all.qvf",
+  "description": "All six 1-D spectrum kinds ($defs/SpectrumPayload) of a synthetic H2O2: frequencies carry the x axis in the kind's spec section 4.3 unit (cm^-1 vibrational, eV electronic) unless x_units declares one; IR with peaks and Lorentzian broadening, Raman and UV-Vis kind blocks, the x alias, and a generic spectrum with declared units.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "spectra.ecd",
+    "spectra.generic",
+    "spectra.ir",
+    "spectra.raman",
+    "spectra.uvvis",
+    "spectra.vcd",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        5
+      ],
+      "equals": 3608.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "x_units"
+      ],
+      "equals": "cm-1"
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "peaks",
+        1,
+        "width"
+      ],
+      "equals": 12.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_ir",
+      "member": "spectrum",
+      "json_pointer": [
+        "broadening",
+        "type"
+      ],
+      "equals": "lorentzian"
+    },
+    {
+      "section": "spectra_raman",
+      "member": "spectrum",
+      "json_pointer": [
+        "raman",
+        "laser_nm"
+      ],
+      "equals": 532.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_raman",
+      "member": "spectrum",
+      "json_pointer": [
+        "raman",
+        "depolarization_ratios",
+        1
+      ],
+      "equals": 0.12,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_raman",
+      "member": "spectrum",
+      "json_pointer": [
+        "temperature_k"
+      ],
+      "equals": 298.15,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "x",
+        2
+      ],
+      "equals": 8.05,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "peaks",
+        0,
+        "assignment",
+        "state_index"
+      ],
+      "equals": 3
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "broadening",
+        "fwhm"
+      ],
+      "equals": 0.3,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "uvvis",
+        "x_axis"
+      ],
+      "equals": "wavelength_nm"
+    },
+    {
+      "section": "spectra_ecd",
+      "member": "spectrum",
+      "json_pointer": [
+        "intensities",
+        1
+      ],
+      "equals": -2.4,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_vcd",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies",
+        0
+      ],
+      "equals": 371.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_generic",
+      "member": "spectrum",
+      "json_pointer": [
+        "y_units"
+      ],
+      "equals": "dimensionless"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        6,
+        "label"
+      ],
+      "equals": "Photoelectron spectrum"
+    }
+  ]
+}

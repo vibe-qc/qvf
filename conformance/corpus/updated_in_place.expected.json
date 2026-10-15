@@ -1,0 +1,107 @@
+{
+  "archive": "updated_in_place.qvf",
+  "description": "An archive updated in place (spec \u00a7 2.3). A pending job (structure, job.spec, a run.record holding the prepared input, provenance.run_status 'pending') was written with its manifest last; a runner then appended the run's log, a rewritten run.record files index under a new name (run/files.2.json), Mulliken charges and a new manifest.json, and wrote a new central directory listing every entry. The archive therefore holds two manifest.json entries: the last is the manifest (run_status 'converged', metadata.modified_utc set, created_utc and uuid kept), the first is superseded. The superseded manifest and run/files.json are orphans, so a validator reports W_ORPHAN_MEMBER twice and no error; E_ZIP_DUPLICATE_ENTRY does not apply to manifest.json. The new manifest references the kept entries (structure, job.spec, the input) and the appended ones. A consumer that reads the first manifest.json sees run_status 'pending' and fails the checks.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "job.spec",
+    "run.record",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "converged"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "modified_utc"
+      ],
+      "equals": "2026-10-08T09:05:41Z"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "created_utc"
+      ],
+      "equals": "2026-10-08T09:00:00Z"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "uuid"
+      ],
+      "equals": "0b5e7c1a-2d4f-4e6a-9b8c-7d1e2f3a4b5c"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "sequence"
+      ],
+      "equals": 0
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "members",
+        "files",
+        "path"
+      ],
+      "equals": "run/files.2.json"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "method"
+      ],
+      "equals": "rhf"
+    },
+    {
+      "section": "run",
+      "member": "input",
+      "decode": "utf8",
+      "equals": "! RHF STO-3G\n* xyz 0 1\nO 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692\n*\n"
+    },
+    {
+      "section": "run",
+      "member": "log",
+      "decode": "utf8",
+      "contains": "SCF CONVERGED"
+    },
+    {
+      "section": "run",
+      "member": "files",
+      "json_pointer": [
+        "log",
+        "filename"
+      ],
+      "equals": "water.out"
+    },
+    {
+      "section": "charges",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.3302,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        0,
+        "symbol"
+      ],
+      "equals": "O"
+    }
+  ]
+}

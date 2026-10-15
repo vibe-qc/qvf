@@ -1,0 +1,92 @@
+{
+  "archive": "volume_elf.qvf",
+  "description": "volume.elf: a dimensionless localization function with values in [0, 1] (float32, 5x5x5 grid in bohr).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.elf"
+  ],
+  "checks": [
+    {
+      "section": "elf",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 5
+    },
+    {
+      "section": "elf",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 5
+    },
+    {
+      "section": "elf",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 5
+    },
+    {
+      "section": "elf",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "elf",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "elf",
+      "member": "data",
+      "binary_index": [
+        2,
+        2,
+        2
+      ],
+      "equals": 0.949999988079071,
+      "tol": 1e-06
+    },
+    {
+      "section": "elf",
+      "member": "data",
+      "binary_index": [
+        0,
+        1,
+        4
+      ],
+      "equals": 0.5144689679145813,
+      "tol": 1e-06
+    },
+    {
+      "section": "elf",
+      "member": "data",
+      "binary_index": [
+        4,
+        3,
+        1
+      ],
+      "equals": 0.6290534138679504,
+      "tol": 1e-06
+    }
+  ]
+}

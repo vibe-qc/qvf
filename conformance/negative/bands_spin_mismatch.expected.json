@@ -1,0 +1,10 @@
+{
+  "archive": "bands_spin_mismatch.qvf",
+  "description": "A bands section whose rank-4 projections carry n_spin 2 while its eigenvalues carry n_spin 1 (spec \u00a7 5.6).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

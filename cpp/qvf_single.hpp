@@ -18,13 +18,15 @@
 // Just enough JSON to build QVF manifests and member payloads: null, bool,
 // integer, double, string, ordered object, and array. Objects preserve
 // insertion order. Numbers emit as round-trippable JSON (integers without a
-// decimal point; doubles via %.17g). This is deliberately minimal — it is a
-// *writer*, not a parser.
+// decimal point; doubles via %.17g). The small recursive-descent parser used by
+// the reader bounds its nesting depth (JsonDepthError), so untrusted input
+// cannot exhaust the stack.
 //
 // License: Apache-2.0.
 #ifndef QVF_JSON_HPP
 #define QVF_JSON_HPP
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +38,14 @@
 #include <vector>
 
 namespace qvf {
+
+// Thrown by Json::parse when a document nests arrays/objects deeper than the
+// caller's limit (spec § 6: E_JSON_TOO_DEEP). Distinct from the plain
+// std::runtime_error thrown for malformed JSON.
+class JsonDepthError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Json {
 public:
@@ -49,6 +59,10 @@ public:
     Json(long long v) : type_(Type::Int), int_(v) {}
     Json(unsigned v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
     Json(unsigned long v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
+    // size_t is `unsigned long long` on LLP64 (64-bit Windows), and so is
+    // uint64_t on macOS; without this overload Json(size_t) / Json(uint64_t)
+    // is an ambiguous call there.
+    Json(unsigned long long v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
     Json(double v) : type_(Type::Double), dbl_(v) {}
     Json(const char* s) : type_(Type::String), str_(s) {}
     Json(std::string s) : type_(Type::String), str_(std::move(s)) {}
@@ -103,6 +117,19 @@ public:
         if (type_ != Type::Object) return false;
         for (const auto& kv : obj_) if (kv.first == key) return true;
         return false;
+    }
+    // Remove every member named `key` (a parsed object may repeat a key).
+    // Returns true if anything was removed; a no-op returning false on a
+    // non-object, including a Raw fragment.
+    bool erase(const std::string& key) {
+        if (type_ != Type::Object) return false;
+        const size_t before = obj_.size();
+        obj_.erase(std::remove_if(obj_.begin(), obj_.end(),
+                                  [&key](const std::pair<std::string, Json>& kv) {
+                                      return kv.first == key;
+                                  }),
+                   obj_.end());
+        return obj_.size() != before;
     }
 
     Type type() const { return type_; }
@@ -177,10 +204,16 @@ public:
     const Json& operator[](const std::string& key) const { return at(key); }
     const Json& operator[](size_t i) const { return at(i); }
 
-    // Parse a UTF-8 JSON document. Throws std::runtime_error on malformed input.
-    static Json parse(const std::string& text) {
+    // Default nesting limit of parse(): the spec § 6 reference value.
+    static constexpr size_t kDefaultMaxDepth = 64;
+
+    // Parse a UTF-8 JSON document. Throws std::runtime_error on malformed input
+    // and JsonDepthError when arrays/objects nest deeper than `max_depth`
+    // (a top-level `[]` is depth 1; scalars are depth 0).
+    static Json parse(const std::string& text,
+                      size_t max_depth = kDefaultMaxDepth) {
         size_t pos = 0;
-        Json v = parse_value(text, pos);
+        Json v = parse_value(text, pos, 0, max_depth);
         skip_ws(text, pos);
         if (pos != text.size())
             throw std::runtime_error("qvf::Json::parse: trailing content");
@@ -194,12 +227,18 @@ private:
                (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
             ++p;
     }
-    static Json parse_value(const std::string& s, size_t& p) {
+    static Json parse_value(const std::string& s, size_t& p, size_t depth,
+                            size_t max_depth) {
         skip_ws(s, p);
         if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: unexpected end");
         char c = s[p];
-        if (c == '{') return parse_object(s, p);
-        if (c == '[') return parse_array(s, p);
+        if (c == '{' || c == '[') {
+            if (depth + 1 > max_depth)
+                throw JsonDepthError("qvf::Json::parse: nesting deeper than " +
+                                     std::to_string(max_depth) + " levels");
+            return c == '{' ? parse_object(s, p, depth + 1, max_depth)
+                            : parse_array(s, p, depth + 1, max_depth);
+        }
         if (c == '"') return Json(parse_string(s, p));
         if (c == 't' || c == 'f') return parse_bool(s, p);
         if (c == 'n') { expect(s, p, "null"); return Json(nullptr); }
@@ -234,18 +273,19 @@ private:
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
                     case 'u': {
-                        if (p + 4 > s.size())
-                            throw std::runtime_error("qvf::Json::parse: bad \\u");
-                        unsigned cp = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = s[p++];
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= unsigned(h - '0');
-                            else if (h >= 'a' && h <= 'f') cp |= unsigned(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') cp |= unsigned(h - 'A' + 10);
-                            else throw std::runtime_error("qvf::Json::parse: bad hex");
+                        unsigned cp = parse_hex4(s, p);
+                        // A high surrogate followed by an escaped low surrogate
+                        // is one code point; a lone surrogate stands for itself.
+                        if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= s.size() &&
+                            s[p] == '\\' && s[p + 1] == 'u') {
+                            size_t q = p + 2;
+                            const unsigned lo = parse_hex4(s, q);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                p = q;
+                            }
                         }
-                        encode_utf8(out, cp);  // surrogate pairs left as-is (rare in QVF)
+                        encode_utf8(out, cp);
                         break;
                     }
                     default: throw std::runtime_error("qvf::Json::parse: bad escape");
@@ -256,13 +296,32 @@ private:
         }
         throw std::runtime_error("qvf::Json::parse: unterminated string");
     }
+    // Four hex digits of a \u escape at s[p], advancing p.
+    static unsigned parse_hex4(const std::string& s, size_t& p) {
+        if (p + 4 > s.size()) throw std::runtime_error("qvf::Json::parse: bad \\u");
+        unsigned cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            char h = s[p++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9') cp |= unsigned(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= unsigned(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= unsigned(h - 'A' + 10);
+            else throw std::runtime_error("qvf::Json::parse: bad hex");
+        }
+        return cp;
+    }
     static void encode_utf8(std::string& out, unsigned cp) {
         if (cp < 0x80) out.push_back(static_cast<char>(cp));
         else if (cp < 0x800) {
             out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
+        } else if (cp < 0x10000) {
             out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
         }
@@ -287,13 +346,14 @@ private:
             return Json(std::stod(num));
         }
     }
-    static Json parse_array(const std::string& s, size_t& p) {
+    static Json parse_array(const std::string& s, size_t& p, size_t depth,
+                            size_t max_depth) {
         ++p;  // '['
         Json a = array();
         skip_ws(s, p);
         if (p < s.size() && s[p] == ']') { ++p; return a; }
         while (true) {
-            a.arr_.push_back(parse_value(s, p));
+            a.arr_.push_back(parse_value(s, p, depth, max_depth));
             skip_ws(s, p);
             if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: bad array");
             if (s[p] == ',') { ++p; continue; }
@@ -302,7 +362,8 @@ private:
         }
         return a;
     }
-    static Json parse_object(const std::string& s, size_t& p) {
+    static Json parse_object(const std::string& s, size_t& p, size_t depth,
+                             size_t max_depth) {
         ++p;  // '{'
         Json o = object();
         skip_ws(s, p);
@@ -316,7 +377,7 @@ private:
             if (p >= s.size() || s[p] != ':')
                 throw std::runtime_error("qvf::Json::parse: expected :");
             ++p;
-            o.obj_.emplace_back(key, parse_value(s, p));
+            o.obj_.emplace_back(key, parse_value(s, p, depth, max_depth));
             skip_ws(s, p);
             if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: bad object");
             if (s[p] == ',') { ++p; continue; }
@@ -334,7 +395,8 @@ private:
 
     static void emit_string(std::string& out, const std::string& s) {
         out.push_back('"');
-        for (unsigned char c : s) {
+        for (char ch : s) {
+            const unsigned char c = static_cast<unsigned char>(ch);
             switch (c) {
                 case '"': out += "\\\""; break;
                 case '\\': out += "\\\\"; break;
@@ -370,7 +432,7 @@ private:
     void newline(std::string& out, int indent, int depth) const {
         if (indent <= 0) return;
         out.push_back('\n');
-        out.append(static_cast<size_t>(indent) * depth, ' ');
+        out.append(static_cast<size_t>(indent) * static_cast<size_t>(depth), ' ');
     }
 
     void dump_to(std::string& out, int indent, int depth) const {
@@ -424,6 +486,1506 @@ private:
 #endif  // QVF_JSON_HPP
 
 
+// ===== include/qvf/kinds_generated.hpp (public API) =====
+
+// qvf/kinds_generated.hpp -- GENERATED by scripts/gen_kinds.py from spec/qvf_manifest.schema.json; do not edit.
+// Regenerate with `python3 scripts/gen_kinds.py` (`--check` fails on drift).
+//
+// The tables the schema defines, for C++: the canonical section kinds with
+// the member roles of each (KindInfo / RoleInfo), the payload definition of
+// every JSON member role, the unit vocabulary (Unit, unit_name, parse_unit),
+// the finding codes of spec Appendix B and the schema $id. Header-only; part
+// of the zero-dependency QVF library. qvf/units.hpp re-exports the unit names
+// into namespace qvf and adds the conversions. License: Apache-2.0.
+#ifndef QVF_KINDS_GENERATED_HPP
+#define QVF_KINDS_GENERATED_HPP
+
+#include <cstddef>
+#include <optional>
+#include <string_view>
+
+namespace qvf {
+namespace gen {
+
+// The schema this file was generated from.
+inline constexpr std::string_view kSchemaId = "https://vibe-qc.org/spec/qvf/1/manifest.schema.json";
+inline constexpr std::string_view kSchemaDialect = "https://json-schema.org/draft/2020-12/schema";
+// The qvf_version every v1 archive declares (the schema's const).
+inline constexpr int kQvfVersion = 1;
+// registry.json: the versions a producer writes and a consumer opens.
+inline constexpr int kProducibleVersions[] = {1};
+inline constexpr int kReadableVersions[] = {1, 2};
+
+// --- kinds and roles ----------------------------------------------------------
+
+// How a member's bytes are stored: a JSON document, a typed little-endian
+// array (dtype + shape), or opaque bytes (format "binary" without dtype).
+enum class Format { Json, Binary, Opaque };
+
+// One member role of a canonical kind. `role` is the role name, or, when
+// `pattern` is set, the regular expression of the roles it admits (for
+// example custom.<name>). `dtypes` lists the allowed dtypes of a Binary role
+// in schema order; min_rank / max_rank bound the rank of its shape (max_rank
+// -1: no upper bound). Json and Opaque roles have no dtypes and ranks -1.
+// `payload_def` names the $defs entry that specifies a Json role's payload,
+// or is empty.
+struct RoleInfo {
+    std::string_view role;
+    bool required;
+    Format format;
+    const char* const* dtypes;
+    std::size_t n_dtypes;
+    int min_rank;
+    int max_rank;
+    std::string_view payload_def;
+    bool pattern;
+};
+
+// A canonical kind and its member roles in schema order.
+// `allow_extra_members` is true when the schema admits roles beyond `roles`.
+struct KindInfo {
+    std::string_view kind;
+    const RoleInfo* roles;
+    std::size_t n_roles;
+    bool allow_extra_members;
+};
+
+namespace tables {
+inline constexpr const char* kDtypes0[] = {"float32", "float64"};
+inline constexpr const char* kDtypes1[] = {"float64"};
+inline constexpr const char* kDtypes2[] = {"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64"};
+
+// structure ($defs/SectionStructure)
+inline constexpr RoleInfo kRoles0[] = {
+    {"structure", true, Format::Json, nullptr, 0, -1, -1, "StructurePayload", false},
+    {"bonds", false, Format::Json, nullptr, 0, -1, -1, "BondsPayload", false},
+};
+// bonds ($defs/SectionBonds)
+inline constexpr RoleInfo kRoles1[] = {
+    {"bonds", true, Format::Json, nullptr, 0, -1, -1, "BondsPayload", false},
+};
+// bond_orders ($defs/SectionBondOrders)
+inline constexpr RoleInfo kRoles2[] = {
+    {"bond_orders", true, Format::Json, nullptr, 0, -1, -1, "BondOrdersPayload", false},
+};
+// volume.density ($defs/SectionVolumeDensity)
+inline constexpr RoleInfo kRoles3[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.orbital ($defs/SectionVolumeOrbital)
+inline constexpr RoleInfo kRoles4[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.spin ($defs/SectionVolumeSpin)
+inline constexpr RoleInfo kRoles5[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.elf ($defs/SectionVolumeELF)
+inline constexpr RoleInfo kRoles6[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.difference ($defs/SectionVolumeDifference)
+inline constexpr RoleInfo kRoles7[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.potential ($defs/SectionVolumePotential)
+inline constexpr RoleInfo kRoles8[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.rdg ($defs/SectionVolumeRDG)
+inline constexpr RoleInfo kRoles9[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.generic ($defs/SectionVolumeGeneric)
+inline constexpr RoleInfo kRoles10[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.laplacian ($defs/SectionVolumeLaplacian)
+inline constexpr RoleInfo kRoles11[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// volume.vector ($defs/SectionVolumeVector)
+inline constexpr RoleInfo kRoles12[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 4, 4, "", false},
+};
+// volume.complex ($defs/SectionVolumeComplex)
+inline constexpr RoleInfo kRoles13[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 4, 4, "", false},
+};
+// volume.series ($defs/SectionVolumeSeries)
+inline constexpr RoleInfo kRoles14[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 4, 4, "", false},
+    {"axis", true, Format::Json, nullptr, 0, -1, -1, "VolumeSeriesAxisPayload", false},
+};
+// wavefunction.gto ($defs/SectionWavefunctionGTO)
+inline constexpr RoleInfo kRoles15[] = {
+    {"basis", true, Format::Json, nullptr, 0, -1, -1, "BasisPayload", false},
+    {"mo_metadata", true, Format::Json, nullptr, 0, -1, -1, "MoMetadataPayload", false},
+    {"mo_coefficients", false, Format::Binary, kDtypes1, 1, 2, 3, "", false},
+    {"mo_coefficients_alpha", false, Format::Binary, kDtypes1, 1, 2, 3, "", false},
+    {"mo_coefficients_beta", false, Format::Binary, kDtypes1, 1, 2, 3, "", false},
+    {"overlap", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"density_matrix", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"density_matrix_alpha", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"density_matrix_beta", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+};
+// wavefunction.bloch ($defs/SectionWavefunctionBloch)
+inline constexpr RoleInfo kRoles16[] = {
+    {"basis", true, Format::Json, nullptr, 0, -1, -1, "BasisPayload", false},
+    {"kpoints", true, Format::Json, nullptr, 0, -1, -1, "BlochKpointsPayload", false},
+    {"mo_metadata", true, Format::Json, nullptr, 0, -1, -1, "BlochMoMetadataPayload", false},
+    {"mo_coefficients", true, Format::Binary, kDtypes1, 1, 5, 5, "", false},
+    {"energies", true, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"occupations", true, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+};
+// basis.ao ($defs/SectionBasisAO)
+inline constexpr RoleInfo kRoles17[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// atom_properties ($defs/SectionAtomProperties)
+inline constexpr RoleInfo kRoles18[] = {
+    {"mulliken_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"loewdin_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"hirshfeld_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"iao_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"spin_population", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"cm5_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"chelpg_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"resp_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"esp_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"nbo_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"mbis_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"bader_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"ddec_charge", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"valence", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"bonded_valence", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"fukui_plus", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"fukui_minus", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"fukui_zero", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"dual_descriptor", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"atomic_energy_eh", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"atomic_volume_bohr3", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"nmr_shielding_iso_ppm", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"magnetic_moment", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"force_eh_bohr", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"meta", false, Format::Json, nullptr, 0, -1, -1, "AtomPropertiesMetaPayload", false},
+    {"^custom\\.[A-Za-z0-9_]+$", false, Format::Binary, kDtypes1, 1, 1, 2, "", true},
+};
+// trajectory ($defs/SectionTrajectory)
+inline constexpr RoleInfo kRoles19[] = {
+    {"metadata", true, Format::Json, nullptr, 0, -1, -1, "TrajectoryMetadataPayload", false},
+    {"coords", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+    {"lattice", false, Format::Binary, kDtypes1, 1, 2, 3, "", false},
+    {"velocities", false, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"gradient", false, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"times", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"energies", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"cell_volumes", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"temperatures", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+};
+// reaction.path ($defs/SectionReactionPath)
+inline constexpr RoleInfo kRoles20[] = {
+    {"metadata", true, Format::Json, nullptr, 0, -1, -1, "ReactionPathMetadataPayload", false},
+    {"coords", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+    {"frame_volumes", false, Format::Binary, kDtypes0, 2, 4, 4, "", false},
+    {"volume_grid", false, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"lattice", false, Format::Binary, kDtypes1, 1, 2, 3, "", false},
+    {"velocities", false, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"gradient", false, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"times", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+    {"energies", false, Format::Binary, kDtypes1, 1, 1, 1, "", false},
+};
+// reaction.waypoints ($defs/SectionReactionWaypoints)
+inline constexpr RoleInfo kRoles21[] = {
+    {"waypoints", true, Format::Json, nullptr, 0, -1, -1, "ReactionWaypointsPayload", false},
+};
+// scan.surface ($defs/SectionScanSurface)
+inline constexpr RoleInfo kRoles22[] = {
+    {"metadata", true, Format::Json, nullptr, 0, -1, -1, "ScanSurfaceMetadataPayload", false},
+    {"axis_a", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"axis_b", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"geometries", false, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+};
+// vibrations ($defs/SectionVibrations)
+inline constexpr RoleInfo kRoles23[] = {
+    {"metadata", true, Format::Json, nullptr, 0, -1, -1, "VibrationsMetadataPayload", false},
+    {"displacements", true, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+};
+// spectra.ir ($defs/SectionSpectraIR)
+inline constexpr RoleInfo kRoles24[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// spectra.raman ($defs/SectionSpectraRaman)
+inline constexpr RoleInfo kRoles25[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// spectra.uvvis ($defs/SectionSpectraUVVis)
+inline constexpr RoleInfo kRoles26[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// spectra.ecd ($defs/SectionSpectraECD)
+inline constexpr RoleInfo kRoles27[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// spectra.vcd ($defs/SectionSpectraVCD)
+inline constexpr RoleInfo kRoles28[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// spectra.nmr ($defs/SectionSpectraNMR)
+inline constexpr RoleInfo kRoles29[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "NmrSpectrumPayload", false},
+};
+// spectra.epr ($defs/SectionSpectraEPR)
+inline constexpr RoleInfo kRoles30[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "EprSpectrumPayload", false},
+};
+// spectra.generic ($defs/SectionSpectraGeneric)
+inline constexpr RoleInfo kRoles31[] = {
+    {"spectrum", true, Format::Json, nullptr, 0, -1, -1, "SpectrumPayload", false},
+};
+// bands ($defs/SectionBands)
+inline constexpr RoleInfo kRoles32[] = {
+    {"kpath", true, Format::Json, nullptr, 0, -1, -1, "KpathPayload", false},
+    {"eigenvalues", true, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+    {"projections", false, Format::Binary, kDtypes1, 1, 3, 4, "", false},
+    {"occupations", false, Format::Binary, kDtypes1, 1, 3, 3, "", false},
+};
+// dos.total ($defs/SectionDOSTotal)
+inline constexpr RoleInfo kRoles33[] = {
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"dos", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+};
+// dos.projected ($defs/SectionDOSProjected)
+inline constexpr RoleInfo kRoles34[] = {
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"projections", true, Format::Binary, kDtypes2, 10, 2, 3, "", false},
+};
+// dos.coop ($defs/SectionDOSCOOP)
+inline constexpr RoleInfo kRoles35[] = {
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"projections", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"integrated", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"meta", true, Format::Json, nullptr, 0, -1, -1, "DosMetaPayload", false},
+};
+// dos.cohp ($defs/SectionDOSCOHP)
+inline constexpr RoleInfo kRoles36[] = {
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"projections", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"integrated", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"meta", true, Format::Json, nullptr, 0, -1, -1, "DosMetaPayload", false},
+};
+// structure.symmetry ($defs/SectionStructureSymmetry)
+inline constexpr RoleInfo kRoles37[] = {
+    {"data", true, Format::Json, nullptr, 0, -1, -1, "SymmetryPayload", false},
+};
+// scf_history ($defs/SectionSCFHistory)
+inline constexpr RoleInfo kRoles38[] = {
+    {"iterations", true, Format::Json, nullptr, 0, -1, -1, "ScfHistoryPayload", false},
+};
+// citations ($defs/SectionCitations)
+inline constexpr RoleInfo kRoles39[] = {
+    {"references", true, Format::Opaque, nullptr, 0, -1, -1, "", false},
+};
+// equation_of_state ($defs/SectionEquationOfState)
+inline constexpr RoleInfo kRoles40[] = {
+    {"volumes", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"energies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"fit", true, Format::Json, nullptr, 0, -1, -1, "EosFitPayload", false},
+};
+// fermi_surface ($defs/SectionFermiSurface)
+inline constexpr RoleInfo kRoles41[] = {
+    {"mesh", true, Format::Json, nullptr, 0, -1, -1, "FermiMeshPayload", false},
+    {"energies", true, Format::Binary, kDtypes0, 2, 4, 4, "", false},
+};
+// phonon_bands ($defs/SectionPhononBands)
+inline constexpr RoleInfo kRoles42[] = {
+    {"qpath", true, Format::Json, nullptr, 0, -1, -1, "QpathPayload", false},
+    {"frequencies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"eigenvectors", false, Format::Binary, kDtypes1, 1, 4, 5, "", false},
+};
+// phonon_dos ($defs/SectionPhononDOS)
+inline constexpr RoleInfo kRoles43[] = {
+    {"meta", true, Format::Json, nullptr, 0, -1, -1, "PhononMetaPayload", false},
+    {"frequencies", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"dos", true, Format::Binary, kDtypes2, 10, 1, -1, "", false},
+    {"projected", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+};
+// topology.qtaim ($defs/SectionTopologyQTAIM)
+inline constexpr RoleInfo kRoles44[] = {
+    {"critical_points", true, Format::Json, nullptr, 0, -1, -1, "QtaimPayload", false},
+};
+// run.record ($defs/SectionRunRecord)
+inline constexpr RoleInfo kRoles45[] = {
+    {"input", false, Format::Opaque, nullptr, 0, -1, -1, "", false},
+    {"log", false, Format::Opaque, nullptr, 0, -1, -1, "", false},
+    {"files", false, Format::Json, nullptr, 0, -1, -1, "RunRecordFilesPayload", false},
+    {"^attachment\\.[A-Za-z0-9_.-]+$", false, Format::Opaque, nullptr, 0, -1, -1, "", true},
+};
+// job.spec ($defs/SectionJobSpec)
+inline constexpr RoleInfo kRoles46[] = {
+    {"spec", true, Format::Json, nullptr, 0, -1, -1, "JobSpecPayload", false},
+};
+// forces ($defs/SectionForces)
+inline constexpr RoleInfo kRoles47[] = {
+    {"gradient", true, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"stress", false, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"meta", false, Format::Json, nullptr, 0, -1, -1, "ForcesMetaPayload", false},
+};
+// hessian ($defs/SectionHessian)
+inline constexpr RoleInfo kRoles48[] = {
+    {"matrix", true, Format::Binary, kDtypes1, 1, 2, 2, "", false},
+    {"meta", false, Format::Json, nullptr, 0, -1, -1, "HessianMetaPayload", false},
+};
+// excited_states ($defs/SectionExcitedStates)
+inline constexpr RoleInfo kRoles49[] = {
+    {"states", true, Format::Json, nullptr, 0, -1, -1, "ExcitedStatesPayload", false},
+};
+// volume.transition_density ($defs/SectionVolumeTransitionDensity)
+inline constexpr RoleInfo kRoles50[] = {
+    {"grid", true, Format::Json, nullptr, 0, -1, -1, "VolumeGridPayload", false},
+    {"data", true, Format::Binary, kDtypes0, 2, 3, 3, "", false},
+};
+// properties.electric ($defs/SectionPropertiesElectric)
+inline constexpr RoleInfo kRoles51[] = {
+    {"properties", true, Format::Json, nullptr, 0, -1, -1, "ElectricPropertiesPayload", false},
+};
+// properties.elastic ($defs/SectionPropertiesElastic)
+inline constexpr RoleInfo kRoles52[] = {
+    {"properties", true, Format::Json, nullptr, 0, -1, -1, "ElasticPropertiesPayload", false},
+};
+// properties.dielectric ($defs/SectionPropertiesDielectric)
+inline constexpr RoleInfo kRoles53[] = {
+    {"properties", true, Format::Json, nullptr, 0, -1, -1, "DielectricPropertiesPayload", false},
+};
+// reaction.scheme ($defs/SectionReactionScheme)
+inline constexpr RoleInfo kRoles54[] = {
+    {"scheme", true, Format::Json, nullptr, 0, -1, -1, "ReactionSchemePayload", false},
+};
+// preview ($defs/SectionPreview)
+inline constexpr RoleInfo kRoles55[] = {
+    {"thumbnail", true, Format::Opaque, nullptr, 0, -1, -1, "", false},
+    {"image", false, Format::Opaque, nullptr, 0, -1, -1, "", false},
+};
+}  // namespace tables
+
+// Every canonical kind, in registry.json order.
+inline constexpr KindInfo kKindInfos[] = {
+    {"structure", tables::kRoles0, 2, false},
+    {"bonds", tables::kRoles1, 1, false},
+    {"bond_orders", tables::kRoles2, 1, false},
+    {"volume.density", tables::kRoles3, 2, false},
+    {"volume.orbital", tables::kRoles4, 2, false},
+    {"volume.spin", tables::kRoles5, 2, false},
+    {"volume.elf", tables::kRoles6, 2, false},
+    {"volume.difference", tables::kRoles7, 2, false},
+    {"volume.potential", tables::kRoles8, 2, false},
+    {"volume.rdg", tables::kRoles9, 2, false},
+    {"volume.generic", tables::kRoles10, 2, false},
+    {"volume.laplacian", tables::kRoles11, 2, false},
+    {"volume.vector", tables::kRoles12, 2, false},
+    {"volume.complex", tables::kRoles13, 2, false},
+    {"volume.series", tables::kRoles14, 3, false},
+    {"wavefunction.gto", tables::kRoles15, 9, false},
+    {"wavefunction.bloch", tables::kRoles16, 6, false},
+    {"basis.ao", tables::kRoles17, 2, false},
+    {"atom_properties", tables::kRoles18, 26, false},
+    {"trajectory", tables::kRoles19, 9, false},
+    {"reaction.path", tables::kRoles20, 9, false},
+    {"reaction.waypoints", tables::kRoles21, 1, false},
+    {"scan.surface", tables::kRoles22, 5, false},
+    {"vibrations", tables::kRoles23, 2, false},
+    {"spectra.ir", tables::kRoles24, 1, false},
+    {"spectra.raman", tables::kRoles25, 1, false},
+    {"spectra.uvvis", tables::kRoles26, 1, false},
+    {"spectra.ecd", tables::kRoles27, 1, false},
+    {"spectra.vcd", tables::kRoles28, 1, false},
+    {"spectra.nmr", tables::kRoles29, 1, false},
+    {"spectra.epr", tables::kRoles30, 1, false},
+    {"spectra.generic", tables::kRoles31, 1, false},
+    {"bands", tables::kRoles32, 4, false},
+    {"dos.total", tables::kRoles33, 2, false},
+    {"dos.projected", tables::kRoles34, 2, false},
+    {"dos.coop", tables::kRoles35, 4, false},
+    {"dos.cohp", tables::kRoles36, 4, false},
+    {"structure.symmetry", tables::kRoles37, 1, false},
+    {"scf_history", tables::kRoles38, 1, false},
+    {"citations", tables::kRoles39, 1, false},
+    {"equation_of_state", tables::kRoles40, 3, false},
+    {"fermi_surface", tables::kRoles41, 2, false},
+    {"phonon_bands", tables::kRoles42, 3, false},
+    {"phonon_dos", tables::kRoles43, 4, false},
+    {"topology.qtaim", tables::kRoles44, 1, false},
+    {"run.record", tables::kRoles45, 4, false},
+    {"job.spec", tables::kRoles46, 1, false},
+    {"forces", tables::kRoles47, 3, false},
+    {"hessian", tables::kRoles48, 2, false},
+    {"excited_states", tables::kRoles49, 1, false},
+    {"volume.transition_density", tables::kRoles50, 2, false},
+    {"properties.electric", tables::kRoles51, 1, false},
+    {"properties.elastic", tables::kRoles52, 1, false},
+    {"properties.dielectric", tables::kRoles53, 1, false},
+    {"reaction.scheme", tables::kRoles54, 1, false},
+    {"preview", tables::kRoles55, 2, false},
+};
+inline constexpr std::size_t kKindCount = 56;
+
+// The canonical kind names (registry.json order); a vendor kind x_<...> is
+// not among them.
+inline constexpr std::string_view kCanonicalKinds[] = {
+    "structure", "bonds", "bond_orders", "volume.density", "volume.orbital", "volume.spin",
+    "volume.elf", "volume.difference", "volume.potential", "volume.rdg", "volume.generic",
+    "volume.laplacian", "volume.vector", "volume.complex", "volume.series", "wavefunction.gto",
+    "wavefunction.bloch", "basis.ao", "atom_properties", "trajectory", "reaction.path",
+    "reaction.waypoints", "scan.surface", "vibrations", "spectra.ir", "spectra.raman",
+    "spectra.uvvis", "spectra.ecd", "spectra.vcd", "spectra.nmr", "spectra.epr",
+    "spectra.generic", "bands", "dos.total", "dos.projected", "dos.coop", "dos.cohp",
+    "structure.symmetry", "scf_history", "citations", "equation_of_state", "fermi_surface",
+    "phonon_bands", "phonon_dos", "topology.qtaim", "run.record", "job.spec", "forces",
+    "hessian", "excited_states", "volume.transition_density", "properties.electric",
+    "properties.elastic", "properties.dielectric", "reaction.scheme", "preview",
+};
+
+// The KindInfo of a canonical kind, or nullptr (unknown or vendor kinds).
+inline const KindInfo* kind_info(std::string_view kind) {
+    for (const KindInfo& k : kKindInfos)
+        if (k.kind == kind) return &k;
+    return nullptr;
+}
+
+inline bool is_canonical_kind(std::string_view kind) { return kind_info(kind) != nullptr; }
+
+// The RoleInfo of a named (non-pattern) role of a KindInfo, or nullptr.
+inline const RoleInfo* role_info(const KindInfo& kind, std::string_view role) {
+    for (std::size_t i = 0; i < kind.n_roles; ++i)
+        if (!kind.roles[i].pattern && kind.roles[i].role == role) return &kind.roles[i];
+    return nullptr;
+}
+
+// --- payload definitions -----------------------------------------------------
+
+// The $defs entry specifying the JSON payload of a (kind, role) member.
+struct PayloadDef {
+    std::string_view kind;
+    std::string_view role;
+    std::string_view def;
+};
+inline constexpr PayloadDef kPayloadDefs[] = {
+    {"structure", "structure", "StructurePayload"},
+    {"job.spec", "spec", "JobSpecPayload"},
+    {"volume.density", "grid", "VolumeGridPayload"},
+    {"volume.orbital", "grid", "VolumeGridPayload"},
+    {"volume.spin", "grid", "VolumeGridPayload"},
+    {"volume.elf", "grid", "VolumeGridPayload"},
+    {"volume.difference", "grid", "VolumeGridPayload"},
+    {"volume.generic", "grid", "VolumeGridPayload"},
+    {"volume.potential", "grid", "VolumeGridPayload"},
+    {"volume.rdg", "grid", "VolumeGridPayload"},
+    {"basis.ao", "grid", "VolumeGridPayload"},
+    {"reaction.path", "volume_grid", "VolumeGridPayload"},
+    {"wavefunction.gto", "basis", "BasisPayload"},
+    {"wavefunction.gto", "mo_metadata", "MoMetadataPayload"},
+    {"trajectory", "metadata", "TrajectoryMetadataPayload"},
+    {"reaction.path", "metadata", "ReactionPathMetadataPayload"},
+    {"reaction.waypoints", "waypoints", "ReactionWaypointsPayload"},
+    {"reaction.scheme", "scheme", "ReactionSchemePayload"},
+    {"scan.surface", "metadata", "ScanSurfaceMetadataPayload"},
+    {"vibrations", "metadata", "VibrationsMetadataPayload"},
+    {"spectra.ir", "spectrum", "SpectrumPayload"},
+    {"spectra.raman", "spectrum", "SpectrumPayload"},
+    {"spectra.uvvis", "spectrum", "SpectrumPayload"},
+    {"spectra.ecd", "spectrum", "SpectrumPayload"},
+    {"spectra.vcd", "spectrum", "SpectrumPayload"},
+    {"spectra.generic", "spectrum", "SpectrumPayload"},
+    {"spectra.nmr", "spectrum", "NmrSpectrumPayload"},
+    {"spectra.epr", "spectrum", "EprSpectrumPayload"},
+    {"bonds", "bonds", "BondsPayload"},
+    {"structure", "bonds", "BondsPayload"},
+    {"bond_orders", "bond_orders", "BondOrdersPayload"},
+    {"scf_history", "iterations", "ScfHistoryPayload"},
+    {"topology.qtaim", "critical_points", "QtaimPayload"},
+    {"structure.symmetry", "data", "SymmetryPayload"},
+    {"bands", "kpath", "KpathPayload"},
+    {"dos.coop", "meta", "DosMetaPayload"},
+    {"dos.cohp", "meta", "DosMetaPayload"},
+    {"fermi_surface", "mesh", "FermiMeshPayload"},
+    {"phonon_bands", "qpath", "QpathPayload"},
+    {"phonon_dos", "meta", "PhononMetaPayload"},
+    {"equation_of_state", "fit", "EosFitPayload"},
+    {"run.record", "files", "RunRecordFilesPayload"},
+    {"forces", "meta", "ForcesMetaPayload"},
+    {"hessian", "meta", "HessianMetaPayload"},
+    {"atom_properties", "meta", "AtomPropertiesMetaPayload"},
+    {"volume.laplacian", "grid", "VolumeGridPayload"},
+    {"volume.vector", "grid", "VolumeGridPayload"},
+    {"volume.complex", "grid", "VolumeGridPayload"},
+    {"volume.series", "grid", "VolumeGridPayload"},
+    {"volume.series", "axis", "VolumeSeriesAxisPayload"},
+    {"wavefunction.bloch", "basis", "BasisPayload"},
+    {"wavefunction.bloch", "kpoints", "BlochKpointsPayload"},
+    {"wavefunction.bloch", "mo_metadata", "BlochMoMetadataPayload"},
+    {"properties.electric", "properties", "ElectricPropertiesPayload"},
+    {"properties.elastic", "properties", "ElasticPropertiesPayload"},
+    {"properties.dielectric", "properties", "DielectricPropertiesPayload"},
+    {"excited_states", "states", "ExcitedStatesPayload"},
+    {"volume.transition_density", "grid", "VolumeGridPayload"},
+};
+
+// The payload definition of a (kind, role) JSON member, or an empty view.
+inline std::string_view payload_def(std::string_view kind, std::string_view role) {
+    for (const PayloadDef& p : kPayloadDefs)
+        if (p.kind == kind && p.role == role) return p.def;
+    return {};
+}
+
+// --- units -------------------------------------------------------------------
+
+// The unit names of QVF spec § 4.3, in vocabulary ($defs/UnitName) order.
+// The comment after each enumerator is its unit name.
+enum class Unit {
+    Angstrom,          // angstrom
+    Bohr,              // bohr
+    Hartree,           // hartree
+    ElectronVolt,      // ev
+    KcalPerMol,        // kcal_per_mol
+    KjPerMol,          // kj_per_mol
+    Wavenumber,        // cm-1
+    Nanometer,         // nm
+    Debye,             // debye
+    Megahertz,         // mhz
+    Hertz,             // hz
+    Ppm,               // ppm
+    KmPerMol,          // km_per_mol
+    Angstrom3,         // a3
+    Bohr3,             // bohr3
+    Gigapascal,        // gpa
+    Femtosecond,       // fs
+    Picosecond,        // ps
+    Kelvin,            // kelvin
+    Atmosphere,        // atm
+    ElementaryCharge,  // e
+    Amu,               // amu
+    Radian,            // radian
+    Degree,            // degree
+    Dimensionless,     // dimensionless
+};
+
+inline constexpr std::size_t kUnitCount = 25;
+
+// Unit names, indexed by Unit.
+inline constexpr std::string_view kUnitNames[kUnitCount] = {
+    "angstrom", "bohr", "hartree", "ev", "kcal_per_mol", "kj_per_mol", "cm-1", "nm", "debye",
+    "mhz", "hz", "ppm", "km_per_mol", "a3", "bohr3", "gpa", "fs", "ps", "kelvin", "atm", "e",
+    "amu", "radian", "degree", "dimensionless",
+};
+
+// The deprecated spellings a {value, units} object still accepts
+// ($defs/LegacyUnitName, spec § 4.3 "Legacy spellings") and the unit each
+// stands for.
+struct LegacyUnitSpelling {
+    std::string_view spelling;
+    Unit unit;
+};
+inline constexpr LegacyUnitSpelling kLegacyUnitSpellings[3] = {
+    {"Eh", Unit::Hartree},
+    {"eV", Unit::ElectronVolt},
+    {"Hartree", Unit::Hartree},
+};
+
+// The unit name of `u`, e.g. "cm-1" for Unit::Wavenumber.
+constexpr std::string_view unit_name(Unit u) {
+    return kUnitNames[static_cast<std::size_t>(u)];
+}
+
+// The unit `name` names, or std::nullopt when it is not a unit name. Names
+// are case-sensitive, and a legacy spelling ("eV") is not a unit name.
+inline std::optional<Unit> parse_unit(std::string_view name) {
+    for (std::size_t i = 0; i < kUnitCount; ++i)
+        if (kUnitNames[i] == name) return static_cast<Unit>(i);
+    return std::nullopt;
+}
+
+// --- finding codes -----------------------------------------------------------
+
+// The stable validation finding codes of spec Appendix B, in its order.
+struct FindingCode {
+    std::string_view code;
+    bool error;   // false: a warning
+};
+inline constexpr FindingCode kFindingCodes[] = {
+    {"E_ZIP_UNREADABLE", true},
+    {"E_ZIP_DUPLICATE_ENTRY", true},
+    {"E_MEMBER_PATH", true},
+    {"E_MEMBER_TOO_LARGE", true},
+    {"E_TOTAL_TOO_LARGE", true},
+    {"E_COMPRESSION_RATIO", true},
+    {"W_ORPHAN_MEMBER", false},
+    {"E_MANIFEST_MISSING", true},
+    {"E_MANIFEST_JSON", true},
+    {"E_JSON_TOO_LARGE", true},
+    {"E_JSON_TOO_DEEP", true},
+    {"E_SCHEMA", true},
+    {"W_SCHEMA_SKIPPED", false},
+    {"E_VERSION", true},
+    {"W_VERSION_WITHDRAWN", false},
+    {"E_SOURCE", true},
+    {"E_SECTION_MALFORMED", true},
+    {"E_SECTION_ID_DUPLICATE", true},
+    {"E_RESERVED_ID", true},
+    {"E_KIND_UNKNOWN", true},
+    {"E_CRITICAL_UNDECLARED", true},
+    {"E_MEMBER_MALFORMED", true},
+    {"E_MEMBER_MISSING", true},
+    {"E_SHA256_MISMATCH", true},
+    {"E_JSON_INVALID", true},
+    {"E_DTYPE", true},
+    {"E_BINARY_SIZE", true},
+    {"E_UTF8", true},
+    {"E_PAYLOAD_SCHEMA", true},
+    {"E_STRUCTURE_PERIODICITY", true},
+    {"E_CHARGE_MULTIPLICITY", true},
+    {"E_REF_UNRESOLVED", true},
+    {"E_FILES_INDEX", true},
+    {"W_UNIT_UNKNOWN", false},
+    {"E_ROOT_INCONSISTENT", true},
+    {"E_NORMALIZATION", true},
+};
+
+// The entry of a finding code, or nullptr.
+inline const FindingCode* finding_code(std::string_view code) {
+    for (const FindingCode& f : kFindingCodes)
+        if (f.code == code) return &f;
+    return nullptr;
+}
+
+}  // namespace gen
+}  // namespace qvf
+
+#endif  // QVF_KINDS_GENERATED_HPP
+
+// ===== include/qvf/units.hpp (public API) =====
+
+// qvf/units.hpp — the QVF unit vocabulary and the length and energy
+// conversions. Header-only; part of the zero-dependency QVF library.
+//
+// QVF names every declared unit with a unit name from a controlled
+// vocabulary (spec § 4.3, "Unit names"); the JSON Schema lists the names as
+// $defs/UnitName. The Unit enum, unit_name() and parse_unit() are generated
+// from the schema into qvf/kinds_generated.hpp (scripts/gen_kinds.py) and
+// re-exported here; this header adds the legacy spellings and the
+// conversions. Writers declare units and never convert; convert() is for code
+// that reads a declared unit and needs another. License: Apache-2.0.
+#ifndef QVF_UNITS_HPP
+#define QVF_UNITS_HPP
+
+#include <cstddef>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+
+namespace qvf {
+
+// The unit names of QVF spec § 4.3, in vocabulary (schema) order:
+// Unit::Angstrom ("angstrom"), Unit::ElectronVolt ("ev"), Unit::Wavenumber
+// ("cm-1"), ... (see qvf/kinds_generated.hpp).
+using gen::Unit;
+using gen::kUnitCount;
+// The unit name of `u`, e.g. "cm-1" for Unit::Wavenumber.
+using gen::unit_name;
+// The unit `name` names, or std::nullopt when it is not a unit name. Names
+// are case-sensitive, and a legacy spelling ("eV") is not a unit name.
+using gen::parse_unit;
+
+// Like parse_unit(), but also maps the legacy spellings "Eh", "Hartree"
+// (Unit::Hartree) and "eV" (Unit::ElectronVolt), which the units of a
+// {value, units} object may still carry ($defs/LegacyUnitName).
+inline std::optional<Unit> canonical_unit(std::string_view name) {
+    if (std::optional<Unit> u = parse_unit(name)) return u;
+    for (const auto& legacy : gen::kLegacyUnitSpellings)
+        if (legacy.spelling == name) return legacy.unit;
+    return std::nullopt;
+}
+
+// --- conversions ------------------------------------------------------------
+// CODATA 2018 recommended values. The SI defining constants h, c, e and N_A
+// are exact since 2019, so the factors below that follow from them alone are
+// exact up to the printed digits.
+
+// Bohr per Ångström: the reciprocal of CODATA 2018's bohr radius,
+// 1 bohr = 0.529177210903 Å (1 / 0.529177210903 = 1.88972612462577...), rounded
+// to ten decimals. The QVF spec (§ 4.3, "Lattice conventions") uses this value.
+inline constexpr double kBohrPerAngstrom = 1.8897261246;
+// Hartree energy in eV: E_h = 27.211386245988 eV (CODATA 2018).
+inline constexpr double kHartreeInEv = 27.211386245988;
+// E_h N_A in kJ/mol: 4.3597447222071e-18 J (CODATA 2018) x 6.02214076e23 /mol.
+inline constexpr double kHartreeInKjPerMol = 2625.4996394799;
+// The thermochemical calorie: 1 kcal = 4.184 kJ (exact).
+inline constexpr double kKjPerKcal = 4.184;
+// E_h N_A in kcal/mol, 627.5094740631.
+inline constexpr double kHartreeInKcalPerMol = kHartreeInKjPerMol / kKjPerKcal;
+// E_h / (h c) in cm^-1: 2.1947463136320e7 /m (CODATA 2018).
+inline constexpr double kHartreeInWavenumber = 219474.6313632;
+// h c / e in eV nm (exact constants): E[eV] = 1239.841984332 / lambda[nm].
+inline constexpr double kEvNanometer = 1239.841984332;
+
+namespace detail {
+// Bohr per unit for the lengths; 0 for any other unit.
+constexpr double bohr_per(Unit u) {
+    return u == Unit::Bohr ? 1.0 : u == Unit::Angstrom ? kBohrPerAngstrom : 0.0;
+}
+// Units per hartree for the energies (cm^-1 through E = h c nu~); 0 otherwise.
+constexpr double per_hartree(Unit u) {
+    switch (u) {
+        case Unit::Hartree: return 1.0;
+        case Unit::ElectronVolt: return kHartreeInEv;
+        case Unit::KjPerMol: return kHartreeInKjPerMol;
+        case Unit::KcalPerMol: return kHartreeInKcalPerMol;
+        case Unit::Wavenumber: return kHartreeInWavenumber;
+        default: return 0.0;
+    }
+}
+}  // namespace detail
+
+// True when convert() handles the pair: a unit to itself, angstrom <-> bohr,
+// and the energies hartree, ev, kcal_per_mol, kj_per_mol, cm-1 among
+// themselves and with nm (a photon wavelength, E = h c / lambda).
+constexpr bool can_convert(Unit from, Unit to) {
+    if (from == to) return true;
+    if (detail::bohr_per(from) != 0.0 && detail::bohr_per(to) != 0.0) return true;
+    const bool from_energy = detail::per_hartree(from) != 0.0;
+    const bool to_energy = detail::per_hartree(to) != 0.0;
+    return (from_energy || from == Unit::Nanometer) &&
+           (to_energy || to == Unit::Nanometer);
+}
+
+// `value` in `from` converted to `to`; the same conversions as the Python
+// qvf_units.convert(). Molar units are per mole of particles, so 1 hartree is
+// 2625.4996394799 kJ/mol. Throws std::invalid_argument for a pair
+// can_convert() rejects. A wavelength or energy of zero has no counterpart
+// across the nm relation (the result is infinite).
+inline double convert(double value, Unit from, Unit to) {
+    if (!can_convert(from, to))
+        throw std::invalid_argument("qvf::convert: cannot convert " +
+                                    std::string(unit_name(from)) + " to " +
+                                    std::string(unit_name(to)));
+    if (from == to) return value;
+    if (detail::bohr_per(from) != 0.0)
+        return value * detail::bohr_per(from) / detail::bohr_per(to);
+    if (from == Unit::Nanometer)
+        return convert(kEvNanometer / value, Unit::ElectronVolt, to);
+    if (to == Unit::Nanometer)
+        return kEvNanometer / convert(value, from, Unit::ElectronVolt);
+    return value / detail::per_hartree(from) * detail::per_hartree(to);
+}
+
+}  // namespace qvf
+
+#endif  // QVF_UNITS_HPP
+
+// ===== include/qvf/container.hpp (public API) =====
+
+// qvf/container.hpp — the QVF container layer: ZIP archives, read and written.
+//
+// QVF archives are ZIP files (spec § 2.1). This layer reads and writes them
+// with no external dependency: CRC-32, SHA-256, DEFLATE and INFLATE are the
+// toolkit's own (cpp/src). It knows nothing about manifests or sections.
+//
+//   ZipWriter  sequential writer over a Sink (file, memory, or callback).
+//              Entries are written whole (write) or streamed in chunks
+//              (begin -> EntrySink), with CRC-32, sizes and the SHA-256 of
+//              the uncompressed bytes computed on the fly. On a seekable sink
+//              a streamed entry's local header is patched afterwards; on a
+//              non-seekable one a data descriptor (general-purpose bit 3)
+//              follows the data. ZIP64 structures (extra field 0x0001, end
+//              record and locator) are written when a size, an offset or the
+//              entry count passes the 32-bit limits, or when forced. An
+//              archive needing none of them is byte-for-byte what this
+//              toolkit has always written. append() reopens an existing
+//              archive: new entries replace its central directory, which is
+//              rewritten after them.
+//   ZipReader  random access through the central directory, from memory or
+//              a file. ZIP64 end records and extra fields and data-descriptor
+//              entries are read; the central directory is authoritative for
+//              sizes and CRCs. Duplicate names are recorded, every offset is
+//              bounds-checked, an entry is never inflated past its declared
+//              size, and its CRC-32 is verified. read_into() streams an entry
+//              in chunks under the resource caps of `Limits`.
+//
+// License: Apache-2.0.
+#ifndef QVF_CONTAINER_HPP
+#define QVF_CONTAINER_HPP
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace qvf {
+namespace detail {
+class ZipWriter;   // the in-memory test/compat writer of cpp/src/qvf_zip.hpp
+}
+namespace container {
+
+// ZIP compression methods QVF uses.
+enum class Method : uint16_t { Store = 0, Deflate = 8 };
+
+// Resource caps applied to untrusted archives (spec § 2.1, § 6.1). The
+// defaults are the reference values; field names match the Python
+// `qvf_reader.Limits` and the negative corpus' `limits` objects. qvf::Limits
+// is this type.
+struct Limits {
+    uint64_t max_member_bytes = 8ull << 30;     // per ZIP entry, uncompressed (§ 2.1)
+    uint64_t max_total_bytes = 64ull << 30;     // all ZIP entries, uncompressed
+    double max_ratio = 0.0;                     // optional ratio policy; 0 disables it
+    uint64_t ratio_exempt_bytes = 1ull << 20;   // smaller entries skip the ratio check
+    uint64_t max_json_bytes = 256ull << 20;     // manifest.json and JSON members
+    size_t max_json_depth = 64;                 // nesting of JSON arrays/objects
+};
+
+// Receives an archive's bytes in order.
+class Sink {
+public:
+    virtual ~Sink() = default;
+    virtual void write(const uint8_t* data, size_t n) = 0;
+    // Bytes written so far, including any the sink started with.
+    virtual uint64_t position() const = 0;
+    // Whether write_at() can overwrite earlier bytes (local-header patching).
+    virtual bool seekable() const { return false; }
+    // Overwrite `n` bytes at `offset` < position() without moving position().
+    virtual void write_at(uint64_t offset, const uint8_t* data, size_t n);
+    // Called once by ZipWriter::finish(), after the last byte.
+    virtual void close() {}
+};
+
+// An archive in memory. Seekable.
+class MemorySink : public Sink {
+public:
+    MemorySink() = default;
+    // Start from existing bytes; new bytes are appended after them.
+    explicit MemorySink(std::vector<uint8_t> prefix) : bytes_(std::move(prefix)) {}
+    void write(const uint8_t* data, size_t n) override;
+    uint64_t position() const override { return bytes_.size(); }
+    bool seekable() const override { return true; }
+    void write_at(uint64_t offset, const uint8_t* data, size_t n) override;
+    const std::vector<uint8_t>& bytes() const { return bytes_; }
+    std::vector<uint8_t> take() { return std::move(bytes_); }
+
+private:
+    std::vector<uint8_t> bytes_;
+};
+
+// An archive file. Seekable.
+class FileSink : public Sink {
+public:
+    // Create `path` (truncating an existing file).
+    explicit FileSink(const std::string& path);
+    // Open the existing file `path` for writing at `offset`; close() cuts the
+    // file at the final position (ZipWriter::append).
+    static std::unique_ptr<FileSink> open_at(const std::string& path, uint64_t offset);
+    ~FileSink() override;
+    void write(const uint8_t* data, size_t n) override;
+    uint64_t position() const override { return pos_; }
+    bool seekable() const override { return true; }
+    void write_at(uint64_t offset, const uint8_t* data, size_t n) override;
+    void close() override;
+
+private:
+    FileSink() = default;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    std::string path_;
+    uint64_t pos_ = 0;
+    bool truncate_on_close_ = false;
+};
+
+// Hands every byte to a callback (a pipe, a socket, a hash). Not seekable,
+// so streamed entries carry data descriptors.
+class CallbackSink : public Sink {
+public:
+    explicit CallbackSink(std::function<void(const uint8_t*, size_t)> fn)
+        : fn_(std::move(fn)) {}
+    void write(const uint8_t* data, size_t n) override;
+    uint64_t position() const override { return pos_; }
+
+private:
+    std::function<void(const uint8_t*, size_t)> fn_;
+    uint64_t pos_ = 0;
+};
+
+// What the writer recorded for one entry.
+struct EntryInfo {
+    std::string name;
+    Method method = Method::Store;
+    uint16_t flags = 0;            // general-purpose bits (3: data descriptor, 11: UTF-8 name)
+    uint32_t crc32 = 0;
+    uint64_t compressed_size = 0;
+    uint64_t size = 0;             // uncompressed
+    uint64_t local_offset = 0;
+    bool zip64 = false;            // the entry carries ZIP64 extra fields
+    std::string sha256;            // of the uncompressed bytes; empty for entries kept by append()
+};
+
+class ZipWriter;
+class ZipReader;
+
+// One entry being streamed. Push the uncompressed bytes with write() in any
+// number of chunks, then close(). Only one EntrySink of a writer is open at a
+// time. Destroyed without close(), the entry is abandoned: its bytes stay in
+// the output but the central directory does not list it.
+class EntrySink {
+public:
+    EntrySink(EntrySink&&) noexcept;
+    EntrySink& operator=(EntrySink&&) noexcept;
+    ~EntrySink();
+
+    void write(const uint8_t* data, size_t n);
+    void write(const std::vector<uint8_t>& bytes) { write(bytes.data(), bytes.size()); }
+    void write(const std::string& bytes);
+    // Finish the entry (patch its local header or write its data descriptor)
+    // and add it to the central directory. Throws if the entry passed the
+    // 32-bit limits without having been begun with force_zip64.
+    EntryInfo close();
+    uint64_t size() const;         // uncompressed bytes so far
+    bool is_open() const;
+
+private:
+    friend class ZipWriter;
+    struct State;
+    explicit EntrySink(std::unique_ptr<State> state);
+    void abandon() noexcept;
+    std::unique_ptr<State> s_;
+};
+
+class ZipWriter {
+public:
+    // Write a new archive to `out`. `force_zip64` gives every entry ZIP64
+    // extra fields and the archive a ZIP64 end record and locator, with the
+    // 32-bit fields saturated, whatever the sizes (for testing readers).
+    explicit ZipWriter(std::unique_ptr<Sink> out, bool force_zip64 = false);
+    // Reopen an existing archive file for appending: its entries are kept
+    // (every central-directory record as it is, a repeated name included),
+    // new entries are written where its central directory began, and
+    // finish() writes the new central directory, old records first, and cuts
+    // the file there. Until finish(), the file is not a readable archive.
+    static ZipWriter append(const std::string& path);
+    // The same over an archive in memory; the result is in sink(), a
+    // MemorySink, after finish().
+    static ZipWriter append(std::vector<uint8_t> archive);
+
+    ZipWriter(ZipWriter&&) noexcept;
+    ZipWriter& operator=(ZipWriter&&) noexcept;
+    ~ZipWriter();
+
+    // Stream an entry. With Method::Deflate the data is compressed in
+    // blocks of about 32 KiB, each DEFLATEd or STOREd, whichever is smaller.
+    // An entry that may reach 4 GiB must be begun with force_zip64 = true.
+    EntrySink begin(const std::string& name, Method method = Method::Deflate,
+                    bool force_zip64 = false);
+    // Write a whole entry. With Method::Deflate the entry is STOREd instead
+    // when DEFLATE would not make it smaller. ZIP64 is used when needed.
+    EntryInfo write(const std::string& name, const uint8_t* data, size_t n,
+                    Method method = Method::Deflate, bool force_zip64 = false);
+    EntryInfo write(const std::string& name, const std::vector<uint8_t>& bytes,
+                    Method method = Method::Deflate, bool force_zip64 = false);
+    EntryInfo write(const std::string& name, const std::string& bytes,
+                    Method method = Method::Deflate, bool force_zip64 = false);
+
+    // Entry names are unique: begin()/write() refuse a name already listed,
+    // except one allowed here. The archive then lists both records, and
+    // readers resolve the name to the last one (QVF's manifest.json after an
+    // in-place update, spec § 2.3).
+    void allow_repeated_name(const std::string& name);
+    bool contains(const std::string& name) const;
+    // Remove an entry (the last of that name) from the central directory;
+    // its bytes stay in the output as unreferenced space. Returns false if
+    // there is none.
+    bool drop(const std::string& name);
+    std::vector<EntryInfo> entries() const;
+
+    // Writer-level ZIP64 forcing (see the constructor); may be set any time
+    // before finish(). Entries written earlier keep their form.
+    void set_force_zip64(bool force);
+
+    // Write the central directory and end records, then close the sink.
+    void finish();
+    bool finished() const;
+    Sink& sink();
+
+private:
+    friend class EntrySink;
+    friend class qvf::detail::ZipWriter;
+    struct State;
+    // Let begin()/write() repeat a name (only for building malformed test
+    // archives; spec § 2.1 forbids duplicates).
+    void allow_duplicate_names();
+    static void keep_entries(ZipWriter& w, const ZipReader& r);
+    std::shared_ptr<State> s_;
+};
+
+// One central-directory record.
+struct ZipEntry {
+    std::string name;
+    uint16_t method = 0;           // 0 = STORE, 8 = DEFLATE
+    uint16_t flags = 0;            // general-purpose bit flags
+    uint32_t crc32 = 0;
+    uint64_t csize = 0;            // compressed size
+    uint64_t usize = 0;            // declared uncompressed size
+    uint64_t local_offset = 0;
+    bool zip64 = false;            // the record carried a ZIP64 extra field
+};
+
+// What an entry's local header says. The central directory is authoritative;
+// these values are informational (with bit 3 set they are zero).
+struct LocalHeader {
+    uint64_t data_offset = 0;      // first byte of the entry's data
+    uint16_t flags = 0;
+    uint32_t crc32 = 0;
+    uint64_t csize = 0;            // from the ZIP64 extra field when saturated
+    uint64_t usize = 0;
+    bool zip64 = false;            // the header carries a ZIP64 extra field
+};
+
+class ZipReader {
+public:
+    using Entry = ZipEntry;
+    using ChunkFn = std::function<void(const uint8_t*, size_t)>;
+
+    // Open an archive file; entries are read from the file on demand.
+    static ZipReader open(const std::string& path);
+    // Open an archive held in memory.
+    static ZipReader from_bytes(std::vector<uint8_t> archive);
+    explicit ZipReader(std::vector<uint8_t> archive);
+
+    ZipReader(ZipReader&&) noexcept;
+    ZipReader& operator=(ZipReader&&) noexcept;
+    ~ZipReader();
+
+    // Every central-directory record, in archive order, duplicates included.
+    const std::vector<Entry>& entries() const;
+    // Unique entry names, in central-directory order of first occurrence.
+    std::vector<std::string> names() const;
+    // Names that occur more than once, in order of their second occurrence.
+    const std::vector<std::string>& duplicates() const;
+    bool has(const std::string& name) const;
+    bool contains(const std::string& name) const { return has(name); }
+    // The record a lookup by name resolves to (the last one when duplicated,
+    // matching Python's zipfile), or nullptr.
+    const Entry* find(const std::string& name) const;
+
+    uint64_t archive_size() const;
+    uint64_t central_directory_offset() const;
+    uint64_t total_size() const;   // sum of the declared uncompressed sizes
+
+    // The uncompressed bytes of an entry. Throws when the declared size
+    // exceeds `max_bytes`, and when the data cannot be read: truncated,
+    // encrypted, an unsupported method, a local header naming another entry,
+    // data that does not inflate to exactly the declared size, or a CRC-32
+    // mismatch.
+    std::vector<uint8_t> read(const std::string& name,
+                              uint64_t max_bytes = UINT64_MAX) const;
+    // The same under every cap of `limits`: the per-member size, the total
+    // of all entries' declared sizes, and the compression ratio (checked
+    // before inflating and again as bytes are produced).
+    std::vector<uint8_t> read(const std::string& name, const Limits& limits) const;
+    // Stream an entry's uncompressed bytes to `fn` in chunks (about 1 MiB),
+    // under the caps of `limits`. A failure is thrown after some chunks may
+    // have been delivered (the CRC-32 is known only at the end): discard what
+    // was received when it throws.
+    void read_into(const std::string& name, const ChunkFn& fn,
+                   const Limits& limits = Limits{}) const;
+    // Throws the error read() would throw for exceeding a cap of `limits`.
+    void check_limits(const Entry& entry, const Limits& limits) const;
+
+    LocalHeader local_header(const Entry& entry) const;
+
+private:
+    friend class ZipWriter;
+    struct Impl;
+    ZipReader() = default;
+    void stream_entry(const Entry& e, const ChunkFn& fn, const Limits* limits,
+                      std::vector<uint8_t>* collect) const;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace container
+}  // namespace qvf
+
+#endif  // QVF_CONTAINER_HPP
+
+// ===== include/qvf/model.hpp (public API) =====
+
+// qvf/model.hpp — the typed manifest model (library layer L1): Manifest,
+// Section and MemberSpec, built from and written back to manifest.json.
+// Header-only; part of the zero-dependency QVF library. License: Apache-2.0.
+//
+// The model is lossless. from_json() types every field it knows when the field
+// has the JSON type the schema gives it, and keeps everything else verbatim in
+// the `extra` object of the enclosing record: keys the model does not know
+// (kind-specific section fields such as `operand_a` or `ao_metadata`, vendor
+// keys) and known keys whose value has another type. to_json() writes the
+// typed fields, then `extra`, so to_json(from_json(m)) equals m as a JSON
+// value for any manifest object m (object key order aside; a key a parsed
+// object repeats keeps its last value, as in Python). Absent and present are
+// told apart everywhere: every optional field is a std::optional.
+//
+// The model checks nothing; the validator (QvfReader::validate_findings) does.
+// QvfReader::typed_manifest() exposes the model of an opened archive beside
+// the raw QvfReader::manifest().
+#ifndef QVF_MODEL_HPP
+#define QVF_MODEL_HPP
+
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+
+namespace qvf {
+
+// The root `source` block (spec § 3.1): the program that wrote the archive.
+struct Source {
+    std::string program;
+    std::string version;
+    std::string calculation;
+};
+
+namespace model_detail {
+
+// The value of the last member named `key` (a parsed object may repeat a key;
+// the last one wins, as in Python's json module).
+inline const Json* find(const Json& obj, std::string_view key) {
+    const auto& items = obj.items();
+    for (auto it = items.rbegin(); it != items.rend(); ++it)
+        if (it->first == key) return &it->second;
+    return nullptr;
+}
+
+// Each key of an object once, first-occurrence order, last value.
+inline std::vector<std::pair<std::string, const Json*>> members_of(const Json& obj) {
+    std::vector<std::pair<std::string, const Json*>> out;
+    for (const auto& kv : obj.items()) {
+        bool seen = false;
+        for (auto& o : out)
+            if (o.first == kv.first) { o.second = &kv.second; seen = true; break; }
+        if (!seen) out.emplace_back(kv.first, &kv.second);
+    }
+    return out;
+}
+
+inline bool is_key(std::string_view key, std::initializer_list<std::string_view> known) {
+    for (std::string_view k : known)
+        if (k == key) return true;
+    return false;
+}
+
+inline void put_string(Json& out, const char* key, const std::optional<std::string>& v) {
+    if (v) out.set(key, *v);
+}
+
+// Every key of `extra`, after the typed fields.
+inline void put_extra(Json& out, const Json& extra) {
+    if (!extra.is_object()) return;
+    for (const auto& kv : extra.items()) out.set(kv.first, kv.second);
+}
+
+}  // namespace model_detail
+
+// One entry of a section's `members` object (spec § 4.2).
+struct MemberSpec {
+    // How the member's bytes are stored: format "json"; format "binary" with
+    // a dtype (a typed array); format "binary" without one (opaque bytes).
+    enum class Format { Json, Binary, Opaque };
+
+    std::optional<std::string> path;
+    std::optional<Format> format;
+    std::optional<std::string> dtype;                // Binary
+    std::optional<std::vector<int64_t>> shape;       // Binary
+    std::optional<std::string> sha256;
+    std::optional<uint64_t> size;                    // spec § 4.2, optional
+    std::optional<std::string> media_type;           // spec § 4.2, optional
+    Json extra = Json::object();
+
+    static MemberSpec from_json(const Json& j) {
+        using namespace model_detail;
+        if (!j.is_object()) throw std::invalid_argument("qvf::MemberSpec: not a JSON object");
+        MemberSpec m;
+        const auto members = members_of(j);
+        for (const auto& kv : members) {
+            const std::string& key = kv.first;
+            const Json& v = *kv.second;
+            bool typed = false;
+            if (key == "path" && v.is_string()) {
+                m.path = v.as_string();
+                typed = true;
+            } else if (key == "dtype" && v.is_string()) {
+                m.dtype = v.as_string();
+                typed = true;
+            } else if (key == "sha256" && v.is_string()) {
+                m.sha256 = v.as_string();
+                typed = true;
+            } else if (key == "media_type" && v.is_string()) {
+                m.media_type = v.as_string();
+                typed = true;
+            } else if (key == "size" && v.type() == Json::Type::Int && v.as_int() >= 0) {
+                m.size = static_cast<uint64_t>(v.as_int());
+                typed = true;
+            } else if (key == "shape" && v.is_array()) {
+                std::vector<int64_t> shape;
+                typed = true;
+                for (const Json& d : v.elements()) {
+                    if (d.type() != Json::Type::Int) { typed = false; break; }
+                    shape.push_back(d.as_int());
+                }
+                if (typed) m.shape = std::move(shape);
+            } else if (key == "format" && v.is_string() &&
+                       (v.as_string() == "json" || v.as_string() == "binary")) {
+                typed = true;   // resolved below, once dtype is known
+            }
+            if (!typed) m.extra.set(key, v);
+        }
+        if (const Json* f = find(j, "format"))
+            if (f->is_string() && (f->as_string() == "json" || f->as_string() == "binary"))
+                m.format = f->as_string() == "json" ? Format::Json
+                           : m.dtype                ? Format::Binary
+                                                    : Format::Opaque;
+        return m;
+    }
+
+    Json to_json() const {
+        using namespace model_detail;
+        Json out = Json::object();
+        put_string(out, "path", path);
+        if (format) out.set("format", *format == Format::Json ? "json" : "binary");
+        put_string(out, "dtype", dtype);
+        if (shape) {
+            Json s = Json::array();
+            for (int64_t d : *shape) s.push_back(Json(static_cast<long long>(d)));
+            out.set("shape", std::move(s));
+        }
+        put_string(out, "sha256", sha256);
+        if (size) out.set("size", Json(static_cast<unsigned long long>(*size)));
+        put_string(out, "media_type", media_type);
+        put_extra(out, extra);
+        return out;
+    }
+};
+
+// One entry of the manifest's `sections` array (spec § 4.1).
+struct Section {
+    std::optional<std::string> id, kind, label, component, structure_ref, run_ref, group;
+    std::optional<bool> critical;
+    // role -> member spec, in manifest order; absent when the section has no
+    // `members` object of member-spec objects (then `extra` holds it as is).
+    std::optional<std::vector<std::pair<std::string, MemberSpec>>> members;
+    // Kind-specific peer fields (operand_a, ao_metadata, program, chains, ...)
+    // and anything else the model does not type.
+    Json extra = Json::object();
+
+    // The spec of member `role`, or nullptr.
+    const MemberSpec* member(std::string_view role) const {
+        if (!members) return nullptr;
+        for (const auto& kv : *members)
+            if (kv.first == role) return &kv.second;
+        return nullptr;
+    }
+
+    static Section from_json(const Json& j) {
+        using namespace model_detail;
+        if (!j.is_object()) throw std::invalid_argument("qvf::Section: not a JSON object");
+        Section s;
+        std::optional<std::string>* const strings[] = {&s.id, &s.kind, &s.label, &s.component,
+                                                       &s.structure_ref, &s.run_ref, &s.group};
+        const char* const names[] = {"id", "kind", "label", "component",
+                                     "structure_ref", "run_ref", "group"};
+        for (const auto& kv : members_of(j)) {
+            const std::string& key = kv.first;
+            const Json& v = *kv.second;
+            bool typed = false;
+            for (std::size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+                if (key == names[i] && v.is_string()) {
+                    *strings[i] = v.as_string();
+                    typed = true;
+                }
+            if (key == "critical" && v.is_bool()) {
+                s.critical = v.as_bool();
+                typed = true;
+            } else if (key == "members" && v.is_object()) {
+                bool all_objects = true;
+                for (const auto& m : v.items()) all_objects = all_objects && m.second.is_object();
+                if (all_objects) {
+                    std::vector<std::pair<std::string, MemberSpec>> list;
+                    for (const auto& m : members_of(v))
+                        list.emplace_back(m.first, MemberSpec::from_json(*m.second));
+                    s.members = std::move(list);
+                    typed = true;
+                }
+            }
+            if (!typed) s.extra.set(key, v);
+        }
+        return s;
+    }
+
+    Json to_json() const {
+        using namespace model_detail;
+        Json out = Json::object();
+        put_string(out, "id", id);
+        put_string(out, "kind", kind);
+        put_string(out, "label", label);
+        put_string(out, "component", component);
+        if (critical) out.set("critical", *critical);
+        put_string(out, "structure_ref", structure_ref);
+        put_string(out, "run_ref", run_ref);
+        put_string(out, "group", group);
+        if (members) {
+            Json m = Json::object();
+            for (const auto& kv : *members) m.set(kv.first, kv.second.to_json());
+            out.set("members", std::move(m));
+        }
+        put_extra(out, extra);
+        return out;
+    }
+};
+
+// The whole manifest.json (spec § 3).
+struct Manifest {
+    std::optional<int64_t> qvf_version;
+    std::optional<std::string> schema_uri;
+    std::optional<std::string> byte_order;
+    // Typed when `source` is an object of exactly the three strings.
+    std::optional<Source> source;
+    // The root blocks, each kept as JSON when it is an object (spec § 3.2 -
+    // § 3.6, § 7.4).
+    std::optional<Json> provenance, metadata, viewer_defaults, thermochemistry,
+        dipole_moment, constraints, energies, extensions;
+    // Absent when `sections` is not an array of objects (then `extra` holds it).
+    std::optional<std::vector<Section>> sections;
+    Json extra = Json::object();
+
+    // The section with this id (the first one, should ids repeat), or nullptr.
+    const Section* section(std::string_view id) const {
+        if (!sections) return nullptr;
+        for (const Section& s : *sections)
+            if (s.id && *s.id == id) return &s;
+        return nullptr;
+    }
+
+    static Manifest from_json(const Json& j) {
+        using namespace model_detail;
+        if (!j.is_object()) throw std::invalid_argument("qvf::Manifest: not a JSON object");
+        Manifest m;
+        struct Block {
+            const char* name;
+            std::optional<Json>* field;
+        } const blocks[] = {{"provenance", &m.provenance},
+                            {"metadata", &m.metadata},
+                            {"viewer_defaults", &m.viewer_defaults},
+                            {"thermochemistry", &m.thermochemistry},
+                            {"dipole_moment", &m.dipole_moment},
+                            {"constraints", &m.constraints},
+                            {"energies", &m.energies},
+                            {"extensions", &m.extensions}};
+        for (const auto& kv : members_of(j)) {
+            const std::string& key = kv.first;
+            const Json& v = *kv.second;
+            bool typed = false;
+            if (key == "qvf_version" && v.type() == Json::Type::Int) {
+                m.qvf_version = v.as_int();
+                typed = true;
+            } else if (key == "schema_uri" && v.is_string()) {
+                m.schema_uri = v.as_string();
+                typed = true;
+            } else if (key == "byte_order" && v.is_string()) {
+                m.byte_order = v.as_string();
+                typed = true;
+            } else if (key == "source" && v.is_object()) {
+                const auto fields = members_of(v);
+                bool exact = fields.size() == 3;
+                for (const auto& f : fields)
+                    exact = exact && f.second->is_string() &&
+                            is_key(f.first, {"program", "version", "calculation"});
+                if (exact) {
+                    m.source = Source{find(v, "program")->as_string(),
+                                      find(v, "version")->as_string(),
+                                      find(v, "calculation")->as_string()};
+                    typed = true;
+                }
+            } else if (key == "sections" && v.is_array()) {
+                bool all_objects = true;
+                for (const Json& s : v.elements()) all_objects = all_objects && s.is_object();
+                if (all_objects) {
+                    std::vector<Section> list;
+                    for (const Json& s : v.elements()) list.push_back(Section::from_json(s));
+                    m.sections = std::move(list);
+                    typed = true;
+                }
+            } else if (v.is_object()) {
+                for (const Block& b : blocks)
+                    if (key == b.name) {
+                        *b.field = v;
+                        typed = true;
+                    }
+            }
+            if (!typed) m.extra.set(key, v);
+        }
+        return m;
+    }
+
+    Json to_json() const {
+        using namespace model_detail;
+        Json out = Json::object();
+        if (qvf_version) out.set("qvf_version", Json(static_cast<long long>(*qvf_version)));
+        put_string(out, "schema_uri", schema_uri);
+        put_string(out, "byte_order", byte_order);
+        if (source) {
+            Json s = Json::object();
+            s.set("program", source->program);
+            s.set("version", source->version);
+            s.set("calculation", source->calculation);
+            out.set("source", std::move(s));
+        }
+        const std::pair<const char*, const std::optional<Json>*> blocks[] = {
+            {"provenance", &provenance},       {"metadata", &metadata},
+            {"viewer_defaults", &viewer_defaults}, {"thermochemistry", &thermochemistry},
+            {"dipole_moment", &dipole_moment}, {"constraints", &constraints},
+            {"energies", &energies},           {"extensions", &extensions}};
+        for (const auto& b : blocks)
+            if (*b.second) out.set(b.first, **b.second);
+        if (sections) {
+            Json list = Json::array();
+            for (const Section& s : *sections) list.push_back(s.to_json());
+            out.set("sections", std::move(list));
+        }
+        put_extra(out, extra);
+        return out;
+    }
+};
+
+}  // namespace qvf
+
+#endif  // QVF_MODEL_HPP
+
 // ===== include/qvf/qvf.hpp (public API) =====
 
 // qvf/qvf.hpp — public API for the zero-dependency QVF writer library.
@@ -439,7 +2001,12 @@ private:
 #define QVF_QVF_HPP
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -451,11 +2018,7 @@ namespace qvf {
 // Value types
 // ---------------------------------------------------------------------------
 
-struct Source {
-    std::string program;
-    std::string version;
-    std::string calculation;
-};
+// Source (program, version, calculation) is defined in qvf/model.hpp.
 
 struct Atom {
     std::string symbol;
@@ -512,6 +2075,12 @@ struct WavefunctionGTO {
     // Restricted: fill mo_coefficients. Unrestricted: set unrestricted=true and
     // fill the alpha/beta matrices instead.
     bool unrestricted = false;
+    // The mo_metadata `spin` (QVF spec § 5.3). Empty means "restricted", or
+    // "unrestricted" when `unrestricted` is set. "restricted_open" and
+    // "generalized" fill mo_coefficients; "generalized" (two-component) needs
+    // complex_coefficients and 2 n_ao columns: the α components of the AOs,
+    // then their β components.
+    std::string spin;
     Matrix mo_coefficients;                 // [n_mo, n_ao]
     std::vector<double> energies;           // Hartree
     std::vector<double> occupations;
@@ -519,6 +2088,10 @@ struct WavefunctionGTO {
     Matrix mo_coefficients_beta;
     std::vector<double> energies_alpha, occupations_alpha;
     std::vector<double> energies_beta, occupations_beta;
+    // Complex coefficients (QVF spec § 5.3): every coefficient Matrix then
+    // holds rows * cols * 2 doubles, (re, im) interleaved, and is written as
+    // float64 [rows, cols, 2]; mo_metadata gets `complex: true`.
+    bool complex_coefficients = false;
 
     // Optional Γ-point tag.
     bool has_kpoint = false;
@@ -529,18 +2102,123 @@ struct WavefunctionGTO {
     // are pre-multiplied by N_i). See spec Appendix A.
     bool coeffs_are_libint_normalized = false;
 
+    // --- optional, QVF spec § 5.3 ---
+    // Effective core potentials: a JSON array of {center, n_core_electrons,
+    // label?, projectors?: [{l, exponents, coefficients, powers, local?}]}, at
+    // most one per atom; Json() omits it. A Json::raw fragment is parsed.
+    Json ecp;
+    // Electrons the wavefunction describes (Σ Z − Σ n_core_electrons −
+    // charge); < 0 omits it. The written occupations must sum to it.
+    int n_electrons = -1;
+    // One irreducible-representation label per MO; empty omits them. The
+    // single-set labels, or the α and β labels of an unrestricted wavefunction.
+    std::vector<std::string> symmetry_labels;
+    std::vector<std::string> symmetry_labels_alpha, symmetry_labels_beta;
+    // AO-basis matrices, each [n_ao, n_ao] in the AO order of the basis as
+    // written; an empty Matrix omits it. `overlap` is the AO overlap matrix,
+    // which validators check against Appendix A.1 (producers SHOULD write
+    // it); `density_matrix` (with mo_coefficients) is the spin-summed density
+    // matrix, `density_matrix_alpha` and `density_matrix_beta` (with the
+    // alpha and beta coefficients, both or neither) the per-spin ones.
+    Matrix overlap;
+    Matrix density_matrix;
+    Matrix density_matrix_alpha;
+    Matrix density_matrix_beta;
+
     std::string section_id = "wf";
+
+    // Natural transition orbitals (QVF spec § 5.3) are two sections per
+    // state, with orbital_kind "nto": nto_role "hole" or "particle",
+    // state_ref the id of the excited_states section and state_index (>= 1)
+    // the state's index there. Empty / 0 omits a field; state_index needs
+    // state_ref, nto_role needs orbital_kind "nto". An "nto" wavefunction is
+    // also written with occupation_semantics "transition_weight" (its
+    // occupations are the pair weights). state_ref is not resolved here,
+    // because the excited_states section is usually added after its orbitals.
+    std::string state_ref;
+    int state_index = 0;
+    // Unrestricted NTOs still use two sections. Alpha/beta row counts may
+    // differ; each channel's weights are nonnegative, non-increasing and
+    // identical to its partner. The combined spin sum is one only for a
+    // normalized state; full TDDFT/RPA sums may differ. Missing energies are
+    // zero-filled. The validator checks pairs and forward state references.
+    std::string nto_role;
+    // Minimal reference basis for localized orbitals; absent omits the field,
+    // an explicitly empty string is rejected.
+    std::optional<std::string> localization_reference_basis;
+};
+
+// k-resolved Bloch orbitals of a periodic system (kind wavefunction.bloch,
+// QVF spec § 5.3.1, provisional): complex MO coefficients at every k-point of
+// a set over the atom-centred Gaussian basis of the cell, with the Bloch sum
+// phi_mu,k(r) = N^-1/2 sum_T exp(+i k.T) chi_mu(r - T). The basis is the one
+// of WavefunctionGTO (shells, pure, coeffs_are_libint_normalized); n_ao is
+// derived from the shells, n_k from kpoints and n_spin from spin.
+struct WavefunctionBloch {
+    std::vector<Shell> shells;
+    std::string structure_ref = "structure";   // must name a periodic structure
+    std::string orbital_kind = "canonical";
+    bool pure = true;
+    bool coeffs_are_libint_normalized = false;
+    std::string spin = "restricted";           // "restricted" (n_spin 1) or
+                                               // "unrestricted" (n_spin 2)
+    // k-points in fractional reciprocal-lattice coordinates.
+    std::vector<std::array<double, 3>> kpoints;
+    // Optional kpoints payload fields; an empty vector or a false has_* omits.
+    std::vector<double> weights;               // n_k, >= 0, summing to 1 (1e-6)
+    std::vector<std::string> labels;           // n_k
+    std::vector<int> mesh;                     // 3 integers >= 1
+    bool has_shift = false;
+    std::array<double, 3> shift{{0, 0, 0}};
+    bool has_time_reversal = false;
+    bool time_reversal = false;
+    // Orbitals per k-point and spin (axis 2 of the members below).
+    int64_t n_mo = 0;
+    // Optional: the defined orbitals at each k-point (n_k entries <= n_mo).
+    std::vector<int64_t> n_mo_per_k;
+    bool has_fermi_energy = false;
+    double fermi_energy_ev = 0.0;              // written as {value, "ev"}
+    // Row-major float64 [n_k, n_spin, n_mo, n_ao, 2], last axis (re, im).
+    std::vector<double> mo_coefficients;
+    std::vector<double> energies;              // [n_k, n_spin, n_mo], hartree
+    std::vector<double> occupations;           // [n_k, n_spin, n_mo], electrons
+    std::string section_id = "wf_bloch";
 };
 
 struct Spectrum {
     std::vector<double> frequencies;
     std::vector<double> intensities;
+    // Optional unit names (QVF spec § 4.3) of frequencies and intensities;
+    // empty omits them. Declared, never converted; add_spectrum throws on a
+    // string that is not a unit name.
+    std::string x_units;
+    std::string y_units;
 };
 
-// A volumetric grid descriptor (bohr). shape is taken from the data tensor.
+// A volumetric grid descriptor (bohr). shape is taken from the data tensor:
+// its three spatial extents (the leading three of a volume.vector or
+// volume.complex tensor, the trailing three of a volume.series tensor).
 struct Grid {
     std::array<double, 3> origin{{0, 0, 0}};
     std::array<std::array<double, 3>, 3> voxel_vectors{{{{1, 0, 0}}, {{0, 1, 0}}, {{0, 0, 1}}}};
+    // Optional `units` declaration of the grid payload (QVF spec § 4.3,
+    // "Declared units"): a grid field or member role -> unit name, e.g.
+    // {{"origin", "bohr"}, {"voxel_vectors", "bohr"}}. Declared, never
+    // converted: origin and voxel_vectors can only restate "bohr", and the
+    // add_* call throws on anything else or on a string that is not a unit name.
+    std::map<std::string, std::string> units;
+    // Optional periodic grid semantics (QVF spec § 5.2); each is written only
+    // when set. periodic[a] true: the field repeats with lattice vector a of
+    // the grid's structure along data axis a. includes_endpoint (absent means
+    // true, cube style): the last plane along a periodic axis repeats the
+    // first, so voxel_vectors[a] * (shape[a] - 1) spans lattice vector a;
+    // false (CHGCAR style): voxel_vectors[a] * shape[a] spans it. Validators
+    // check the span against the structure's cell; the writer does not.
+    // structure_ref (empty = omit) names the structure section whose cell the
+    // grid samples; the add_* call throws if it names none.
+    std::optional<std::array<bool, 3>> periodic;
+    std::optional<bool> includes_endpoint;
+    std::string structure_ref;
 };
 
 // One program invocation's self-contained record (kind run.record): the
@@ -563,6 +2241,75 @@ struct RunRecord {
     Json files;                        // optional role -> {filename, ...} index
     // Auxiliary files: role suffix -> raw bytes, stored as attachment.<suffix>.
     std::vector<std::pair<std::string, std::vector<uint8_t>>> attachments;
+    // In a job set (QVF spec § 5.8, § 5.9): the id of the job.spec section
+    // this run executed, which must already be added, and the run's outcome,
+    // "running", "converged" or "failed". Empty omits a field.
+    std::string job_ref;
+    std::string run_status;
+};
+
+// An opaque binary member (no dtype or shape, QVF spec § 4.2) of a vendor
+// section: its role, its bytes and, optionally, the IANA media type of the
+// bytes ("type/subtype" without parameters, e.g. "image/svg+xml"), which an
+// opaque vendor member SHOULD carry (spec § 7.3). Empty media_type omits it.
+struct OpaqueMember {
+    std::string role;
+    std::vector<uint8_t> bytes;
+    std::string media_type;
+};
+
+// kBohrPerAngstrom (Bohr per Ångström, CODATA 2018) and the other unit
+// constants and conversions are in qvf/units.hpp, included above.
+
+// A periodic cell that converts between QVF's two lattice conventions (spec
+// § 4.3, "Lattice conventions"):
+//   * structure.lattice_vectors — three ROW vectors in ÅNGSTRÖM; row i pairs
+//     with pbc[i];
+//   * reaction.path.lattice     — a 3x3 matrix whose COLUMNS are a, b, c, in
+//     BOHR (one matrix per frame in the [n_frames, 3, 3] form).
+// The rows in Å are stored internally; the columns in bohr are
+// rows_angstrom() transposed and scaled by kBohrPerAngstrom. Construction
+// validates that every entry is finite (the 3x3 shape is the type) and throws
+// std::runtime_error otherwise; a degenerate or non-physical row (an aperiodic
+// axis, spec § 5.1) is accepted.
+struct Lattice {
+    using Mat3 = std::array<std::array<double, 3>, 3>;
+
+    // structure.lattice_vectors: row i is the lattice vector of axis i, in Å.
+    static Lattice from_rows_angstrom(const Mat3& rows);
+    // reaction.path.lattice (one matrix): column j is lattice vector j, in bohr.
+    static Lattice from_columns_bohr(const Mat3& columns);
+
+    Mat3 rows_angstrom() const;     // the structure.lattice_vectors form
+    Mat3 columns_bohr() const;      // the reaction.path.lattice form
+    double volume_angstrom3() const;   // |a . (b x c)|
+    double volume_bohr3() const;
+
+private:
+    explicit Lattice(const Mat3& rows_angstrom) : rows_(rows_angstrom) {}
+    Mat3 rows_;                     // rows, Å
+};
+
+// The optional per-frame members of a trajectory (QVF spec § 5.5). Every
+// pointer may be nullptr, which omits the member; each tensor is float64 and
+// in frame order, with the frame count (and, for the vectors, the atom count)
+// of `coords`. `reaction.path` carries the four shared members (velocities,
+// gradient, times, energies); its add_reaction_path overload refuses the
+// trajectory-only ones (lattice, cell_volumes, temperatures).
+struct TrajectoryExtras {
+    // The cell in the STRUCTURE convention: rows in Å (row i is the lattice
+    // vector of axis i, paired with metadata pbc[i]), [3, 3] for a fixed cell
+    // or [n_frames, 3, 3] for one cell per frame. Not the columns in bohr of
+    // add_reaction_path's lattice (spec § 4.3, "Lattice conventions"). The
+    // metadata must carry "pbc" when it is given.
+    const Tensor* lattice = nullptr;
+    const Tensor* velocities = nullptr;    // [n_frames, n_atoms, 3], Å/fs
+    const Tensor* gradient = nullptr;      // [n_frames, n_atoms, 3], dE/dR in hartree/bohr
+    const Tensor* times = nullptr;         // [n_frames], fs
+    const Tensor* energies = nullptr;      // [n_frames], hartree; must match metadata
+                                           // "energies" within 1e-10 when both exist
+    const Tensor* cell_volumes = nullptr;  // [n_frames], Å^3
+    const Tensor* temperatures = nullptr;  // [n_frames], kelvin
 };
 
 // Normalization factor for the *axial* Cartesian Gaussian primitive of a
@@ -576,17 +2323,144 @@ double primitive_norm(double alpha, int l);
 // Writer
 // ---------------------------------------------------------------------------
 
+class QvfWriter;
+namespace detail {
+struct WriterOutput;   // the archive file a streaming or updating writer is bound to
+}
+
+// A binary member being streamed (QvfWriter::begin_binary). Push its
+// little-endian, C-contiguous bytes with write() in slabs of any size, then
+// close(): the member spec (path, format, dtype, shape, sha256, computed on
+// the fly) joins its section. The bytes must total itemsize x prod(shape).
+// Destroyed without close(), or closed short, the member is abandoned and
+// never listed. The writer must outlive the sink and not move while it is
+// open; only one sink of a writer is open at a time.
+class MemberSink {
+public:
+    MemberSink(MemberSink&&) noexcept;
+    MemberSink& operator=(MemberSink&&) noexcept;
+    ~MemberSink();
+
+    void write(const void* data, size_t n);
+    void write(const std::vector<uint8_t>& bytes) { write(bytes.data(), bytes.size()); }
+    void close();
+    uint64_t bytes_written() const;
+    uint64_t bytes_expected() const;
+    const std::string& path() const;   // the member's ZIP entry name
+
+private:
+    friend class QvfWriter;
+    struct State;
+    explicit MemberSink(std::unique_ptr<State> state);
+    void abandon() noexcept;
+    std::unique_ptr<State> s_;
+};
+
 class QvfWriter {
 public:
     explicit QvfWriter(Source source);
+    // A streaming writer: the archive `path` (".qvf" appended if missing) is
+    // created now, every member is written to it as it is added (memory
+    // holds one member at a time), and write() writes manifest.json last and
+    // finishes the file. to_bytes() is not available.
+    QvfWriter(Source source, const std::string& path);
+    // Open an existing archive for an in-place update (spec § 2.3): the
+    // manifest is loaded (source, root blocks, sections), add_* and
+    // begin_binary() append new members, remove_section() removes a section
+    // (remove and add under the same id to replace one), and write() appends
+    // the new members and a new manifest.json, STOREd and last. The previous
+    // manifest, and the members of removed or replaced sections, stay in the
+    // archive as superseded entries (W_ORPHAN_MEMBER until repack()); readers
+    // use the last manifest. An update never rewrites an existing entry: a
+    // new member whose default path the archive already holds (an
+    // atom_properties meta.json, or a member of a replaced section) gets a
+    // fresh path "<stem>.<n><suffix>" (n = 2, 3, ...; the stem ends at the
+    // first '.' of the file name, so "s/structure.json" becomes
+    // "s/structure.2.json"). Root keys the writer does not model are kept;
+    // auto_metadata is off, and metadata.modified_utc is stamped unless
+    // set_metadata() gives one. An archive stamped with the withdrawn
+    // qvf_version 2 is read as version 1, and the update writes 1 and the v1
+    // schema_uri (spec § 3.1). Until write() the file is untouched
+    // (to_bytes() returns the updated archive in memory) unless
+    // begin_binary() starts streaming into it. Throws for an archive that
+    // repeats an entry name other than manifest.json, has no manifest.json,
+    // a qvf_version other than 1 or 2, or a byte_order other than "little".
+    static QvfWriter open_for_update(const std::string& path);
 
     // --- root metadata (each takes a qvf::Json object; see docs) ---
-    void set_provenance(Json provenance);
+    // set_provenance drops a top-level "hostname" key: the field is deprecated
+    // (QVF spec § 3.2) because archives are meant to be shared and machine
+    // names are private operational detail. Pass allow_hostname = true to
+    // keep it. A Json::raw fragment is parsed for the checks (throws if it is
+    // not valid JSON) and stays verbatim unless the key had to be removed.
+    // The block must be a JSON object, and its typed fields are checked (the
+    // call throws, and changes nothing, on a wrong one): `software` (an array
+    // of {name, version?, url?} objects, `name` non-empty, further keys must
+    // begin x_), `git_commit` (7 to 64 hexadecimal characters), `n_threads`
+    // and `n_mpi_ranks` (integers >= 1), `n_gpus` (an integer >= 0) and
+    // `started_utc` / `finished_utc` (strings YYYY-MM-DDThh:mm:ssZ, UTC; QVF
+    // spec § 3.2). Every other key of the open block is written as given.
+    void set_provenance(Json provenance);  // allow_hostname = false
+    void set_provenance(Json provenance, bool allow_hostname);
     void set_thermochemistry(Json thermochemistry);
     void set_dipole_moment(Json dipole);
     void set_constraints(Json constraints);
+    // Root energies block (QVF spec § 3.6): {"total": {value, units}, "method"?,
+    // "components"?, "by_method"?, "units_note"?}; write energies in hartree.
+    // An object must carry "total"; a Json::raw fragment (the C ABI path) is
+    // emitted verbatim. An energy stated for the method provenance.method
+    // names must agree with provenance.scf_energy (validators check it).
+    void set_energies(Json energies);
     void set_extensions(Json extensions);
     void set_viewer_defaults(Json viewer_defaults);
+    // The root `metadata` block (QVF spec § 3.5): title, description,
+    // created_utc, modified_utc, uuid, authors, license, doi, keywords,
+    // derived_from, tags and x_-prefixed keys. Replaces any earlier block.
+    // Throws if `metadata` is not a JSON object (a Json::raw fragment is
+    // parsed first); its fields are checked by the schema, not here.
+    void set_metadata(Json metadata);
+    // When true (the default), build_manifest() adds `created_utc` (now, UTC)
+    // and a random version-4 `uuid` to the metadata block unless
+    // set_metadata() supplied them. Both are made on the first
+    // build_manifest() and reused afterwards. Set it to false for a manifest
+    // that is the same on every run, such as a test vector.
+    bool auto_metadata = true;
+
+    // --- section references and grouping (QVF spec § 4.1) ---
+    // Set field `key` of the already added section `id` to `value`. The
+    // fields `id`, `kind` and `members` cannot be changed. A `structure_ref`
+    // or `run_ref` must be a string naming an existing section of kind
+    // `structure` or `run.record` respectively. Throws otherwise, changing
+    // nothing.
+    void set_section_field(const std::string& id, const std::string& key, Json value);
+    // Set the generic references of section `id`: the `structure` section it
+    // describes, the `run.record` of the run that produced it, and a display
+    // `group` label. An empty string leaves that field as it is. Both
+    // references are checked before anything is set. A section's
+    // structure_ref takes precedence over the one in a wavefunction.gto basis
+    // payload, so keep the two equal. Returns `id`.
+    std::string annotate_section(const std::string& id,
+                                 const std::string& structure_ref = "",
+                                 const std::string& run_ref = "",
+                                 const std::string& group = "");
+
+    // --- removing and replacing sections (QVF spec § 2.3) ---
+    // Remove the section `id` from the manifest and return it (its section
+    // object, as it would have been written). The members this writer has
+    // not yet written are dropped: a buffered writer discards their bytes,
+    // and a streaming writer drops the entries it already streamed from the
+    // archive's directory (their bytes stay in the file as unreferenced
+    // space). Entries the archive held before (open_for_update, or an
+    // earlier write() of a bound writer) are never rewritten: they stay as
+    // superseded entries (W_ORPHAN_MEMBER until repack()). To replace a
+    // section, remove it and add the new one under the same id; in an update
+    // its members get fresh paths where the old ones are taken. Nothing else
+    // changes: references to the removed section from other sections
+    // (structure_ref, run_ref, job_ref, a reaction.scheme participant, ...)
+    // dangle until a section with that id is added again, and validators
+    // report any left dangling. Throws for an unknown id or while a member
+    // sink is open, changing nothing.
+    Json remove_section(const std::string& id);
 
     // --- structure & connectivity ---
     // `pbc` says which axes are periodic and needs no particular ordering; row i
@@ -598,45 +2472,218 @@ public:
                               const std::vector<std::array<double, 3>>& lattice_vectors = {},
                               const std::vector<Bond>& bonds = {},
                               const std::string& section_id = "structure");
+    // Same, with the cell as a Lattice: written as its rows_angstrom(), so the
+    // payload is identical to passing those three rows as lattice_vectors.
+    std::string add_structure(const std::vector<Atom>& atoms,
+                              const std::array<bool, 3>& pbc,
+                              const Lattice& lattice,
+                              const std::vector<Bond>& bonds = {},
+                              const std::string& section_id = "structure");
+    // The chemical identity of the species of the already added structure
+    // section `id` (QVF spec § 5.1, "Chemical identity"), set on its section
+    // object. `identity` is a JSON object (a Json::raw fragment is parsed)
+    // with any of: "charge" (an integer), "multiplicity" (an integer >= 1),
+    // "name" (a non-empty string), "smiles" (a non-empty string without
+    // whitespace), "inchi" (beginning "InChI=", without whitespace) and
+    // "inchikey" (AAAAAAAAAAAAAA-BBBBBBBBBB-C, uppercase letters). A given
+    // field replaces the section's value and a null removes it; the others
+    // stay. The section's charge and multiplicity after the call must be
+    // possible for its atoms (when every atomic number is a non-negative
+    // integer): the electron count sum(Z) - charge is not negative, and
+    // multiplicity - 1 does not exceed it and has its parity. Throws on
+    // another kind, an unknown key, a malformed value or an impossible
+    // charge and multiplicity, changing nothing. Use set_section_field(id,
+    // "label", ...) for the species' label in a scheme (its compound number).
+    // In an archive with one structure section, validators also require
+    // charge and multiplicity to equal provenance.charge and
+    // provenance.multiplicity. Returns `id`.
+    std::string set_structure_identity(const std::string& id, const Json& identity);
+    // A standalone `bonds` section (QVF spec § 5.1). `structure_ref`, when
+    // not empty, names the already added `structure` section whose atoms the
+    // indices address and is written on the section object; without it the
+    // bonds belong to the archive's first structure, so an archive with
+    // several structures should pass it. A reference that names no added
+    // structure section throws before anything is added; validators check
+    // the indices against that structure's atoms.
     std::string add_bonds(const std::vector<Bond>& pairs,
-                          const std::string& section_id = "bonds");
+                          const std::string& section_id = "bonds",
+                          const std::string& structure_ref = "");
     std::string add_bond_orders(const std::string& method,
                                 const Json& pairs,
                                 const std::string& section_id = "bond_orders");
 
     // --- wavefunction (GBW-equivalent) ---
+    // Checks everything (shapes, complex layout, spin, ECP entries,
+    // n_electrons against the occupations, symmetry_labels lengths, the
+    // AO-basis matrices and their pairing) and throws before writing anything.
     std::string add_wavefunction_gto(const WavefunctionGTO& wf);
+    // Add the `overlap` member, [n_ao, n_ao], to the already added
+    // wavefunction.gto section `section_id` (the C ABI's
+    // qvf_set_wavefunction_overlap). Throws on another kind, a shape that is
+    // not the basis's [n_ao, n_ao], or a section that already has one.
+    std::string set_wavefunction_overlap(const std::string& section_id,
+                                         const Matrix& overlap);
+    // Set the basis payload's `ecp` array of the already added
+    // wavefunction.gto section `section_id`, replacing any earlier one (the C
+    // ABI's qvf_set_wavefunction_ecp_json). A Json::raw fragment is parsed.
+    // Throws on another kind or a malformed entry, changing nothing.
+    std::string set_wavefunction_ecp(const std::string& section_id, const Json& ecp);
+    // k-resolved Bloch orbitals (wavefunction.bloch, spec § 5.3.1,
+    // provisional). Throws before anything is written on an unknown spin, no
+    // k-points, array sizes that disagree with [n_k, n_spin, n_mo, n_ao(, 2)],
+    // weights that are not n_k non-negative numbers summing to 1 within 1e-6,
+    // labels / n_mo_per_k of the wrong length, or a mesh that is not three
+    // integers >= 1. Returns the section id.
+    std::string add_wavefunction_bloch(const WavefunctionBloch& wf);
 
     // --- spectra ---
+    // spectrum.x_units / y_units, when set, are written as the payload's
+    // x_units / y_units (unit names, QVF spec § 4.3).
     std::string add_spectrum(const std::string& kind, const Spectrum& spectrum,
                              const std::string& label = "",
                              const std::string& section_id = "");
-    // NMR and other object-shaped spectra: pass the full JSON payload.
+    // NMR and other object-shaped spectra: pass the full JSON payload. For a
+    // one-dimensional kind, x_units, y_units and broadening.units in the
+    // payload must be unit names, and a states_ref (which makes the peaks'
+    // assignment.state_index values state indices, spec § 5.4) must name an
+    // added excited_states section (throws otherwise).
     std::string add_spectrum(const std::string& kind, const Json& payload,
                              const std::string& label = "",
                              const std::string& section_id = "");
 
     // --- analysis / provenance ---
+    // atom_properties (QVF spec § 5.7). Its roles are the schema's role list:
+    // the 22 scalar roles mulliken_charge, loewdin_charge, hirshfeld_charge,
+    // iao_charge, spin_population, cm5_charge, chelpg_charge, resp_charge,
+    // esp_charge, nbo_charge, mbis_charge, bader_charge, ddec_charge, valence,
+    // bonded_valence, fukui_plus, fukui_minus, fukui_zero, dual_descriptor,
+    // atomic_energy_eh, atomic_volume_bohr3 and nmr_shielding_iso_ppm, each
+    // float64 [n_atoms]; and the two vector roles magnetic_moment and
+    // force_eh_bohr (the energy gradient, not the force), each float64
+    // [n_atoms, 3]. A role named custom.<name> (<name> is [A-Za-z0-9_]+) is
+    // also accepted once set_atom_properties_meta has described it. All roles
+    // of one section have the same length; every form below throws if they
+    // differ or if no role is given.
+    //
+    // Mulliken, Löwdin and spin populations; an empty vector omits that role.
     std::string add_atom_properties(const std::vector<double>& mulliken = {},
                                     const std::vector<double>& loewdin = {},
                                     const std::vector<double>& spin_population = {},
                                     const std::string& section_id = "atom_properties");
+    // The same, for a braced first argument: add_atom_properties({-0.4, 0.4})
+    // would otherwise be ambiguous with the map form below.
+    std::string add_atom_properties(std::initializer_list<double> mulliken,
+                                    const std::vector<double>& loewdin = {},
+                                    const std::vector<double>& spin_population = {},
+                                    const std::string& section_id = "atom_properties");
+    // Any scalar role, keyed by role name, e.g.
+    // add_atom_properties({{"hirshfeld_charge", q_h}, {"iao_charge", q_iao}}).
+    // A custom.<name> key writes a scalar custom role and the section's `meta`
+    // member. Throws on a role outside the list, a vector role (use
+    // add_atom_vector_property), a custom role without a scalar entry from
+    // set_atom_properties_meta, or an empty value vector.
+    std::string add_atom_properties(const std::map<std::string, std::vector<double>>& roles,
+                                    const std::string& section_id = "atom_properties");
+    // Append one scalar role to the atom_properties section `section_id`,
+    // creating the section on first use (the C ABI's qvf_add_atom_property).
+    // Throws on a role outside the list, a vector role, a custom role without
+    // a scalar `meta` entry, a role already in the section, an empty `values`,
+    // a length that differs from the section's other roles, or a `section_id`
+    // that names a section of another kind.
+    std::string add_atom_property(const std::string& role,
+                                  const std::vector<double>& values,
+                                  const std::string& section_id = "atom_properties");
+    // The same for a vector role (magnetic_moment, force_eh_bohr or a custom
+    // role whose meta entry has kind "vector"): one {x, y, z} per atom, written
+    // as float64 [n_atoms, 3]. Throws under the same conditions.
+    std::string add_atom_vector_property(
+        const std::string& role,
+        const std::vector<std::array<double, 3>>& values,
+        const std::string& section_id = "atom_properties");
+    // Describe custom roles for the atom_properties sections written after
+    // this call: an object mapping "custom.<name>" to {units, description,
+    // kind} with kind "scalar" or "vector" (strict: only those keys and keys
+    // beginning with x_). Entries merge into earlier calls, a repeated role
+    // replaces its entry, and a custom role cannot be written without one. A
+    // Json::raw fragment is parsed; the call throws on invalid JSON or a
+    // malformed entry and then changes nothing. The writer emits each
+    // section's `meta` member from the entries of its custom roles.
+    void set_atom_properties_meta(const Json& meta);
     std::string add_scf_history(const Json& iterations,
                                 const std::string& section_id = "scf_history");
     std::string add_citations(const std::string& bibtex,
                               const std::string& section_id = "citations");
     // Self-contained record of one program invocation (input + log +
     // attachments). Requires record.program and at least one of
-    // record.input_text / record.log_text.
+    // record.input_text / record.log_text. record.job_ref, when set, must
+    // name an added job.spec section and record.run_status be one of
+    // "running", "converged" or "failed" (QVF spec § 5.8); the call throws
+    // otherwise before anything is written.
     std::string add_run_record(const RunRecord& record,
                                const std::string& section_id = "run_record");
     // Declarative specification of the calculation the archive requests
     // (kind job.spec, spec § 5.9). `spec` is the JobSpecPayload JSON object;
-    // it must carry job_type = "molecular" | "periodic". Pair with
-    // set_provenance({... run_status: "pending" ...}) for an archive that
-    // describes a job not yet run.
+    // it must carry job_type = "molecular" | "periodic". Its typed optional
+    // fields are checked, and the call throws, and adds nothing, on a wrong
+    // one: structure_ref (a section id; one that already names a section must
+    // name a `structure`, a later one is resolved by the validator),
+    // dispersion and relativistic (non-empty strings), and the objects
+    // solvation {model, solvent?, epsilon?}, scf {convergence?,
+    // max_iterations?, guess?, damping?}, geometry {convergence?, max_steps?,
+    // coordinates?: cartesian | internal | redundant} and resources
+    // {n_cores?, memory_mb?, walltime_s?}, which are hints, not requirements
+    // (a key outside an object's list must begin x_; engine keywords go under
+    // `options`). Pair with set_provenance({... run_status: "pending" ...})
+    // for an archive that describes a job not yet run. A structure_ref is
+    // written in the payload and on the section object, where a reader finds
+    // it in the manifest (spec § 5.9). Several job.spec sections form a job
+    // set: give each its own section_id and, when the archive holds more than
+    // one structure, its structure_ref; the run.record of each job names it
+    // with RunRecord::job_ref.
     std::string add_job_spec(const Json& spec,
                              const std::string& section_id = "job_spec");
+
+    // --- reaction schemes (spec § 5.14) ---
+    // A reaction.scheme section relating added structure sections as the
+    // steps of a scheme. `steps` is a JSON array (a Json::raw fragment is
+    // parsed) of step objects, in reading order, each with "id" (unique among
+    // the steps, [A-Za-z0-9_.-]+), "reactants" and "products" (at least one
+    // participant each) and optionally "label", "reagents", "arrow"
+    // ("forward", the default, "equilibrium", "retrosynthetic" or
+    // "resonance"), "conditions" (an array of strings, the text lines at the
+    // arrow), "yield_percent" (0 to 100), "yield_text" (the yield as
+    // printed) and keys beginning x_. A participant is the id of an added
+    // structure section, or an object {"structure_ref": id, "coefficient"?:
+    // number > 0} (further keys must begin x_); within one role of a step a
+    // structure appears once. Roles are chemical: reactants are consumed and
+    // products formed in the forward direction whatever the arrow, so the
+    // target of a retrosynthetic step is among its products. Null values are
+    // treated as absent. `label` (empty = omit) titles the scheme. Throws
+    // before anything is added on a malformed step or a participant that
+    // names no structure section. Returns the section id.
+    std::string add_reaction_scheme(const Json& steps, const std::string& label = "",
+                                    const std::string& section_id = "reaction_scheme");
+
+    // --- preview (spec § 5.15) ---
+    // A preview section, a picture of the archive for file managers and
+    // quick-look panels: `thumbnail` is PNG or JPEG bytes (its longest side
+    // should be 256 to 1024 pixels), `image` an optional larger or vector
+    // rendering, SVG, PNG or JPEG (empty omits it, and image_media_type is
+    // then ignored). The media types are sniffed from the bytes unless given
+    // (empty = sniff), and given ones are checked against the bytes: a PNG
+    // begins with the PNG signature, a JPEG with FF D8 FF, and an SVG is UTF-8
+    // with an <svg element. An SVG image must be self-contained and inert (no
+    // external resources, no scripts); that is not checked. Both members are
+    // stored uncompressed at "<id>/thumbnail.png|jpg" and
+    // "<id>/image.svg|png|jpg". The picture of the archive is the thumbnail
+    // of the first preview section. Throws before anything is added on bytes
+    // that are not an allowed image type. Returns the section id.
+    std::string add_preview(const std::vector<uint8_t>& thumbnail,
+                            const std::vector<uint8_t>& image = {},
+                            const std::string& label = "",
+                            const std::string& section_id = "preview",
+                            const std::string& thumbnail_media_type = "",
+                            const std::string& image_media_type = "");
 
     // --- vendor escape hatch (x_<vendor>.*) ---
     // json_members: object mapping role -> JSON payload.
@@ -645,32 +2692,97 @@ public:
                                    bool critical = false,
                                    const std::string& schema_uri = "",
                                    const std::string& section_id = "");
+    // The same with opaque binary members (spec § 4.2, § 7.3), each stored at
+    // "<id>/<role>.bin" with its media_type when given; `json_members` may
+    // then be empty (Json::object()). Throws on a role given twice, a media
+    // type that is not "type/subtype", or no member at all.
+    std::string add_vendor_section(const std::string& kind,
+                                   const Json& json_members,
+                                   const std::vector<OpaqueMember>& opaque_members,
+                                   bool critical = false,
+                                   const std::string& schema_uri = "",
+                                   const std::string& section_id = "");
+    // Add the opaque binary member `role` (bytes without dtype or shape,
+    // spec § 4.2), with its IANA media type when `media_type` is not empty,
+    // to the already added vendor section `section_id`, at
+    // "<section_id>/<role>.bin". Throws on a section that is not an
+    // x_<vendor> section, a role it already has, or a media type that is not
+    // "type/subtype" (RFC 6838, without parameters), changing nothing.
+    // Returns `section_id`.
+    std::string add_opaque_member(const std::string& section_id, const std::string& role,
+                                  const std::vector<uint8_t>& bytes,
+                                  const std::string& media_type = "");
 
-    // --- volumes & basis AO (data is a 3-D Tensor; grid shape taken from it) ---
-    // kind is one of volume.density/orbital/spin/elf/generic/potential/rdg.
+    // --- volumes & basis AO (grid shape taken from the data Tensor) ---
+    // kind is a volume kind (QVF spec § 5.2). `data` is float32 or float64:
+    // [nx, ny, nz] for the scalar kinds (volume.density, orbital, spin, elf,
+    // generic, potential, rdg, laplacian, transition_density; for the last,
+    // add_volume_transition_density also writes its section fields);
+    // [nx, ny, nz, 3] for volume.vector
+    // (Cartesian x, y, z on the last axis); [nx, ny, nz, 2] for volume.complex
+    // (last axis [re, im]). volume.series goes through add_volume_series.
+    // Throws on another rank, trailing axis or dtype, or a grid.structure_ref
+    // naming no structure section, before anything is written. A non-empty
+    // grid.units is written as the grid payload's `units`; grid.periodic,
+    // grid.includes_endpoint and grid.structure_ref when set.
     std::string add_volume(const std::string& kind, const Grid& grid,
                            const Tensor& data, const std::string& label = "",
                            const std::string& component = "",
                            const std::string& section_id = "");
+    // A volume.series section (QVF spec § 5.2): `data` is float32 or float64
+    // [n, nx, ny, nz], slab s the field at axis value s; `axis` is the
+    // VolumeSeriesAxisPayload object written as the `axis` member: "kind"
+    // ("time", "frame", "state" or "custom"), "values" (n numbers; 0-based
+    // frame indices for a frame axis), and optionally "units" (a unit name),
+    // "labels" (n strings), "trajectory_ref" (an added trajectory or
+    // reaction.path section) and x_-prefixed keys. A Json::raw fragment is
+    // parsed. Throws on a malformed axis or data before anything is written.
+    std::string add_volume_series(const Grid& grid, const Tensor& data,
+                                  const Json& axis, const std::string& label = "",
+                                  const std::string& section_id = "");
     std::string add_volume_difference(const Grid& grid, const Tensor& data,
                                       const std::string& operand_a,
                                       const std::string& operand_b,
                                       const std::string& description = "",
                                       const std::string& label = "",
                                       const std::string& section_id = "diff");
+    // volume.transition_density (QVF spec § 5.2): the transition density of
+    // one excitation, e/bohr^3. excited_states_ref (empty = omit) names the
+    // excited_states section of the state and state_index (0 = omit; needs
+    // excited_states_ref) its index there. Neither is resolved here: the
+    // excited_states section usually names this one through density_ref and
+    // is added after it; validators resolve both.
+    std::string add_volume_transition_density(const Grid& grid, const Tensor& data,
+                                              const std::string& excited_states_ref = "",
+                                              int state_index = 0,
+                                              const std::string& label = "",
+                                              const std::string& section_id = "");
     std::string add_basis_ao(const Json& ao_metadata, const Grid& grid,
                              const Tensor& data, const std::string& label = "",
                              const std::string& section_id = "");
 
     // --- bands & DOS ---
+    // eigenvalues: float64 [n_spin, n_k, n_bands], eV. projections (optional,
+    // fat bands): float64 [n_spin, n_k, n_bands, n_channels], or the legacy
+    // [n_k, n_bands, n_channels], which means n_spin = 1. occupations
+    // (optional): float64 [n_spin, n_k, n_bands], electrons per state. Shapes
+    // must agree with eigenvalues (spec § 5.6); throws otherwise.
     std::string add_bands(const Json& kpath, const Tensor& eigenvalues,
                           const Tensor* projections = nullptr,
                           const std::string& section_id = "bands");
-    // section_meta merges extra section-level peer fields (smearing, channels,
-    // fermi_energy_ev, n_spin, ...) onto the section object per the schema.
+    std::string add_bands(const Json& kpath, const Tensor& eigenvalues,
+                          const Tensor* projections, const Tensor* occupations,
+                          const std::string& section_id = "bands");
+    // section_meta merges optional fields onto the section object (QVF spec
+    // § 5.6): n_spin (1 or 2), smearing (eV), smearing_type, fermi_energy_ev,
+    // n_electrons and, for dos.projected, channels (one label object per
+    // projection row: atom, l, m, spin, label).
     std::string add_dos_total(const Tensor& energies, const Tensor& dos,
                               const Json& section_meta = Json::object(),
                               const std::string& section_id = "dos_total");
+    // projections: [n_spin, n_channels, n_points], or the legacy
+    // [n_channels, n_points], which means n_spin = 1 (spec § 5.6). A rank-3
+    // tensor's spin axis must equal an integer n_spin in section_meta.
     std::string add_dos_projected(const Tensor& energies, const Tensor& projections,
                                   const Json& section_meta = Json::object(),
                                   const std::string& section_id = "dos_projected");
@@ -680,13 +2792,65 @@ public:
                                   const std::string& section_id = "");
 
     // --- trajectories / reactions / scans / vibrations ---
+    // A `units` object in the metadata of add_trajectory, add_reaction_path
+    // and add_scan_surface (and in the payload of add_topology_qtaim) is a
+    // declaration (QVF spec § 4.3, "Declared units"): each value must be a
+    // unit name, and the units the spec fixes can only be restated:
+    // trajectory `energies` "hartree", `coords` "angstrom", `times` and
+    // `timestep_fs` "fs", `lattice` "angstrom", `cell_volumes` "a3",
+    // `temperatures` "kelvin"; a reaction path's `lattice` "bohr". These calls
+    // throw otherwise; nothing is converted.
+    //
+    // add_trajectory (QVF spec § 5.5): `coords` is [n_frames, n_atoms, 3] in
+    // Å, float64, or float32 for a long MD run: float32 coords write
+    // "precision": "float32" into the metadata (added when absent), and the
+    // call throws if the metadata names a precision other than the dtype of
+    // `coords`. `extras` adds the optional per-frame members; with a lattice
+    // the metadata must carry "pbc" (three booleans), and a true pbc entry
+    // requires the lattice. Everything is checked before anything is written.
     std::string add_trajectory(const Json& metadata, const Tensor& coords,
+                               const std::string& section_id = "trajectory");
+    std::string add_trajectory(const Json& metadata, const Tensor& coords,
+                               const TrajectoryExtras& extras,
+                               const std::string& section_id = "trajectory");
+    // A fixed cell from a Lattice, written as its rows_angstrom() [3, 3]
+    // (extras.lattice must then be nullptr).
+    std::string add_trajectory(const Json& metadata, const Tensor& coords,
+                               const Lattice& lattice,
+                               const TrajectoryExtras& extras = TrajectoryExtras(),
+                               const std::string& section_id = "trajectory");
+    // One cell per frame (lattices.size() == n_frames), written as the
+    // [n_frames, 3, 3] rows in Å (extras.lattice must then be nullptr).
+    std::string add_trajectory(const Json& metadata, const Tensor& coords,
+                               const std::vector<Lattice>& lattices,
+                               const TrajectoryExtras& extras = TrajectoryExtras(),
                                const std::string& section_id = "trajectory");
     // `lattice` (optional, may be nullptr) marks the path periodic: float64
     // [3,3] (fixed cell) or [n_frames,3,3] (variable cell), columns = a,b,c, in
-    // bohr. Presence — not the manifest version — signals a periodic path.
+    // bohr. Presence — not the manifest version — signals a periodic path. This
+    // is NOT the layout or unit of add_structure's lattice_vectors (rows, Å);
+    // see spec § 4.3, "Lattice conventions". The Tensor is written as given.
     std::string add_reaction_path(const Json& metadata, const Tensor& coords,
                                   const Tensor* lattice = nullptr,
+                                  const std::string& section_id = "reaction_path");
+    // Fixed-cell periodic path from a Lattice: written as the [3,3] matrix
+    // columns_bohr(), so the conversion to the on-disk convention is done for
+    // you. nullptr writes a molecular path, as for the Tensor overload.
+    std::string add_reaction_path(const Json& metadata, const Tensor& coords,
+                                  const Lattice* lattice,
+                                  const std::string& section_id = "reaction_path");
+    // A literal `nullptr` argument would be ambiguous between the two pointer
+    // overloads above; this keeps existing calls that pass one compiling.
+    std::string add_reaction_path(const Json& metadata, const Tensor& coords,
+                                  std::nullptr_t,
+                                  const std::string& section_id = "reaction_path");
+    // The same with the per-frame members a reaction path shares with a
+    // trajectory: extras.velocities, gradient, times and energies (shapes and
+    // units as for add_trajectory). extras.lattice, cell_volumes and
+    // temperatures must be nullptr: a reaction path's cell is `lattice`
+    // above, in columns and bohr. Coordinates stay float64.
+    std::string add_reaction_path(const Json& metadata, const Tensor& coords,
+                                  const Tensor* lattice, const TrajectoryExtras& extras,
                                   const std::string& section_id = "reaction_path");
     std::string add_reaction_waypoints(const std::string& trajectory_ref,
                                        const Json& waypoints,
@@ -695,17 +2859,109 @@ public:
                                  const Tensor& axis_b, const Tensor& energies,
                                  const Tensor* geometries = nullptr,
                                  const std::string& section_id = "scan_surface");
+    // `hessian_ref` (optional, empty = omit) names the hessian section the
+    // modes were derived from (spec § 5.5); it must already be added.
     std::string add_vibrations(const Json& metadata, const Tensor& displacements,
-                               const std::string& section_id = "vibrations");
+                               const std::string& section_id = "vibrations",
+                               const std::string& hessian_ref = "");
+
+    // --- energy derivatives (spec § 5.10, § 5.11) ---
+    // `gradient`: float64 [n_atoms, 3], the energy GRADIENT dE/dR in
+    // hartree/bohr (the forces are its negative), rows in the atom order of
+    // the structure. `stress` (optional, may be nullptr, periodic systems):
+    // float64 [3, 3] stress tensor (1/V) dE/d(strain) in hartree/bohr^3.
+    // `meta` (optional; Json() omits it): the ForcesMetaPayload object
+    // (structure_ref, method, convention = "gradient", units). Throws on a
+    // wrong dtype or shape before anything is written.
+    std::string add_forces(const Tensor& gradient, const Tensor* stress = nullptr,
+                           const Json& meta = Json(),
+                           const std::string& section_id = "forces");
+    // `matrix`: float64 [3N, 3N] Cartesian Hessian d2E/(dx_i dx_j) in
+    // hartree/bohr^2, index 3 * atom + xyz; symmetric. `meta` (optional;
+    // Json() omits it): the HessianMetaPayload object (structure_ref,
+    // mass_weighted, projected, atom_masses_amu, units). Throws on a
+    // non-square matrix, an extent not divisible by 3, a mass-weighted matrix
+    // without atom_masses_amu, or masses that are not one per atom, before
+    // anything is written.
+    std::string add_hessian(const Tensor& matrix, const Json& meta = Json(),
+                            const std::string& section_id = "hessian");
+
+    // --- excited states (spec § 5.12) ---
+    // `states`: a JSON array of state objects in ascending order of `index`
+    // (an integer >= 1, unique), with the fields of $defs/ExcitedState:
+    // index and excitation_energy (required), total_energy, multiplicity,
+    // symmetry, oscillator_strength, rotatory_strength_cgs (10^-40 esu^2
+    // cm^2), transition_dipole and transition_magnetic_dipole (3 numbers,
+    // atomic units), contributions ({from_mo, to_mo, spin?, weight}), nto_ref,
+    // density_ref and x_ keys. excitation_energy / total_energy are {value,
+    // units} objects with a unit name, or numbers, written in "ev" /
+    // "hartree". nto_ref must name an added wavefunction.gto section,
+    // density_ref an added volume.transition_density or volume.difference.
+    // `meta` (optional; Json() omits it): the ExcitedStatesMeta object
+    // (method, reference_state, n_states, tda, spin_flip, units); n_states
+    // must equal the number of states. `wavefunction_ref` (empty = omit)
+    // names the added wavefunction.gto of the reference state; every
+    // contribution's from_mo / to_mo must then be one of its orbital rows.
+    // A Json::raw fragment is parsed. Throws on anything else before anything
+    // is written.
+    std::string add_excited_states(const Json& states, const Json& meta = Json(),
+                                   const std::string& wavefunction_ref = "",
+                                   const std::string& section_id = "excited_states");
+
+    // --- property kinds (spec § 5.13) ---
+    // Each takes the `properties` payload as a JSON object (a Json::raw fragment
+    // is parsed), checks it, and writes the section's single `properties`
+    // member as given. Every call throws before anything is written on a
+    // payload the schema would reject that can be judged without a schema
+    // engine: an unknown key (keys beginning x_ are allowed), a block or matrix
+    // of the wrong shape or with a non-finite number, a missing required
+    // field, a value outside an enumeration, or a `units` declaration that is
+    // not a unit name or contradicts the fixed unit. Units are fixed and
+    // nothing is converted.
+    //
+    // properties.electric: at least one of `dipole` ({"vector": [x, y, z],
+    // "total"?, "units"?: "debye"}, debye), `quadrupole` ({"matrix": 3x3
+    // symmetric, "traceless": bool, "convention": "buckingham" | "cartesian"},
+    // debye-angstrom), `octupole` ({"tensor": 27 numbers, row-major [3, 3, 3],
+    // "convention"?}, debye-angstrom^2), `polarizability` ({"matrix": 3x3,
+    // "frequency_ev"?, "isotropic"?}, atomic units) and `hyperpolarizability`
+    // ({"tensor": 27 numbers, "frequencies_ev"?: [w1, w2]}, atomic units);
+    // optional `origin` (a name or a 3-vector in bohr) and `units` ({"dipole":
+    // "debye", "origin": "bohr"}). A dipole that the root dipole_moment also
+    // states must agree with it within 1e-6 debye (validators check).
+    std::string add_electric_properties(const Json& properties,
+                                        const std::string& section_id = "electric");
+    // properties.elastic: `stiffness` (6x6, Voigt order xx yy zz yz xz xy, GPa,
+    // symmetric, required); optional `compliance` (6x6, 1/GPa, symmetric),
+    // `bulk_modulus_gpa`, `shear_modulus_gpa`, `youngs_modulus_gpa`,
+    // `poisson_ratio`, `average` ("voigt" | "reuss" | "hill") and `units`.
+    std::string add_elastic_properties(const Json& properties,
+                                       const std::string& section_id = "elastic");
+    // properties.dielectric: `electronic` (3x3, required); optional `ionic`,
+    // `static` (3x3; static must equal electronic + ionic within 1e-6 when all
+    // three are given), `born_charges` (array of 3x3, one per atom, in e),
+    // `piezoelectric` (3x6, C/m^2) and `units`. That there is one Born tensor
+    // per atom of the section's structure is checked by validators.
+    std::string add_dielectric_properties(const Json& properties,
+                                          const std::string& section_id = "dielectric");
 
     // --- symmetry & periodic kinds ---
     std::string add_structure_symmetry(const Json& data,
                                        const std::string& section_id = "symmetry");
     std::string add_fermi_surface(const Json& mesh, const Tensor& energies,
                                   const std::string& section_id = "fermi_surface");
+    // `eigenvectors` (optional, may be nullptr): float64 [n_q, n_modes, n_atoms, 3]
+    // when real, or [n_q, n_modes, n_atoms, 3, 2] with the last axis [re, im]
+    // when complex; its [n_q, n_modes] must match `frequencies` (QVF spec
+    // § 5.6). Throws on another rank, trailing axis or dtype, or a mismatch,
+    // before anything is written.
     std::string add_phonon_bands(const Json& qpath, const Tensor& frequencies,
                                  const Tensor* eigenvectors = nullptr,
                                  const std::string& section_id = "phonon_bands");
+    // `projected` (optional, may be nullptr): float64 [n_channels, n_points] on
+    // the [n_points] `frequencies` grid. Label its rows with a `channels` array
+    // in `meta`, one object per row; when `meta` has one, its length must be
+    // n_channels. Throws otherwise, before anything is written.
     std::string add_phonon_dos(const Json& meta, const Tensor& frequencies,
                                const Tensor& dos, const Tensor* projected = nullptr,
                                const std::string& section_id = "phonon_dos");
@@ -714,16 +2970,80 @@ public:
     std::string add_topology_qtaim(const Json& critical_points,
                                    const std::string& section_id = "qtaim");
 
+    // --- streaming members (WP-40) ---
+    // Stream a binary member `role` into the already added section
+    // `section_id` (any kind; the role must be new). Its path is
+    // "<section_id>/<role>.bin", or a fresh one when an archive being
+    // updated already holds that (MemberSink::path() names it). A streaming
+    // or updating writer writes the bytes straight into the archive; a
+    // buffered writer keeps them until to_bytes()/write(). Close the sink
+    // before adding anything else.
+    MemberSink begin_binary(const std::string& section_id, const std::string& role,
+                            DType dtype, std::vector<int64_t> shape);
+    // Write ZIP64 structures (extra fields, end record and locator) even
+    // though nothing needs them. Off by default; ZIP64 is used anyway when a
+    // size, an offset or the entry count passes the 32-bit limits.
+    bool force_zip64 = false;
+
     // --- output ---
     Json build_manifest() const;
+    // The archive: members in the order added, then manifest.json, STOREd.
     std::vector<uint8_t> to_bytes();
+    // Write the archive to `path` (".qvf" appended if missing), streaming
+    // it to the file. A writer bound to a file accepts only its own path.
     std::string write(const std::string& path);
+    // Finish a writer bound to a file (QvfWriter(source, path) or
+    // open_for_update): manifest.json last, then the central directory. The
+    // writer stays usable: later members are appended by the next write().
+    std::string write();
 
 private:
+    friend class MemberSink;
+    void open_bound_archive();                       // appends to out_->path
+    void emit_archive(container::ZipWriter& zip);
+    Json final_manifest() const;
+    std::shared_ptr<detail::WriterOutput> out_;      // null for a buffered writer
+    bool member_open_ = false;
+
     std::string reserve_id(const std::string& id);
-    void add_file(const std::string& path, std::vector<uint8_t> bytes);
+    void check_new_id(const std::string& id) const;   // reserve_id's checks only
+    // The entry name a new member with the default `path` gets: `path`, or,
+    // in a bound writer, a fresh "<stem>.<n><suffix>" when the archive
+    // already holds `path` or its manifest names it. Throws for a path a
+    // member of this session already uses.
+    std::string entry_name(const std::string& path) const;
+    bool pending_file(const std::string& path) const;   // written this session
+    // Adds the member file under entry_name(path) and returns that name;
+    // `store` writes it uncompressed (an already compressed image).
+    std::string add_file(const std::string& path, std::vector<uint8_t> bytes,
+                         bool store = false);
+    void drop_file(const std::string& path);
     Json json_member(const std::string& path, const Json& obj);
     Json binary_member(const std::string& path, const Tensor& t, bool with_shape = true);
+    Json opaque_member(const std::string& path, std::vector<uint8_t> bytes,
+                       const std::string& media_type = "", bool store = false);
+    // Throws unless `ref` names an added section of kind `kind`.
+    void require_section_kind(const std::string& what, const std::string& ref,
+                              const char* kind) const;
+    // atom_properties: one role as a [n_atoms] or [n_atoms, 3] float64 member.
+    std::string add_atom_role(const std::string& role, const std::vector<double>& flat,
+                              size_t n_atoms, bool vector, const std::string& section_id);
+    Json atom_properties_meta_payload(const std::vector<std::string>& custom_roles) const;
+    // trajectory / reaction.path: checks every member, then writes the section.
+    std::string add_frames_section(const std::string& kind, const Json& metadata,
+                                   const Tensor& coords, const Tensor* lattice,
+                                   const TrajectoryExtras& extras,
+                                   const std::string& section_id);
+    // properties.*: the section with its single `properties` member.
+    std::string add_properties_section(const std::string& kind,
+                                       const std::string& section_id,
+                                       const Json& payload);
+    size_t section_index(const std::string& id) const;   // throws if absent
+    void check_section_ref(const std::string& key, const Json& value) const;
+    // A wavefunction.gto section's index; throws for an absent id or another kind.
+    size_t wavefunction_index(const std::string& id) const;
+    Json member_json(const Json& member) const;   // a written JSON member, parsed
+    void replace_section(size_t index, Json section);
 
     Source source_;
     Json root_ = Json::object();          // optional root blocks
@@ -731,7 +3051,22 @@ private:
     std::vector<std::pair<std::string, std::vector<uint8_t>>> files_;
     std::set<std::string> ids_;
     std::set<std::string> paths_;
+    std::set<std::string> stored_;        // member paths written uncompressed
+    // Structure section id -> the sum of its atomic numbers, when every one is
+    // a non-negative integer (for set_structure_identity, spec § 5.1).
+    std::map<std::string, int64_t> structure_sum_z_;
+    Json atom_properties_meta_ = Json::object();  // custom role -> description
+    // The automatic metadata values, made on the first build_manifest().
+    mutable std::string auto_created_utc_;
+    mutable std::string auto_uuid_;
 };
+
+// Rewrite the archive `in` as `out` from its current (last) manifest (spec
+// § 2.3): the entries a member path references, in archive order, then that
+// manifest.json, STOREd, last. Orphans and superseded manifests are dropped;
+// member bytes and the manifest are copied unchanged, so every sha256 and
+// size stays valid. `in` and `out` may name the same file.
+void repack(const std::string& in, const std::string& out);
 
 }  // namespace qvf
 
@@ -745,9 +3080,16 @@ private:
 // sha256s, and decode JSON / binary members. Zero external dependencies — the
 // ZIP reader, INFLATE decompressor, JSON parser, and SHA-256 are all in the
 // toolkit. License: Apache-2.0.
+//
+// The validator reports findings with the stable codes of the specification's
+// Appendix B ("Validation finding codes") — the same codes the Python reference
+// validator (python/qvf_reader.py) emits, including the JSON Schema findings:
+// a checker generated from the schema (scripts/gen_kinds.py) checks
+// manifest.json and every JSON member payload without a schema engine.
 #ifndef QVF_QVF_READER_HPP
 #define QVF_QVF_READER_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -772,11 +3114,49 @@ struct BinaryMember {
     std::vector<double> as_doubles() const;
 };
 
+// Resource caps applied to untrusted archives (spec § 6): max_member_bytes,
+// max_total_bytes, max_ratio, ratio_exempt_bytes, max_json_bytes and
+// max_json_depth, with the reference values as defaults. The type lives in
+// the container layer (qvf/container.hpp), whose ZipReader enforces it.
+using Limits = container::Limits;
+
+// Options of a validation run. `schema_check` runs the JSON Schema check of
+// manifest.json (E_SCHEMA) and of every JSON member with a payload definition
+// (E_PAYLOAD_SCHEMA) through the checker generated from the schema; false
+// skips it and reports W_SCHEMA_SKIPPED instead, the behaviour of a validator
+// without a schema engine.
+struct ValidationOptions {
+    bool schema_check = true;
+};
+
+// One validation finding. `code` is a stable identifier from spec Appendix B
+// (E_* for errors, W_* for warnings). `where` is "archive", "entry:<zip name>",
+// "manifest.json", or a JSON Pointer into manifest.json such as
+// "/sections/2/members/data".
+struct Finding {
+    enum class Severity { Error, Warning } severity;
+    std::string code, where, message;
+};
+
+// True if any finding is an error (warnings leave an archive valid).
+bool has_errors(const std::vector<Finding>& findings);
+
 class QvfReader {
 public:
-    // Open a .qvf file from disk, or from an in-memory archive.
-    static QvfReader open(const std::string& path);
-    static QvfReader from_bytes(std::vector<uint8_t> archive);
+    // Open a .qvf file from disk, or from an in-memory archive. Throws on an
+    // unreadable ZIP, on duplicate ZIP entry names (an ambiguous archive, spec
+    // § 2.1; several manifest.json entries are an archive updated in place,
+    // whose last manifest.json is read, § 2.3), when manifest.json is missing,
+    // over `limits.max_json_bytes`, nested deeper than `limits.max_json_depth`,
+    // or not valid JSON, and on a `byte_order` other than "little" (§ 2.2).
+    // Member reads enforce every cap of `limits` (member and total size,
+    // ratio; JSON members also the JSON caps), and refuse a member whose
+    // declared `size` disagrees with its ZIP entry (E_BINARY_SIZE, § 4.2).
+    // open() keeps the file open and reads entries from it on demand, so the
+    // archive need not fit in memory.
+    static QvfReader open(const std::string& path, const Limits& limits = Limits{});
+    static QvfReader from_bytes(std::vector<uint8_t> archive,
+                                const Limits& limits = Limits{});
 
     QvfReader(QvfReader&&) noexcept;
     QvfReader& operator=(QvfReader&&) noexcept;
@@ -785,6 +3165,11 @@ public:
     // The parsed manifest, and its `sections` array.
     const Json& manifest() const;
     const Json& sections() const;
+
+    // The manifest as the typed, lossless model of qvf/model.hpp (built when
+    // the archive is opened). Throws std::runtime_error when manifest.json is
+    // not a JSON object.
+    const Manifest& typed_manifest() const;
 
     bool has_section(const std::string& id) const;
     const Json& section(const std::string& id) const;   // throws if missing
@@ -800,14 +3185,52 @@ public:
                                     const std::string& role,
                                     bool verify = true) const;
 
-    // Semantic validation: qvf_version/source, member existence, sha256
-    // integrity, binary byte-size == itemsize*prod(shape). Returns true if
-    // clean; otherwise appends messages to `errors`.
+    // Full validation (spec § 6) with stable finding codes: container caps and
+    // path/duplicate/orphan rules (superseded manifest.json copies are
+    // orphans, spec § 2.3), manifest and section well-formedness, member
+    // existence, declared member size, sha256, JSON size/depth/parse, dtype
+    // and binary size, UTF-8,
+    // reference resolution, the structure periodicity contract, bands shapes,
+    // the trajectory and reaction.path members (per-frame extents, coords
+    // precision, binary energies, lattice and pbc), forces and hessian
+    // shapes, excited_states state indices and orbital rows, the
+    // wavefunction.gto rules of spec § 5.3 (including the Appendix A.1
+    // normalization check of an `overlap` member, E_NORMALIZATION), the data
+    // shapes of the vector, complex, series and Laplacian volumes, a series
+    // axis against its slabs, the span of a periodic grid against its
+    // structure's cell (spec § 5.2), wavefunction.bloch shapes, k-point
+    // weights and periodic structure, the reaction.scheme participants, step
+    // ids and repeated structures (spec § 5.14), the bytes of preview members
+    // against their media_type (spec § 5.15), a run.record job_ref (spec
+    // § 5.8), a structure section's charge and multiplicity against its atoms
+    // (E_CHARGE_MULTIPLICITY) and, with one structure section, against
+    // provenance (spec § 5.1), the root energies consistency rule, unit names
+    // (W_UNIT_UNKNOWN, spec § 4.3), and the JSON Schema (E_SCHEMA,
+    // E_PAYLOAD_SCHEMA) unless `options.schema_check` is false (then
+    // W_SCHEMA_SKIPPED). The withdrawn qvf_version 2 is checked as 1 and
+    // reported as the warning W_VERSION_WITHDRAWN (spec § 3.1).
+    std::vector<Finding> validate_findings(const Limits& limits = Limits{},
+                                           const ValidationOptions& options = {}) const;
+
+    // Validate an archive that may not even open as a QvfReader (unreadable
+    // ZIP, duplicate entries, broken manifest): such failures are returned as
+    // findings rather than thrown.
+    static std::vector<Finding> validate_file(const std::string& path,
+                                              const Limits& limits = Limits{},
+                                              const ValidationOptions& options = {});
+    static std::vector<Finding> validate_bytes(std::vector<uint8_t> archive,
+                                               const Limits& limits = Limits{},
+                                               const ValidationOptions& options = {});
+
+    // Legacy form of validate_findings() with the default limits. Returns true
+    // if there is no error; otherwise appends "CODE: message" strings for the
+    // errors (warnings are not reported here).
     bool validate(std::vector<std::string>& errors) const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::shared_ptr<const Manifest> typed_;   // null when manifest.json is not an object
     explicit QvfReader(std::unique_ptr<Impl> impl);
 };
 
@@ -879,8 +3302,9 @@ public:
         for (int i = 0; i < 8; ++i) {
             for (int j = 0; j < 4; ++j) {
                 uint8_t byte = static_cast<uint8_t>((h_[i] >> (24 - 8 * j)) & 0xff);
-                out[i * 8 + j * 2] = HEX[byte >> 4];
-                out[i * 8 + j * 2 + 1] = HEX[byte & 0x0f];
+                const size_t o = static_cast<size_t>(i * 8 + j * 2);
+                out[o] = HEX[byte >> 4];
+                out[o + 1] = HEX[byte & 0x0f];
             }
         }
         return out;
@@ -948,14 +3372,88 @@ private:
 
 #endif  // QVF_SHA256_HPP
 
+// ===== src/qvf_crc32.hpp =====
+
+// qvf_crc32.hpp — CRC-32 (ISO-HDLC, the ZIP checksum), incremental.
+//
+// Header-only, inline, dependency-free. `Crc32` accumulates a checksum over
+// any number of update() calls; crc32_of() is the one-shot form. The lookup
+// table is built once, on first use, by a function-local static (thread-safe
+// initialisation). License: Apache-2.0.
+#ifndef QVF_CRC32_HPP
+#define QVF_CRC32_HPP
+
+#include <cstddef>
+#include <cstdint>
+
+namespace qvf {
+namespace detail {
+
+struct Crc32Table {
+    uint32_t entry[256];
+    Crc32Table() {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            entry[i] = c;
+        }
+    }
+};
+
+inline const uint32_t* crc32_table() {
+    static const Crc32Table table;
+    return table.entry;
+}
+
+class Crc32 {
+public:
+    void update(const uint8_t* data, size_t n) {
+        const uint32_t* t = crc32_table();
+        uint32_t c = state_;
+        for (size_t i = 0; i < n; ++i) c = t[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        state_ = c;
+    }
+    uint32_t value() const { return state_ ^ 0xFFFFFFFFu; }
+
+private:
+    uint32_t state_ = 0xFFFFFFFFu;
+};
+
+inline uint32_t crc32_of(const uint8_t* data, size_t n) {
+    Crc32 c;
+    c.update(data, n);
+    return c.value();
+}
+
+}  // namespace detail
+}  // namespace qvf
+
+#endif  // QVF_CRC32_HPP
+
 // ===== src/qvf_deflate.hpp =====
 
 // qvf_deflate.hpp — an original, dependency-free DEFLATE compressor (RFC 1951).
 //
-// LZ77 (hash-chain match finder) + a single fixed-Huffman block. Output is a
-// raw DEFLATE stream (no zlib/gzip wrapper), suitable for ZIP method 8. Not the
-// tightest possible ratio (fixed Huffman, greedy matching), but standards-clean
-// and decompressible by any inflate (zlib, unzip, Python zipfile).
+// LZ77 (hash-chain match finder, greedy) with the fixed Huffman code. Output
+// is a raw DEFLATE stream (no zlib/gzip wrapper), suitable for ZIP method 8.
+// Not the tightest possible ratio, but standards-clean and decompressible by
+// any inflate (zlib, unzip, Python zipfile).
+//
+// `Deflater` compresses incrementally: write() any number of chunks, then
+// finish(). Memory is bounded by the 32 KiB window plus the chunk being
+// encoded, whatever the total size. It has two framings:
+//
+//   * SingleBlock (the default, and what deflate() produces): the whole
+//     stream is one fixed-Huffman block. The output for a given input does
+//     not depend on how the input was split into write() calls, and is the
+//     encoding this codec has always produced.
+//   * Blocks: the stream is cut into blocks of about 32 KiB of input, and
+//     each is emitted with the fixed code or STORED, whichever is smaller, so
+//     incompressible data grows by at most 5 bytes per block (the fixed code
+//     alone can grow it by up to 12.5 %). The streaming ZIP writer uses this
+//     framing, because it cannot fall back to STORE for a whole entry once
+//     the entry's bytes are written.
 //
 // Header-only, inline. License: Apache-2.0.
 #ifndef QVF_DEFLATE_HPP
@@ -964,6 +3462,7 @@ private:
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace qvf {
@@ -987,49 +3486,12 @@ static const int kDistExtra[30] = {
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
     11, 11, 12, 12, 13, 13};
 
-// LSB-first bit sink. Huffman codes are supplied MSB-first and bit-reversed here.
-class BitWriter {
-public:
-    explicit BitWriter(std::vector<uint8_t>& out) : out_(out) {}
-
-    void bits(uint32_t value, int n) {
-        buf_ |= (static_cast<uint64_t>(value) << count_);
-        count_ += n;
-        while (count_ >= 8) {
-            out_.push_back(static_cast<uint8_t>(buf_ & 0xFF));
-            buf_ >>= 8;
-            count_ -= 8;
-        }
-    }
-    // Emit a Huffman code given MSB-first; reversed into the LSB-first stream.
-    void huff(uint32_t code, int len) {
-        uint32_t rev = 0;
-        for (int i = 0; i < len; ++i) {
-            rev = (rev << 1) | (code & 1u);
-            code >>= 1;
-        }
-        bits(rev, len);
-    }
-    void flush() {
-        if (count_ > 0) {
-            out_.push_back(static_cast<uint8_t>(buf_ & 0xFF));
-            buf_ = 0;
-            count_ = 0;
-        }
-    }
-
-private:
-    std::vector<uint8_t>& out_;
-    uint64_t buf_ = 0;
-    int count_ = 0;
-};
-
 // Fixed literal/length Huffman code (RFC 1951 §3.2.6): returns (code, len).
 inline void fixed_litlen_code(int sym, uint32_t& code, int& len) {
-    if (sym <= 143) { code = 0x30 + sym; len = 8; }
-    else if (sym <= 255) { code = 0x190 + (sym - 144); len = 9; }
-    else if (sym <= 279) { code = 0x00 + (sym - 256); len = 7; }
-    else { code = 0xC0 + (sym - 280); len = 8; }
+    if (sym <= 143) { code = static_cast<uint32_t>(0x30 + sym); len = 8; }
+    else if (sym <= 255) { code = static_cast<uint32_t>(0x190 + (sym - 144)); len = 9; }
+    else if (sym <= 279) { code = static_cast<uint32_t>(0x00 + (sym - 256)); len = 7; }
+    else { code = static_cast<uint32_t>(0xC0 + (sym - 280)); len = 8; }
 }
 
 inline int len_code_index(int length) {
@@ -1045,101 +3507,277 @@ inline int dist_code_index(int dist) {
     return 0;
 }
 
-// Compress `data` into a raw DEFLATE stream.
-inline std::vector<uint8_t> deflate(const uint8_t* data, size_t n) {
-    std::vector<uint8_t> out;
-    out.reserve(n / 2 + 16);
-    BitWriter bw(out);
+class Deflater {
+public:
+    enum class Framing { SingleBlock, Blocks };
 
-    // Block header: BFINAL=1, BTYPE=01 (fixed Huffman).
-    bw.bits(1, 1);
-    bw.bits(1, 2);
+    explicit Deflater(Framing framing = Framing::SingleBlock) : framing_(framing) {}
 
-    auto emit_literal = [&](uint8_t byte) {
-        uint32_t code;
-        int len;
-        fixed_litlen_code(byte, code, len);
-        bw.huff(code, len);
-    };
-    auto emit_match = [&](int length, int dist) {
-        int li = len_code_index(length);
-        uint32_t code;
-        int clen;
-        fixed_litlen_code(257 + li, code, clen);
-        bw.huff(code, clen);
-        if (kLenExtra[li]) bw.bits(length - kLenBase[li], kLenExtra[li]);
-        int di = dist_code_index(dist);
-        bw.huff(static_cast<uint32_t>(di), 5);  // fixed 5-bit distance code
-        if (kDistExtra[di]) bw.bits(dist - kDistBase[di], kDistExtra[di]);
-    };
-
-    // LZ77 with a hash-chain match finder.
-    constexpr int kMinMatch = 3, kMaxMatch = 258, kWindow = 32768;
-    constexpr int kHashBits = 15, kHashSize = 1 << kHashBits;
-    constexpr int kMaxChain = 128;  // effort cap per position
-
-    std::vector<int32_t> head(kHashSize, -1);
-    std::vector<int32_t> prev(n, -1);
-
-    auto hash3 = [&](size_t p) -> uint32_t {
-        uint32_t h = (uint32_t(data[p]) << 16) ^ (uint32_t(data[p + 1]) << 8)
-                     ^ uint32_t(data[p + 2]);
-        return (h * 2654435761u) >> (32 - kHashBits);
-    };
-
-    size_t pos = 0;
-    while (pos < n) {
-        int best_len = 0, best_dist = 0;
-        if (pos + kMinMatch <= n) {
-            uint32_t h = hash3(pos);
-            int32_t cand = head[h];
-            int chain = kMaxChain;
-            size_t max_len = std::min<size_t>(kMaxMatch, n - pos);
-            while (cand >= 0 && chain-- > 0) {
-                size_t d = pos - static_cast<size_t>(cand);
-                if (d > kWindow) break;
-                // Quick reject on the byte past the current best match.
-                if (best_len == 0 ||
-                    data[cand + best_len] == data[pos + best_len]) {
-                    size_t l = 0;
-                    while (l < max_len && data[cand + l] == data[pos + l]) ++l;
-                    if (static_cast<int>(l) > best_len) {
-                        best_len = static_cast<int>(l);
-                        best_dist = static_cast<int>(d);
-                        if (l >= max_len) break;
-                    }
-                }
-                cand = prev[cand];
-            }
-        }
-
-        if (best_len >= kMinMatch) {
-            emit_match(best_len, best_dist);
-            // Insert hash entries for all covered positions.
-            size_t end = pos + static_cast<size_t>(best_len);
-            for (; pos + kMinMatch <= n && pos < end; ++pos) {
-                uint32_t h = hash3(pos);
-                prev[pos] = head[h];
-                head[h] = static_cast<int32_t>(pos);
-            }
-            pos = end;
-        } else {
-            emit_literal(data[pos]);
-            if (pos + kMinMatch <= n) {
-                uint32_t h = hash3(pos);
-                prev[pos] = head[h];
-                head[h] = static_cast<int32_t>(pos);
-            }
-            ++pos;
+    // Compress `n` more input bytes; compressed bytes are appended to `out`.
+    void write(const uint8_t* data, size_t n, std::vector<uint8_t>& out) {
+        if (finished_) throw std::logic_error("deflate: write after finish");
+        start(out);
+        while (n > 0) {
+            const size_t take = n < kSlice ? n : kSlice;
+            buf_.insert(buf_.end(), data, data + take);
+            data += take;
+            n -= take;
+            encode(false, out);
+            compact();
         }
     }
 
-    // End of block (symbol 256), then flush partial byte.
-    uint32_t eob;
-    int eob_len;
-    fixed_litlen_code(256, eob, eob_len);
-    bw.huff(eob, eob_len);
-    bw.flush();
+    // Encode the rest of the input and end the stream (byte-aligned).
+    void finish(std::vector<uint8_t>& out) {
+        if (finished_) return;
+        start(out);
+        encode(true, out);
+        if (framing_ == Framing::SingleBlock)
+            emit_end_of_block(out);
+        else
+            flush_block(true, out);
+        if (bitcount_ > 0) {
+            out.push_back(static_cast<uint8_t>(bitbuf_ & 0xFF));
+            bitbuf_ = 0;
+            bitcount_ = 0;
+        }
+        finished_ = true;
+    }
+
+    uint64_t total_in() const { return base_ + buf_.size(); }
+
+private:
+    static constexpr int kMinMatch = 3, kMaxMatch = 258;
+    static constexpr uint64_t kWindow = 32768, kWindowMask = kWindow - 1;
+    static constexpr int kHashBits = 15, kHashSize = 1 << kHashBits;
+    static constexpr int kMaxChain = 128;  // effort cap per position
+    // A position is encoded only when this much input follows it (or at the
+    // end of the stream): every decision then sees the same bytes it would
+    // see with the whole input in memory, so the output does not depend on
+    // how the input was chunked.
+    static constexpr uint64_t kLookahead = kMaxMatch + kMinMatch + 1;
+    static constexpr size_t kSlice = size_t(1) << 18;        // input per encode pass
+    static constexpr uint64_t kCompactAt = uint64_t(1) << 20; // drop consumed input
+    static constexpr uint64_t kBlockInput = 32768;           // Blocks framing
+
+    // -- bit output (LSB first) --
+    void bits(uint32_t value, int n, std::vector<uint8_t>& out) {
+        bitbuf_ |= static_cast<uint64_t>(value) << bitcount_;
+        bitcount_ += n;
+        while (bitcount_ >= 8) {
+            out.push_back(static_cast<uint8_t>(bitbuf_ & 0xFF));
+            bitbuf_ >>= 8;
+            bitcount_ -= 8;
+        }
+    }
+    // A Huffman code given MSB-first, reversed into the LSB-first stream.
+    void huff(uint32_t code, int len, std::vector<uint8_t>& out) {
+        uint32_t rev = 0;
+        for (int i = 0; i < len; ++i) {
+            rev = (rev << 1) | (code & 1u);
+            code >>= 1;
+        }
+        bits(rev, len, out);
+    }
+
+    void start(std::vector<uint8_t>& out) {
+        if (started_) return;
+        started_ = true;
+        // SingleBlock: BFINAL=1, BTYPE=01 (fixed Huffman), once.
+        if (framing_ == Framing::SingleBlock) {
+            bits(1, 1, out);
+            bits(1, 2, out);
+        }
+    }
+
+    const uint8_t* at(uint64_t p) const { return buf_.data() + (p - base_); }
+
+    uint32_t hash3(uint64_t p) const {
+        const uint8_t* d = at(p);
+        uint32_t h = (uint32_t(d[0]) << 16) ^ (uint32_t(d[1]) << 8) ^ uint32_t(d[2]);
+        return (h * 2654435761u) >> (32 - kHashBits);
+    }
+
+    // Hash chains hold position + 1 modulo 2^32 (0 = empty); a candidate's
+    // distance is recovered relative to the current position.
+    void insert(uint64_t p) {
+        if (head_.empty()) head_.assign(kHashSize, 0);
+        const size_t slot = static_cast<size_t>(p & kWindowMask);
+        if (prev_.size() <= slot)
+            prev_.resize(slot + 1 < kWindow ? slot + 1 : static_cast<size_t>(kWindow), 0);
+        const uint32_t h = hash3(p);
+        prev_[slot] = head_[h];
+        head_[h] = static_cast<uint32_t>(p + 1);
+    }
+    // Distance from pos_ to the position stored as `link`, or 0 for none.
+    uint64_t distance_of(uint32_t link) const {
+        if (link == 0) return 0;
+        const uint32_t d = static_cast<uint32_t>(pos_ + 1) - link;
+        if (d == 0 || d > pos_) return 0;
+        return d;
+    }
+
+    void encode(bool final, std::vector<uint8_t>& out) {
+        const uint64_t n = base_ + buf_.size();  // input available
+        while (pos_ < n) {
+            if (!final && n - pos_ < kLookahead) break;
+            int best_len = 0, best_dist = 0;
+            if (pos_ + kMinMatch <= n && !head_.empty()) {
+                const size_t max_len =
+                    static_cast<size_t>(std::min<uint64_t>(kMaxMatch, n - pos_));
+                const uint8_t* cur = at(pos_);
+                uint64_t d = distance_of(head_[hash3(pos_)]);
+                int chain = kMaxChain;
+                while (d != 0 && chain-- > 0) {
+                    if (d > kWindow) break;
+                    const uint64_t cand = pos_ - d;
+                    const uint8_t* c = at(cand);
+                    // Quick reject on the byte past the current best match.
+                    if (best_len == 0 || c[best_len] == cur[best_len]) {
+                        size_t l = 0;
+                        while (l < max_len && c[l] == cur[l]) ++l;
+                        if (static_cast<int>(l) > best_len) {
+                            best_len = static_cast<int>(l);
+                            best_dist = static_cast<int>(d);
+                            if (l >= max_len) break;
+                        }
+                    }
+                    const size_t slot = static_cast<size_t>(cand & kWindowMask);
+                    d = slot < prev_.size() ? distance_of(prev_[slot]) : 0;
+                }
+            }
+            if (best_len >= kMinMatch) {
+                emit_match(best_len, best_dist, out);
+                // Insert hash entries for all covered positions.
+                const uint64_t stop = pos_ + static_cast<uint64_t>(best_len);
+                for (; pos_ + kMinMatch <= n && pos_ < stop; ++pos_) insert(pos_);
+                pos_ = stop;
+            } else {
+                emit_literal(*at(pos_), out);
+                if (pos_ + kMinMatch <= n) insert(pos_);
+                ++pos_;
+            }
+            if (framing_ == Framing::Blocks && pos_ - block_start_ >= kBlockInput)
+                flush_block(false, out);
+        }
+    }
+
+    // Drop input that no future match (and no pending STORED block) can use.
+    void compact() {
+        uint64_t keep = pos_ > kWindow ? pos_ - kWindow : 0;
+        if (framing_ == Framing::Blocks && block_start_ < keep) keep = block_start_;
+        if (keep > base_ && keep - base_ >= kCompactAt) {
+            buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(keep - base_));
+            base_ = keep;
+        }
+    }
+
+    static int literal_bits(int byte) { return byte <= 143 ? 8 : 9; }
+    static int match_bits(int length, int dist) {
+        const int li = len_code_index(length);
+        const int di = dist_code_index(dist);
+        return (257 + li <= 279 ? 7 : 8) + kLenExtra[li] + 5 + kDistExtra[di];
+    }
+
+    void put_literal(int byte, std::vector<uint8_t>& out) {
+        uint32_t code;
+        int len;
+        fixed_litlen_code(byte, code, len);
+        huff(code, len, out);
+    }
+    void put_match(int length, int dist, std::vector<uint8_t>& out) {
+        const int li = len_code_index(length);
+        uint32_t code;
+        int clen;
+        fixed_litlen_code(257 + li, code, clen);
+        huff(code, clen, out);
+        if (kLenExtra[li])
+            bits(static_cast<uint32_t>(length - kLenBase[li]), kLenExtra[li], out);
+        const int di = dist_code_index(dist);
+        huff(static_cast<uint32_t>(di), 5, out);  // fixed 5-bit distance code
+        if (kDistExtra[di])
+            bits(static_cast<uint32_t>(dist - kDistBase[di]), kDistExtra[di], out);
+    }
+    void emit_end_of_block(std::vector<uint8_t>& out) {
+        uint32_t eob;
+        int eob_len;
+        fixed_litlen_code(256, eob, eob_len);
+        huff(eob, eob_len, out);
+    }
+
+    void emit_literal(uint8_t byte, std::vector<uint8_t>& out) {
+        if (framing_ == Framing::SingleBlock) {
+            put_literal(byte, out);
+        } else {
+            tokens_.push_back(byte);
+            block_bits_ += static_cast<uint64_t>(literal_bits(byte));
+        }
+    }
+    void emit_match(int length, int dist, std::vector<uint8_t>& out) {
+        if (framing_ == Framing::SingleBlock) {
+            put_match(length, dist, out);
+        } else {
+            tokens_.push_back(0x80000000u | (static_cast<uint32_t>(length) << 16) |
+                              static_cast<uint32_t>(dist));
+            block_bits_ += static_cast<uint64_t>(match_bits(length, dist));
+        }
+    }
+
+    // Blocks framing: emit the input since block_start_ as one block, fixed
+    // Huffman or STORED, whichever takes fewer bits.
+    void flush_block(bool final, std::vector<uint8_t>& out) {
+        const uint64_t len = pos_ - block_start_;   // < 65536 by construction
+        const uint64_t fixed_bits = 3 + block_bits_ + 7;
+        const uint64_t pad = (8 - (static_cast<uint64_t>(bitcount_) + 3) % 8) % 8;
+        const uint64_t stored_bits = 3 + pad + 32 + 8 * len;
+        bits(final ? 1u : 0u, 1, out);
+        if (stored_bits < fixed_bits) {
+            bits(0, 2, out);                         // BTYPE=00 (stored)
+            if (bitcount_ > 0) bits(0, 8 - bitcount_, out);
+            const uint32_t l16 = static_cast<uint32_t>(len);
+            bits(l16 & 0xFFFF, 16, out);
+            bits(~l16 & 0xFFFF, 16, out);
+            const uint8_t* src = at(block_start_);
+            out.insert(out.end(), src, src + static_cast<size_t>(len));
+        } else {
+            bits(1, 2, out);                         // BTYPE=01 (fixed)
+            for (uint32_t t : tokens_) {
+                if (t & 0x80000000u)
+                    put_match(static_cast<int>((t >> 16) & 0x1FF),
+                              static_cast<int>(t & 0xFFFF), out);
+                else
+                    put_literal(static_cast<int>(t), out);
+            }
+            emit_end_of_block(out);
+        }
+        tokens_.clear();
+        block_bits_ = 0;
+        block_start_ = pos_;
+    }
+
+    Framing framing_;
+    std::vector<uint8_t> buf_;     // input [base_, base_ + buf_.size())
+    uint64_t base_ = 0;
+    uint64_t pos_ = 0;             // next input position to encode
+    std::vector<uint32_t> head_;   // hash -> position + 1 (lazily allocated)
+    std::vector<uint32_t> prev_;   // ring over the window: position -> previous
+    uint64_t bitbuf_ = 0;
+    int bitcount_ = 0;
+    bool started_ = false;
+    bool finished_ = false;
+    // Blocks framing: the pending block.
+    std::vector<uint32_t> tokens_;
+    uint64_t block_bits_ = 0;
+    uint64_t block_start_ = 0;
+};
+
+// Compress `data` into a raw DEFLATE stream (one fixed-Huffman block).
+inline std::vector<uint8_t> deflate(const uint8_t* data, size_t n) {
+    std::vector<uint8_t> out;
+    out.reserve(n / 2 + 16);
+    Deflater d;
+    d.write(data, n, out);
+    d.finish(out);
     return out;
 }
 
@@ -1161,11 +3799,22 @@ inline std::vector<uint8_t> deflate(const std::vector<uint8_t>& v) {
 // zipfile), not just this toolkit's fixed-Huffman writer. Canonical-Huffman
 // decode via the classic count/symbol tables (à la zlib's puff, reimplemented).
 //
+// Two forms share one decoder:
+//   * inflate(): the whole compressed stream in memory, the whole output
+//     returned as one vector;
+//   * InflateBitReader with a refill callback plus InflateWindow with a sink:
+//     input is pulled in chunks and output is pushed to the sink in chunks,
+//     keeping only the 32 KiB window back-references need (streaming).
+// Either way the output never exceeds the caller's bound: a stream that would
+// inflate past it is abandoned at once.
+//
 // Header-only, inline. License: Apache-2.0.
 #ifndef QVF_INFLATE_HPP
 #define QVF_INFLATE_HPP
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -1188,12 +3837,16 @@ static const int kInfDistExtra[30] = {
 
 class InflateBitReader {
 public:
-    InflateBitReader(const uint8_t* p, size_t n) : p_(p), n_(n) {}
+    // Supplies the next chunk of compressed input: sets `p` and returns its
+    // length, or 0 at the end of the input.
+    using Refill = std::function<size_t(const uint8_t*& p)>;
+
+    InflateBitReader(const uint8_t* p, size_t n, Refill refill = Refill())
+        : p_(p), n_(n), refill_(std::move(refill)) {}
 
     int bit() {
         if (bitcnt_ == 0) {
-            if (pos_ >= n_) throw std::runtime_error("inflate: out of input");
-            cur_ = p_[pos_++];
+            cur_ = next_byte();
             bitcnt_ = 8;
         }
         int b = cur_ & 1;
@@ -1207,17 +3860,89 @@ public:
         return v;
     }
     void align() { bitcnt_ = 0; }
-    uint8_t byte() {
-        if (pos_ >= n_) throw std::runtime_error("inflate: out of input (byte)");
+    uint8_t byte() { return next_byte(); }
+
+private:
+    uint8_t next_byte() {
+        while (pos_ >= n_) {
+            const uint8_t* q = nullptr;
+            const size_t m = refill_ ? refill_(q) : 0;
+            if (m == 0 || q == nullptr) throw std::runtime_error("inflate: out of input");
+            p_ = q;
+            n_ = m;
+            pos_ = 0;
+        }
         return p_[pos_++];
     }
 
-private:
     const uint8_t* p_;
     size_t n_;
     size_t pos_ = 0;
+    Refill refill_;
     uint8_t cur_ = 0;
     int bitcnt_ = 0;
+};
+
+// Thrown when a stream inflates past the caller's output bound (a ZIP entry
+// whose data expands beyond its declared uncompressed size).
+[[noreturn]] inline void inflate_overflow() {
+    throw std::runtime_error("inflate: output exceeds the declared size");
+}
+
+// The decoder's output: the bytes produced so far, of which at least the last
+// 32 KiB (the DEFLATE window) are kept. Without a sink everything is kept and
+// take() returns it; with a sink, bytes are handed over in chunks of about
+// 1 MiB and dropped once they leave the window.
+class InflateWindow {
+public:
+    using Sink = std::function<void(const uint8_t*, size_t)>;
+
+    InflateWindow(uint64_t max_out, Sink sink = Sink(), size_t reserve = 0)
+        : max_out_(max_out), sink_(std::move(sink)) {
+        if (sink_) reserve = kFlushAt;
+        if (reserve) buf_.reserve(reserve);
+    }
+
+    void put(uint8_t b) {
+        if (total_ >= max_out_) inflate_overflow();
+        buf_.push_back(b);
+        ++total_;
+    }
+    void copy(size_t distance, size_t length) {
+        if (distance > buf_.size()) throw std::runtime_error("inflate: distance too far back");
+        if (static_cast<uint64_t>(length) > max_out_ - total_) inflate_overflow();
+        const size_t start = buf_.size() - distance;
+        for (size_t i = 0; i < length; ++i) {
+            const uint8_t b = buf_[start + i];
+            buf_.push_back(b);
+        }
+        total_ += length;
+    }
+    void maybe_flush() {
+        if (sink_ && buf_.size() >= kFlushAt) {
+            sink_(buf_.data() + delivered_, buf_.size() - delivered_);
+            buf_.erase(buf_.begin(),
+                       buf_.begin() + static_cast<std::ptrdiff_t>(buf_.size() - kWindow));
+            delivered_ = buf_.size();
+        }
+    }
+    void finish() {
+        if (sink_ && buf_.size() > delivered_) {
+            sink_(buf_.data() + delivered_, buf_.size() - delivered_);
+            delivered_ = buf_.size();
+        }
+    }
+    uint64_t total() const { return total_; }
+    std::vector<uint8_t> take() { return std::move(buf_); }
+
+private:
+    static constexpr size_t kWindow = 32768;
+    static constexpr size_t kFlushAt = (size_t(1) << 20) + kWindow;
+    std::vector<uint8_t> buf_;
+    size_t delivered_ = 0;   // buf_[0, delivered_) already handed to the sink
+    uint64_t total_ = 0;
+    uint64_t max_out_;
+    Sink sink_;
 };
 
 struct HuffTable {
@@ -1233,7 +3958,8 @@ struct HuffTable {
         for (int len = 1; len < 15; ++len) offs[len + 1] = offs[len] + counts[len];
         symbols.assign(lengths.size(), 0);
         for (size_t sym = 0; sym < lengths.size(); ++sym)
-            if (lengths[sym]) symbols[offs[lengths[sym]]++] = static_cast<int>(sym);
+            if (lengths[sym])
+                symbols[static_cast<size_t>(offs[lengths[sym]]++)] = static_cast<int>(sym);
     }
 
     int decode(InflateBitReader& br) const {
@@ -1241,7 +3967,8 @@ struct HuffTable {
         for (int len = 1; len <= 15; ++len) {
             code |= br.bit();
             int count = counts[len];
-            if (code - first < count) return symbols[index + (code - first)];
+            if (code - first < count)
+                return symbols[static_cast<size_t>(index + (code - first))];
             index += count;
             first += count;
             first <<= 1;
@@ -1251,13 +3978,14 @@ struct HuffTable {
     }
 };
 
-inline void inflate_block_codes(InflateBitReader& br, std::vector<uint8_t>& out,
+inline void inflate_block_codes(InflateBitReader& br, InflateWindow& out,
                                 const HuffTable& lit, const HuffTable& dist) {
     while (true) {
         int sym = lit.decode(br);
         if (sym == 256) return;  // end of block
         if (sym < 256) {
-            out.push_back(static_cast<uint8_t>(sym));
+            out.put(static_cast<uint8_t>(sym));
+            out.maybe_flush();
             continue;
         }
         sym -= 257;
@@ -1267,76 +3995,98 @@ inline void inflate_block_codes(InflateBitReader& br, std::vector<uint8_t>& out,
         if (dsym >= 30) throw std::runtime_error("inflate: bad distance symbol");
         int distance =
             kInfDistBase[dsym] + static_cast<int>(br.bits(kInfDistExtra[dsym]));
-        if (static_cast<size_t>(distance) > out.size())
-            throw std::runtime_error("inflate: distance too far back");
-        size_t start = out.size() - static_cast<size_t>(distance);
-        for (int i = 0; i < length; ++i) out.push_back(out[start + i]);
+        out.copy(static_cast<size_t>(distance), static_cast<size_t>(length));
+        out.maybe_flush();
     }
 }
 
-inline void build_fixed(HuffTable& lit, HuffTable& dist) {
-    std::vector<int> ll(288);
-    for (int i = 0; i < 144; ++i) ll[i] = 8;
-    for (int i = 144; i < 256; ++i) ll[i] = 9;
-    for (int i = 256; i < 280; ++i) ll[i] = 7;
-    for (int i = 280; i < 288; ++i) ll[i] = 8;
-    lit.construct(ll);
-    dist.construct(std::vector<int>(30, 5));
+struct FixedHuffTables {
+    HuffTable lit, dist;
+    FixedHuffTables() {
+        std::vector<int> ll(288);
+        for (size_t i = 0; i < 144; ++i) ll[i] = 8;
+        for (size_t i = 144; i < 256; ++i) ll[i] = 9;
+        for (size_t i = 256; i < 280; ++i) ll[i] = 7;
+        for (size_t i = 280; i < 288; ++i) ll[i] = 8;
+        lit.construct(ll);
+        dist.construct(std::vector<int>(30, 5));
+    }
+};
+
+inline const FixedHuffTables& fixed_huff_tables() {
+    static const FixedHuffTables tables;
+    return tables;
 }
 
 inline void build_dynamic(InflateBitReader& br, HuffTable& lit, HuffTable& dist) {
     int hlit = static_cast<int>(br.bits(5)) + 257;
     int hdist = static_cast<int>(br.bits(5)) + 1;
     int hclen = static_cast<int>(br.bits(4)) + 4;
+    // As zlib: at most 286 literal/length and 30 distance codes.
+    if (hlit > 286 || hdist > 30)
+        throw std::runtime_error("inflate: too many length or distance codes");
     static const int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5,
                                   11, 4, 12, 3, 13, 2, 14, 1, 15};
     std::vector<int> cl(19, 0);
-    for (int i = 0; i < hclen; ++i) cl[order[i]] = static_cast<int>(br.bits(3));
+    for (int i = 0; i < hclen; ++i)
+        cl[static_cast<size_t>(order[i])] = static_cast<int>(br.bits(3));
     HuffTable clh;
     clh.construct(cl);
 
+    const size_t total = static_cast<size_t>(hlit + hdist);
     std::vector<int> lengths;
-    lengths.reserve(static_cast<size_t>(hlit + hdist));
-    while (static_cast<int>(lengths.size()) < hlit + hdist) {
+    lengths.reserve(total);
+    while (lengths.size() < total) {
         int sym = clh.decode(br);
         if (sym < 16) {
             lengths.push_back(sym);
-        } else if (sym == 16) {
-            if (lengths.empty()) throw std::runtime_error("inflate: bad repeat");
-            int prev = lengths.back();
-            int rep = 3 + static_cast<int>(br.bits(2));
-            for (int i = 0; i < rep; ++i) lengths.push_back(prev);
-        } else if (sym == 17) {
-            int rep = 3 + static_cast<int>(br.bits(3));
-            for (int i = 0; i < rep; ++i) lengths.push_back(0);
-        } else {  // 18
-            int rep = 11 + static_cast<int>(br.bits(7));
-            for (int i = 0; i < rep; ++i) lengths.push_back(0);
+            continue;
         }
+        int value = 0, rep = 0;
+        if (sym == 16) {
+            if (lengths.empty()) throw std::runtime_error("inflate: bad repeat");
+            value = lengths.back();
+            rep = 3 + static_cast<int>(br.bits(2));
+        } else if (sym == 17) {
+            rep = 3 + static_cast<int>(br.bits(3));
+        } else {  // 18
+            rep = 11 + static_cast<int>(br.bits(7));
+        }
+        if (lengths.size() + static_cast<size_t>(rep) > total)
+            throw std::runtime_error("inflate: bad repeat");
+        lengths.insert(lengths.end(), static_cast<size_t>(rep), value);
     }
+    if (lengths[256] == 0)
+        throw std::runtime_error("inflate: missing end-of-block code");
     lit.construct(std::vector<int>(lengths.begin(), lengths.begin() + hlit));
     dist.construct(std::vector<int>(lengths.begin() + hlit, lengths.end()));
 }
 
-// Decompress a raw DEFLATE stream. `size_hint` pre-reserves the output.
-inline std::vector<uint8_t> inflate(const uint8_t* data, size_t n,
-                                    size_t size_hint = 0) {
-    std::vector<uint8_t> out;
-    if (size_hint) out.reserve(size_hint);
-    InflateBitReader br(data, n);
+// Decode a whole raw DEFLATE stream from `br` into `out` (data after the
+// final block is ignored), then hand the rest of the output to the sink.
+inline void inflate_stream(InflateBitReader& br, InflateWindow& out) {
     while (true) {
         int bfinal = br.bit();
         int btype = static_cast<int>(br.bits(2));
         if (btype == 0) {
             br.align();
-            uint16_t len = static_cast<uint16_t>(br.byte() | (br.byte() << 8));
-            br.byte();  // NLEN
-            br.byte();
-            for (int i = 0; i < len; ++i) out.push_back(br.byte());
+            // Read the LEN and NLEN bytes in order: operand evaluation order
+            // of `br.byte() | (br.byte() << 8)` is unspecified in C++.
+            const unsigned len_lo = br.byte();
+            const unsigned len_hi = br.byte();
+            const unsigned nlen_lo = br.byte();
+            const unsigned nlen_hi = br.byte();
+            const unsigned len = len_lo | (len_hi << 8);
+            const unsigned nlen = nlen_lo | (nlen_hi << 8);
+            if ((len ^ 0xFFFFu) != nlen)
+                throw std::runtime_error("inflate: stored block length check failed");
+            for (unsigned i = 0; i < len; ++i) {
+                out.put(br.byte());
+                out.maybe_flush();
+            }
         } else if (btype == 1) {
-            HuffTable lit, dist;
-            build_fixed(lit, dist);
-            inflate_block_codes(br, out, lit, dist);
+            const FixedHuffTables& fixed = fixed_huff_tables();
+            inflate_block_codes(br, out, fixed.lit, fixed.dist);
         } else if (btype == 2) {
             HuffTable lit, dist;
             build_dynamic(br, lit, dist);
@@ -1346,7 +4096,25 @@ inline std::vector<uint8_t> inflate(const uint8_t* data, size_t n,
         }
         if (bfinal) break;
     }
-    return out;
+    out.finish();
+}
+
+// Decompress a raw DEFLATE stream. `size_hint` pre-reserves the output (never
+// more than DEFLATE's maximum expansion of the input allows, so a lying hint
+// cannot force a huge allocation). Throws if the output would exceed `max_out`.
+inline std::vector<uint8_t> inflate(const uint8_t* data, size_t n,
+                                    size_t size_hint = 0,
+                                    size_t max_out = static_cast<size_t>(-1)) {
+    // A DEFLATE stream expands at most ~1032:1 (258-byte matches in 1-bit codes).
+    const size_t max_expansion = n > static_cast<size_t>(-1) / 1032 - 64
+                                     ? static_cast<size_t>(-1)
+                                     : n * 1032 + 64;
+    size_t reserve = size_hint < max_expansion ? size_hint : max_expansion;
+    if (reserve > max_out) reserve = max_out;
+    InflateBitReader br(data, n);
+    InflateWindow out(static_cast<uint64_t>(max_out), InflateWindow::Sink(), reserve);
+    inflate_stream(br, out);
+    return out.take();
 }
 
 inline std::vector<uint8_t> inflate(const std::vector<uint8_t>& v,
@@ -1361,21 +4129,23 @@ inline std::vector<uint8_t> inflate(const std::vector<uint8_t>& v,
 
 // ===== src/qvf_zip.hpp =====
 
-// qvf_zip.hpp — a minimal, original ZIP archive writer.
+// qvf_zip.hpp — the in-memory ZIP writer interface of the original toolkit.
 //
-// Header-only, inline, dependency-free. Emits a valid PKZIP archive. Each
-// member is DEFLATE-compressed (method 8) when that is smaller than the raw
-// bytes, else STORE-d (method 0) — both decompressible by any unzip. The
-// DEFLATE codec is the original implementation in qvf_deflate.hpp.
+// `detail::ZipWriter` keeps the interface the tests and early code use (add
+// members, finish() returns the archive bytes) on top of
+// qvf::container::ZipWriter (qvf/container.hpp), which does the encoding:
+// each member is DEFLATE-compressed (method 8) when that is smaller than the
+// raw bytes, else STORE-d (method 0). An archive that needs no ZIP64
+// structure is byte-for-byte what this writer has always produced. Unlike
+// container::ZipWriter it accepts a repeated name, so tests can build the
+// malformed archives validators must reject.
 //
-// Only what QVF needs: no encryption, no zip64 (QVF caps members at 8 GiB and
-// archives well under 4 GiB in practice), no directory entries. License:
-// Apache-2.0.
+// Also re-exports crc32_of() (qvf_crc32.hpp). License: Apache-2.0.
 #ifndef QVF_ZIP_HPP
 #define QVF_ZIP_HPP
 
 #include <cstdint>
-#include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1383,65 +4153,19 @@ inline std::vector<uint8_t> inflate(const std::vector<uint8_t>& v,
 namespace qvf {
 namespace detail {
 
-inline uint32_t crc32_of(const uint8_t* data, size_t n) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        init = true;
-    }
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; ++i)
-        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
 class ZipWriter {
 public:
+    ZipWriter() : sink_(new container::MemorySink), zip_(std::unique_ptr<container::Sink>(sink_)) {
+        zip_.allow_duplicate_names();
+    }
+
     // Add a member. DEFLATE-compressed when that is smaller than STORE.
     // `compress = false` forces STORE (used for manifest.json).
     void add(const std::string& name, const uint8_t* data, size_t n,
              bool compress = true) {
-        Entry e;
-        e.name = name;
-        e.crc = crc32_of(data, n);
-        e.usize = static_cast<uint32_t>(n);
-        e.offset = static_cast<uint32_t>(out_.size());
-
-        std::vector<uint8_t> deflated;
-        const uint8_t* body = data;
-        uint32_t csize = static_cast<uint32_t>(n);
-        e.method = 0;  // STORE
-        if (compress && n > 0) {
-            deflated = deflate(data, n);
-            if (deflated.size() < n) {
-                e.method = 8;  // DEFLATE
-                body = deflated.data();
-                csize = static_cast<uint32_t>(deflated.size());
-            }
-        }
-        e.csize = csize;
-
-        put16(0x04034b50 & 0xFFFF); put16(0x04034b50 >> 16);  // local sig (LE)
-        put16(20);              // version needed
-        put16(0);               // flags
-        put16(e.method);        // compression method
-        put16(0); put16(0);     // mod time, mod date (fixed / zeroed)
-        put32(e.crc);
-        put32(e.csize);         // compressed size
-        put32(e.usize);         // uncompressed size
-        put16(static_cast<uint16_t>(name.size()));
-        put16(0);               // extra len
-        out_.insert(out_.end(), name.begin(), name.end());
-        out_.insert(out_.end(), body, body + csize);
-        entries_.push_back(std::move(e));
+        zip_.write(name, data, n,
+                   compress ? container::Method::Deflate : container::Method::Store);
     }
-
     void add(const std::string& name, const std::vector<uint8_t>& v,
              bool compress = true) {
         add(name, v.data(), v.size(), compress);
@@ -1453,60 +4177,13 @@ public:
 
     // Finalize: append the central directory + end record; return archive bytes.
     std::vector<uint8_t> finish() {
-        uint32_t cd_start = static_cast<uint32_t>(out_.size());
-        for (const auto& e : entries_) {
-            put16(0x02014b50 & 0xFFFF); put16(0x02014b50 >> 16);  // central sig
-            put16(20);          // version made by
-            put16(20);          // version needed
-            put16(0);           // flags
-            put16(e.method);    // compression method
-            put16(0); put16(0); // time, date
-            put32(e.crc);
-            put32(e.csize);     // compressed size
-            put32(e.usize);     // uncompressed size
-            put16(static_cast<uint16_t>(e.name.size()));
-            put16(0);           // extra
-            put16(0);           // comment
-            put16(0);           // disk number
-            put16(0);           // internal attrs
-            put32(0);           // external attrs
-            put32(e.offset);
-            out_.insert(out_.end(), e.name.begin(), e.name.end());
-        }
-        uint32_t cd_size = static_cast<uint32_t>(out_.size()) - cd_start;
-        put16(0x06054b50 & 0xFFFF); put16(0x06054b50 >> 16);  // end sig
-        put16(0); put16(0);     // disk numbers
-        put16(static_cast<uint16_t>(entries_.size()));
-        put16(static_cast<uint16_t>(entries_.size()));
-        put32(cd_size);
-        put32(cd_start);
-        put16(0);               // comment length
-        return std::move(out_);
+        zip_.finish();
+        return sink_->take();
     }
 
 private:
-    struct Entry {
-        std::string name;
-        uint32_t crc = 0;
-        uint32_t csize = 0;   // compressed (stored) size
-        uint32_t usize = 0;   // uncompressed size
-        uint32_t offset = 0;
-        uint16_t method = 0;  // 0 = STORE, 8 = DEFLATE
-    };
-
-    void put16(uint32_t v) {
-        out_.push_back(static_cast<uint8_t>(v & 0xFF));
-        out_.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
-    }
-    void put32(uint32_t v) {
-        out_.push_back(static_cast<uint8_t>(v & 0xFF));
-        out_.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
-        out_.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
-        out_.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
-    }
-
-    std::vector<uint8_t> out_;
-    std::vector<Entry> entries_;
+    container::MemorySink* sink_;   // owned by zip_
+    container::ZipWriter zip_;
 };
 
 }  // namespace detail
@@ -1516,140 +4193,5437 @@ private:
 
 // ===== src/qvf_unzip.hpp =====
 
-// qvf_unzip.hpp — a minimal, original ZIP archive reader.
+// qvf_unzip.hpp — the ZIP reader under its original internal name.
 //
-// Parses the central directory and extracts members by name, decompressing
-// STORE (method 0) and DEFLATE (method 8, via qvf_inflate.hpp). No zip64, no
-// encryption — matching what the QVF writer produces and what real .qvf files
-// use. Header-only, inline. License: Apache-2.0.
+// `detail::ZipReader` is qvf::container::ZipReader (qvf/container.hpp): it
+// parses the central directory (ZIP64 end records and extra fields
+// included) and extracts entries by name, decompressing STORE (method 0) and
+// DEFLATE (method 8), from memory or from a file.
+//
+// The archive is untrusted input: every offset is bounds-checked, entry names
+// that occur more than once are recorded (duplicates() — spec § 2.1 forbids
+// them; the caller decides whether to refuse), a member is never inflated
+// past the uncompressed size its central-directory record declares, and its
+// CRC-32 is verified. License: Apache-2.0.
 #ifndef QVF_UNZIP_HPP
 #define QVF_UNZIP_HPP
-
-#include <cstdint>
-#include <cstring>
-#include <map>
-#include <stdexcept>
-#include <string>
-#include <vector>
 
 
 namespace qvf {
 namespace detail {
 
-class ZipReader {
-public:
-    explicit ZipReader(std::vector<uint8_t> bytes) : buf_(std::move(bytes)) {
-        parse_central_directory();
-    }
-
-    bool has(const std::string& name) const {
-        return entries_.find(name) != entries_.end();
-    }
-
-    std::vector<std::string> names() const {
-        std::vector<std::string> out;
-        out.reserve(entries_.size());
-        for (const auto& kv : entries_) out.push_back(kv.first);
-        return out;
-    }
-
-    // Return the uncompressed bytes of a member.
-    std::vector<uint8_t> read(const std::string& name) const {
-        auto it = entries_.find(name);
-        if (it == entries_.end())
-            throw std::runtime_error("zip: member not found: " + name);
-        const Entry& e = it->second;
-        // Local header: sig(4) ver(2) flags(2) method(2) time(2) date(2)
-        // crc(4) csize(4) usize(4) namelen(2) extralen(2) -> 30 bytes fixed.
-        if (e.local_offset + 30 > buf_.size())
-            throw std::runtime_error("zip: truncated local header");
-        if (rd32(e.local_offset) != 0x04034b50u)
-            throw std::runtime_error("zip: bad local header signature");
-        uint16_t namelen = rd16(e.local_offset + 26);
-        uint16_t extralen = rd16(e.local_offset + 28);
-        size_t data_off = e.local_offset + 30 + namelen + extralen;
-        if (data_off + e.csize > buf_.size())
-            throw std::runtime_error("zip: truncated member data");
-        const uint8_t* data = buf_.data() + data_off;
-        if (e.method == 0) {
-            return std::vector<uint8_t>(data, data + e.csize);
-        }
-        if (e.method == 8) {
-            return inflate(data, e.csize, e.usize);
-        }
-        throw std::runtime_error("zip: unsupported compression method");
-    }
-
-private:
-    struct Entry {
-        uint16_t method = 0;
-        uint32_t csize = 0;
-        uint32_t usize = 0;
-        uint32_t local_offset = 0;
-    };
-
-    uint16_t rd16(size_t o) const {
-        return static_cast<uint16_t>(buf_[o] | (buf_[o + 1] << 8));
-    }
-    uint32_t rd32(size_t o) const {
-        return static_cast<uint32_t>(buf_[o]) |
-               (static_cast<uint32_t>(buf_[o + 1]) << 8) |
-               (static_cast<uint32_t>(buf_[o + 2]) << 16) |
-               (static_cast<uint32_t>(buf_[o + 3]) << 24);
-    }
-
-    void parse_central_directory() {
-        if (buf_.size() < 22) throw std::runtime_error("zip: too small");
-        // Find the End Of Central Directory record by scanning backwards.
-        size_t eocd = 0;
-        bool found = false;
-        size_t max_back = buf_.size() < 65557 ? buf_.size() : 65557;
-        for (size_t i = 0; i <= max_back - 22; ++i) {
-            size_t p = buf_.size() - 22 - i;
-            if (rd32(p) == 0x06054b50u) { eocd = p; found = true; break; }
-        }
-        if (!found) throw std::runtime_error("zip: no end-of-central-directory");
-        uint16_t total = rd16(eocd + 10);
-        uint32_t cd_size = rd32(eocd + 12);
-        uint32_t cd_off = rd32(eocd + 16);
-        if (static_cast<size_t>(cd_off) + cd_size > buf_.size())
-            throw std::runtime_error("zip: central directory out of range");
-
-        size_t p = cd_off;
-        for (uint16_t i = 0; i < total; ++i) {
-            if (p + 46 > buf_.size() || rd32(p) != 0x02014b50u)
-                throw std::runtime_error("zip: bad central directory entry");
-            Entry e;
-            e.method = rd16(p + 10);
-            e.csize = rd32(p + 20);
-            e.usize = rd32(p + 24);
-            uint16_t namelen = rd16(p + 28);
-            uint16_t extralen = rd16(p + 30);
-            uint16_t commentlen = rd16(p + 32);
-            e.local_offset = rd32(p + 42);
-            std::string name(reinterpret_cast<const char*>(buf_.data() + p + 46),
-                             namelen);
-            entries_[name] = e;
-            p += 46u + namelen + extralen + commentlen;
-        }
-    }
-
-    std::vector<uint8_t> buf_;
-    std::map<std::string, Entry> entries_;
-};
+using ZipReader = container::ZipReader;
 
 }  // namespace detail
 }  // namespace qvf
 
 #endif  // QVF_UNZIP_HPP
 
+// ===== src/qvf_schema_table.hpp =====
+
+// qvf_schema_table.hpp -- GENERATED by scripts/gen_kinds.py from spec/qvf_manifest.schema.json; do not edit.
+// Regenerate with `python3 scripts/gen_kinds.py` (`--check` fails on drift).
+//
+// The compiled JSON Schema: an instruction table interpreted by
+// qvf_schema_check.hpp, so the C++ validator checks manifest.json and every
+// JSON member payload against the schema without a JSON Schema engine. The
+// table format (opcodes and operands) is documented in scripts/gen_kinds.py.
+// Internal header; not installed. License: Apache-2.0.
+#ifndef QVF_SCHEMA_TABLE_HPP
+#define QVF_SCHEMA_TABLE_HPP
+
+#include <cstdint>
+
+namespace qvf {
+namespace detail {
+namespace schema_table {
+
+// Opcodes; operands a, b, c per opcode:
+//   False: the false schema: always fails
+//   Type: a = mask of the allowed types (TYPE_BITS)
+//   Const: a = value
+//   Enum: a = list start, b = count (values)
+//   Ref: a = node of the referenced $defs entry
+//   AllOf: a = list start, b = count (nodes)
+//   AnyOf: a = list start, b = count (nodes)
+//   OneOf: a = list start, b = count (nodes)
+//   Not: a = node
+//   If: a = if node, b = then node or -1, c = else node or -1
+//   Properties: a = pair start, b = count ((name string, node) pairs)
+//   PatternProperties: a = pair start, b = count ((regex, node) pairs)
+//   AdditionalProperties: a = node, or -1 for false; the node's own Properties / PatternProperties ops name the non-additional keys
+//   Required: a = list start, b = count (strings)
+//   DependentRequired: a = triple start, b = count ((name string, list start, count) triples)
+//   DependentSchemas: a = pair start, b = count ((name string, node) pairs)
+//   PropertyNames: a = node
+//   MinProperties: a = count
+//   MaxProperties: a = count
+//   PrefixItems: a = list start, b = count (nodes)
+//   Items: a = node, or -1 for false; b = number of prefixItems
+//   Contains: a = node, b = minContains, c = maxContains or -1
+//   MinItems: a = count
+//   MaxItems: a = count
+//   UniqueItems: (true only)
+//   Minimum: a = number
+//   Maximum: a = number
+//   ExclusiveMinimum: a = number
+//   ExclusiveMaximum: a = number
+//   MultipleOf: a = number
+//   MinLength: a = count (code points)
+//   MaxLength: a = count (code points)
+//   Pattern: a = regex
+enum Opcode : std::uint8_t {
+    kFalse = 0,
+    kType = 1,
+    kConst = 2,
+    kEnum = 3,
+    kRef = 4,
+    kAllOf = 5,
+    kAnyOf = 6,
+    kOneOf = 7,
+    kNot = 8,
+    kIf = 9,
+    kProperties = 10,
+    kPatternProperties = 11,
+    kAdditionalProperties = 12,
+    kRequired = 13,
+    kDependentRequired = 14,
+    kDependentSchemas = 15,
+    kPropertyNames = 16,
+    kMinProperties = 17,
+    kMaxProperties = 18,
+    kPrefixItems = 19,
+    kItems = 20,
+    kContains = 21,
+    kMinItems = 22,
+    kMaxItems = 23,
+    kUniqueItems = 24,
+    kMinimum = 25,
+    kMaximum = 26,
+    kExclusiveMinimum = 27,
+    kExclusiveMaximum = 28,
+    kMultipleOf = 29,
+    kMinLength = 30,
+    kMaxLength = 31,
+    kPattern = 32,
+};
+
+// Type mask bits of a Type op.
+inline constexpr std::int32_t kTypeNull = 1;
+inline constexpr std::int32_t kTypeBoolean = 2;
+inline constexpr std::int32_t kTypeObject = 4;
+inline constexpr std::int32_t kTypeArray = 8;
+inline constexpr std::int32_t kTypeNumber = 16;
+inline constexpr std::int32_t kTypeString = 32;
+inline constexpr std::int32_t kTypeInteger = 64;
+
+// Pike-VM opcodes of the compiled patterns. Class / NotClass: x = first
+// range, y = number of (lo, hi) code point ranges in kRxRanges; Split: x, y
+// = targets; Jump: x = target (targets are relative to the program).
+enum RxOpcode : std::uint8_t {
+    kRxClass = 0,
+    kRxNotClass = 1,
+    kRxSplit = 2,
+    kRxJump = 3,
+    kRxLineStart = 4,
+    kRxLineEnd = 5,
+    kRxMatch = 6,
+};
+
+struct Op { std::uint8_t code; std::int32_t a, b, c; };
+struct Node { std::int32_t first, count; };
+struct Def { const char* name; std::int32_t node; };
+struct RxProgram { const char* source; std::int32_t first, count; };
+struct RxOp { std::uint8_t code; std::int32_t x, y; };
+
+inline constexpr const char* kSchemaId = "https://vibe-qc.org/spec/qvf/1/manifest.schema.json";
+inline constexpr std::int32_t kRoot = 0;
+
+inline constexpr const char* kStrings[493] = {
+    "qvf_version", "source", "sections", "schema_uri", "byte_order", "program", "version",
+    "calculation", "provenance", "method", "functional", "basis", "charge", "multiplicity",
+    "n_electrons", "scf_converged", "n_scf_iterations", "scf_energy", "fermi_energy",
+    "wall_seconds", "hostname", "dimensionality", "run_status", "software", "git_commit",
+    "n_threads", "n_mpi_ranks", "n_gpus", "started_utc", "finished_utc", "metadata",
+    "viewer_defaults", "auto_open", "bookmarks", "camera", "crossfade", "thermochemistry",
+    "dipole_moment", "constraints", "energies", "extensions", "value", "units", "isovalue",
+    "colormap", "opacity", "replication", "position", "focal_point", "view_up", "view_angle",
+    "parallel_scale", "name", "description", "path", "format", "dtype", "shape", "sha256",
+    "size", "media_type", "id", "kind", "members", "label", "component", "critical",
+    "structure_ref", "run_ref", "group", "symbol", "atomic_number", "b_factor", "atoms", "pbc",
+    "lattice_vectors", "seq", "chain", "atom_indices", "type", "start_seq", "end_seq",
+    "structure", "bonds", "chains", "residues", "secondary_structure", "b_factors", "smiles",
+    "inchi", "inchikey", "grid", "data", "origin", "voxel_vectors", "periodic",
+    "includes_endpoint", "operand_a", "operand_b", "axis", "values", "labels",
+    "trajectory_ref", "meta", "mulliken_charge", "loewdin_charge", "hirshfeld_charge",
+    "iao_charge", "spin_population", "cm5_charge", "chelpg_charge", "resp_charge",
+    "esp_charge", "nbo_charge", "mbis_charge", "bader_charge", "ddec_charge", "valence",
+    "bonded_valence", "fukui_plus", "fukui_minus", "fukui_zero", "dual_descriptor",
+    "atomic_energy_eh", "atomic_volume_bohr3", "nmr_shielding_iso_ppm", "magnetic_moment",
+    "force_eh_bohr", "coords", "lattice", "velocities", "gradient", "times", "cell_volumes",
+    "temperatures", "symbols", "atomic_numbers", "n_frames", "ensemble", "timestep_fs",
+    "precision", "frame_volumes", "volume_grid", "frame_index", "energy_eh", "waypoints",
+    "reaction_coordinate", "reaction_coordinate_label", "reaction_coordinate_unit", "dim",
+    "dim_per_frame", "volume_frame_index", "volume_label", "volume_isovalue", "axis_a",
+    "axis_b", "geometries", "unit", "axis_a_label", "axis_b_label", "coordinate_a_label",
+    "coordinate_a_unit", "coordinate_b_label", "coordinate_b_unit", "energy_unit", "scheme",
+    "steps", "reactants", "products", "reagents", "arrow", "conditions", "yield_percent",
+    "yield_text", "coefficient", "hessian_ref", "displacements", "frequencies",
+    "ir_intensities", "raman_activities", "reduced_masses", "force_constants",
+    "symmetry_labels", "imaginary", "n_modes", "spectrum", "intensities", "x", "x_units",
+    "y_units", "peaks", "broadening", "fwhm", "temperature_k", "raman", "laser_nm",
+    "depolarization_ratios", "uvvis", "x_axis", "states_ref", "y", "width", "assignment",
+    "mode_index", "state_index", "isotope", "reference", "solvent", "chemical_shifts",
+    "atom_index", "isotropic_shift_ppm", "anisotropy_ppm", "asymmetry", "shielding_tensors",
+    "tensor", "isotropic_ppm", "j_couplings", "i", "j", "value_hz", "isotope_i", "isotope_j",
+    "g_tensor", "matrix", "isotropic", "principal", "hyperfine", "a_iso_mhz", "a_tensor_mhz",
+    "a_principal_mhz", "zero_field_splitting", "d_mhz", "e_mhz", "tensor_mhz", "mo_metadata",
+    "mo_coefficients", "mo_coefficients_alpha", "mo_coefficients_beta", "overlap",
+    "density_matrix", "density_matrix_alpha", "density_matrix_beta", "center", "l",
+    "exponents", "coefficients", "pure", "powers", "local", "n_core_electrons", "projectors",
+    "shells", "n_ao", "ecp", "occupations", "n_mo", "spin", "orbital_kind", "alpha", "beta",
+    "occupation_semantics", "k_point", "complex", "coefficient_encoding",
+    "coefficient_components", "state_ref", "nto_role", "localization_method",
+    "localization_reference_basis", "atom_populations", "centroids_bohr", "n_centres",
+    "iao_charges", "excitation_index", "excitation_energy_ev", "kpoints", "weights", "mesh",
+    "shift", "time_reversal", "n_spin", "k_point_convention", "n_mo_per_k", "kpath",
+    "eigenvalues", "projections", "start", "end", "n_points", "label_start", "label_end",
+    "k_start", "k_end", "segments", "fermi", "fermi_energy_ev", "spinor", "n_kpoints",
+    "n_bands", "channels", "title", "reciprocal_space", "dos", "smearing", "smearing_type",
+    "atom", "m", "integrated", "pairs", "symbol_i", "symbol_j", "distance_ang", "pair_labels",
+    "spacegroup_number", "international", "hall", "point_group", "hermann_mauguin",
+    "space_group_number", "space_group_symbol", "operations", "rotation", "translation",
+    "wyckoffs", "equivalent_atoms", "symprec", "order", "bond_orders", "iterations", "iter",
+    "delta_e", "diis_error", "rms_density_change", "converged", "references",
+    "program_version", "command", "exit_status", "sequence", "job_ref", "input", "log",
+    "files", "filename", "truncated", "spec", "job_type", "tasks", "solvation", "dispersion",
+    "relativistic", "scf", "geometry", "resources", "options", "model", "epsilon",
+    "convergence", "max_iterations", "guess", "damping", "max_steps", "coordinates", "n_cores",
+    "memory_mb", "walltime_s", "ao_metadata", "atom_symbol", "shell_index", "primitive_index",
+    "angular_momentum", "shell_type", "exponent", "is_primitive", "is_contracted", "ao_index",
+    "cartesian_powers", "basis_label", "volumes", "fit", "V0", "E0", "B0", "B0_prime",
+    "residual_rms", "pressures_gpa", "volume_unit", "pressure_unit", "nk1", "nk2", "nk3",
+    "symmetry_expanded", "band_indices", "reciprocal_lattice", "qpath", "eigenvectors",
+    "n_atoms", "has_eigenvectors", "projected", "critical_points", "points", "rho",
+    "laplacian", "ellipticity", "atom_pair", "bond_paths", "stress", "convention", "energy",
+    "length", "mass_weighted", "atom_masses_amu", "wavefunction_ref", "states", "properties",
+    "index", "excitation_energy", "total_energy", "symmetry", "oscillator_strength",
+    "rotatory_strength_cgs", "transition_dipole", "transition_magnetic_dipole",
+    "contributions", "nto_ref", "density_ref", "from_mo", "to_mo", "weight", "reference_state",
+    "n_states", "tda", "spin_flip", "dipole", "quadrupole", "octupole", "polarizability",
+    "hyperpolarizability", "vector", "total", "traceless", "frequency_ev", "frequencies_ev",
+    "stiffness", "compliance", "bulk_modulus_gpa", "shear_modulus_gpa", "youngs_modulus_gpa",
+    "poisson_ratio", "average", "electronic", "ionic", "static", "born_charges",
+    "piezoelectric", "excited_states_ref", "thumbnail", "image", "created_utc", "modified_utc",
+    "uuid", "authors", "license", "doi", "keywords", "derived_from", "tags", "orcid",
+    "affiliation", "email", "url", "zpve_eh", "enthalpy_eh", "entropy_cal_mol_k",
+    "gibbs_free_energy_eh", "pressure_atm", "total_debye", "vector_debye", "frozen_atoms",
+    "distance_constraints", "target_angstrom", "components", "by_method", "units_note",
+    "nuclear_repulsion", "one_electron", "two_electron", "exchange_correlation", "exchange",
+    "correlation", "zpve", "thermal", "embedding",
+};
+inline constexpr double kNumbers[8] = {
+    0.0, 3.0, 1.0, 180.0, 100.0, 7.0, 2.0, 230.0,
+};
+// JSON literals of const / enum, as JSON text.
+inline constexpr const char* kValues[191] = {
+    "1", "\"little\"", "\"pending\"", "\"running\"", "\"converged\"", "\"failed\"",
+    "\"angstrom\"", "\"bohr\"", "\"hartree\"", "\"ev\"", "\"kcal_per_mol\"", "\"kj_per_mol\"",
+    "\"cm-1\"", "\"nm\"", "\"debye\"", "\"mhz\"", "\"hz\"", "\"ppm\"", "\"km_per_mol\"",
+    "\"a3\"", "\"bohr3\"", "\"gpa\"", "\"fs\"", "\"ps\"", "\"kelvin\"", "\"atm\"", "\"e\"",
+    "\"amu\"", "\"radian\"", "\"degree\"", "\"dimensionless\"", "\"Eh\"", "\"eV\"",
+    "\"Hartree\"", "\"int8\"", "\"int16\"", "\"int32\"", "\"int64\"", "\"uint8\"",
+    "\"uint16\"", "\"uint32\"", "\"uint64\"", "\"float32\"", "\"float64\"", "\"binary\"",
+    "\"json\"", "3", "2", "true", "0", "\"helix\"", "\"sheet\"", "\"coil\"", "\"structure\"",
+    "\"volume.density\"", "\"volume.orbital\"", "\"volume.spin\"", "\"volume.elf\"",
+    "\"volume.generic\"", "\"volume.difference\"", "\"volume.potential\"", "\"volume.rdg\"",
+    "\"volume.laplacian\"", "\"volume.vector\"", "\"volume.complex\"", "\"volume.series\"",
+    "\"time\"", "\"frame\"", "\"state\"", "\"custom\"", "\"scalar\"", "\"vector\"",
+    "\"atom_properties\"", "\"trajectory\"", "\"optimization\"", "\"irc\"", "\"md\"",
+    "\"neb\"", "\"scan\"", "\"nve\"", "\"nvt\"", "\"npt\"", "\"nph\"", "\"reaction.path\"",
+    "\"reactant\"", "\"transition_state\"", "\"intermediate\"", "\"product\"", "\"point\"",
+    "\"scan.surface\"", "\"reaction.waypoints\"", "\"reaction.scheme\"", "\"forward\"",
+    "\"equilibrium\"", "\"retrosynthetic\"", "\"resonance\"", "\"vibrations\"",
+    "\"spectra.ir\"", "\"none\"", "\"gaussian\"", "\"lorentzian\"", "\"energy_ev\"",
+    "\"wavelength_nm\"", "\"spectra.raman\"", "\"spectra.uvvis\"", "\"spectra.ecd\"",
+    "\"spectra.vcd\"", "\"spectra.nmr\"", "\"spectra.epr\"", "\"spectra.generic\"",
+    "\"wavefunction.gto\"", "\"restricted\"", "\"unrestricted\"", "\"restricted_open\"",
+    "\"generalized\"", "\"canonical\"", "\"natural\"", "\"localized\"", "\"nto\"", "\"nbo\"",
+    "\"iao\"", "\"ibo\"", "\"boys\"", "\"pipek_mezey\"", "\"electron_occupation\"",
+    "\"transition_weight\"", "\"real\"", "\"complex_split_last_axis\"", "\"imag\"", "\"hole\"",
+    "\"particle\"", "\"wavefunction.bloch\"", "\"fractional\"", "\"bands\"", "\"dos.total\"",
+    "\"dos.projected\"", "\"dos.coop\"", "\"dos.cohp\"", "\"structure.symmetry\"", "\"bonds\"",
+    "\"bond_orders\"", "\"scf_history\"", "\"citations\"", "\"run.record\"", "\"job.spec\"",
+    "\"molecular\"", "\"periodic\"", "\"\"", "\"cartesian\"", "\"internal\"", "\"redundant\"",
+    "\"basis.ao\"", "\"s\"", "\"p\"", "\"sp\"", "\"d\"", "\"f\"", "\"g\"", "\"h\"",
+    "\"equation_of_state\"", "\"birch_murnaghan\"", "\"murnaghan\"", "\"vinet\"",
+    "\"poirier_tarantola\"", "\"polynomial\"", "\"fermi_surface\"", "\"phonon_bands\"",
+    "\"phonon_dos\"", "\"topology.qtaim\"", "\"bcp\"", "\"rcp\"", "\"ccp\"", "\"ncp\"",
+    "\"forces\"", "\"gradient\"", "\"hessian\"", "\"excited_states\"",
+    "\"properties.electric\"", "\"alpha\"", "\"beta\"", "\"properties.elastic\"",
+    "\"properties.dielectric\"", "\"buckingham\"", "\"voigt\"", "\"reuss\"", "\"hill\"",
+    "\"volume.transition_density\"", "\"preview\"", "\"image/png\"", "\"image/jpeg\"",
+    "\"image/svg+xml\"",
+};
+// Node lists, string lists and value lists (see the opcodes).
+inline constexpr std::int32_t kLists[739] = {
+    0, 1, 2, 5, 6, 7, 2, 3, 4, 5, 41, 42, 225, 226, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 47, 48, 49, 50, 51, 51, 50,
+    238, 240, 52, 34, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 54, 55, 56, 57, 58, 54, 55, 58,
+    61, 62, 63, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283,
+    284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+    302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319,
+    320, 321, 322, 323, 324, 42, 43, 325, 326, 42, 43, 329, 330, 42, 43, 337, 338, 339, 340,
+    333, 334, 42, 43, 345, 346, 347, 348, 341, 342, 70, 47, 71, 73, 359, 360, 75, 74, 74, 75,
+    21, 21, 74, 21, 74, 21, 74, 362, 366, 372, 379, 385, 391, 52, 76, 77, 78, 79, 77, 80, 81,
+    50, 51, 52, 82, 91, 92, 93, 94, 57, 91, 92, 91, 92, 91, 92, 91, 92, 91, 92, 98, 97, 91, 92,
+    91, 92, 91, 92, 91, 92, 91, 92, 91, 92, 99, 62, 100, 66, 67, 68, 69, 62, 498, 504, 505,
+    512, 513, 508, 509, 42, 53, 62, 70, 71, 103, 103, 553, 554, 43, 42, 555, 556, 563, 564,
+    565, 559, 560, 566, 567, 575, 576, 578, 579, 580, 574, 577, 570, 571, 30, 128, 70, 71, 135,
+    136, 73, 594, 595, 596, 74, 75, 76, 77, 78, 69, 79, 80, 81, 82, 69, 43, 42, 618, 30, 128,
+    143, 64, 62, 84, 85, 86, 87, 88, 640, 661, 662, 664, 665, 666, 660, 663, 656, 657, 30, 154,
+    155, 39, 64, 145, 61, 62, 63, 102, 145, 165, 61, 62, 63, 166, 61, 167, 168, 92, 93, 94, 95,
+    67, 723, 724, 30, 176, 177, 185, 177, 186, 79, 98, 99, 100, 101, 102, 187, 185, 786, 787,
+    185, 185, 185, 185, 209, 210, 217, 218, 219, 185, 209, 185, 850, 851, 11, 234, 235, 236,
+    237, 867, 868, 236, 237, 235, 865, 869, 871, 872, 242, 243, 244, 245, 243, 244, 245, 247,
+    242, 249, 67, 251, 39, 254, 256, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+    122, 123, 69, 124, 125, 126, 127, 933, 934, 129, 130, 256, 257, 266, 260, 265, 204, 266,
+    256, 258, 259, 255, 39, 254, 182, 962, 963, 964, 965, 39, 254, 258, 259, 968, 969, 256,
+    262, 951, 957, 970, 11, 275, 234, 235, 39, 254, 61, 62, 63, 987, 988, 989, 990, 991, 983,
+    984, 992, 993, 996, 997, 275, 256, 280, 255, 252, 262, 281, 111, 112, 115, 116, 117, 118,
+    119, 120, 121, 122, 123, 69, 132, 256, 256, 1030, 1035, 283, 284, 1046, 1047, 1050, 1051,
+    1077, 1078, 39, 302, 0, 47, 39, 285, 0, 47, 49, 0, 1113, 1114, 39, 285, 307, 103, 39, 285,
+    307, 103, 64, 217, 218, 1140, 1142, 1153, 1154, 92, 321, 83, 308, 217, 218, 327, 9, 308,
+    217, 218, 326, 328, 328, 329, 144, 54, 55, 58, 334, 54, 55, 58, 3, 4, 5, 340, 341, 1246,
+    1247, 61, 62, 63, 5, 345, 61, 62, 63, 346, 145, 146, 1260, 1261, 1262, 1264, 1265, 1266,
+    355, 148, 149, 150, 209, 367, 368, 369, 370, 371, 372, 174, 373, 374, 375, 152, 153, 154,
+    155, 156, 157, 158, 91, 92, 378, 39, 379, 355, 160, 161, 162, 163, 164, 277, 39, 394, 177,
+    1372, 1373, 1374, 1375, 1377, 1378, 1379, 1380, 1381, 1371, 1376, 1367, 1368, 103, 177,
+    302, 1405, 1406, 399, 400, 79, 47, 169, 170, 171, 172, 131, 61, 62, 63, 1450, 1451, 1446,
+    1447, 1456, 1457, 1452, 1453, 174, 223, 61, 62, 63, 1470, 1471, 410, 411, 413, 61, 62, 63,
+    414, 61, 62, 63, 413, 415, 416, 426, 427, 428, 178, 179, 414, 61, 62, 63, 414, 61, 62, 63,
+    433, 434, 435, 436, 437, 1538, 1539, 1540, 1541, 1542, 1544, 1545, 438, 223, 440, 407, 182,
+    148, 407, 214, 182, 148, 223, 214, 443, 183, 184, 185, 450, 91, 92, 455, 456, 61, 62, 63,
+    54, 55, 58, 60, 188, 189, 54, 55, 58, 60, 190, 188, 189, 1629, 1630, 1631, 52, 52, 1666,
+    1667, 73, 480, 439, 9, 439, 6,
+};
+// (key, node) pairs: Properties, PatternProperties, DependentSchemas.
+inline constexpr std::int32_t kPairs[2212] = {
+    5, 181, 6, 182, 7, 183, 9, 185, 10, 186, 11, 187, 12, 188, 13, 189, 14, 190, 15, 191, 16,
+    192, 17, 193, 18, 194, 19, 195, 20, 196, 21, 197, 22, 198, 23, 199, 24, 201, 25, 202, 26,
+    203, 27, 204, 28, 205, 29, 206, 32, 210, 33, 212, 34, 214, 35, 215, 0, 177, 3, 178, 4, 179,
+    1, 180, 8, 184, 30, 207, 31, 208, 36, 216, 37, 217, 38, 218, 39, 219, 40, 220, 2, 221, 41,
+    223, 42, 224, 43, 227, 44, 228, 45, 229, 46, 230, 47, 233, 48, 234, 49, 235, 50, 236, 51,
+    237, 52, 242, 53, 243, 34, 244, 54, 246, 55, 247, 56, 248, 57, 249, 58, 251, 59, 252, 60,
+    253, 54, 254, 55, 255, 58, 256, 59, 257, 60, 258, 61, 259, 62, 260, 64, 261, 65, 262, 66,
+    263, 67, 264, 68, 265, 69, 266, 63, 267, 56, 327, 57, 328, 56, 331, 57, 332, 56, 335, 57,
+    336, 56, 343, 57, 344, 70, 349, 47, 350, 71, 351, 72, 352, 73, 354, 74, 356, 75, 358, 21,
+    361, 75, 364, 74, 368, 75, 371, 21, 374, 74, 376, 21, 381, 74, 383, 21, 387, 74, 389, 21,
+    393, 74, 395, 52, 397, 76, 398, 77, 399, 78, 400, 79, 402, 77, 403, 80, 404, 81, 405, 82,
+    408, 83, 409, 62, 406, 63, 407, 84, 410, 85, 412, 86, 414, 87, 416, 12, 418, 13, 419, 52,
+    420, 88, 421, 89, 422, 90, 423, 91, 426, 92, 427, 62, 424, 63, 425, 10, 428, 93, 440, 94,
+    441, 93, 429, 94, 430, 57, 432, 95, 434, 96, 436, 67, 437, 42, 438, 91, 444, 92, 445, 62,
+    442, 63, 443, 91, 448, 92, 449, 62, 446, 63, 447, 91, 452, 92, 453, 62, 450, 63, 451, 91,
+    456, 92, 457, 62, 454, 63, 455, 91, 463, 92, 464, 62, 458, 97, 459, 98, 460, 53, 461, 63,
+    462, 91, 467, 92, 468, 62, 465, 63, 466, 91, 471, 92, 472, 62, 469, 63, 470, 91, 475, 92,
+    476, 62, 473, 63, 474, 91, 479, 92, 480, 62, 477, 63, 478, 91, 483, 92, 484, 62, 481, 63,
+    482, 91, 487, 92, 488, 99, 489, 62, 485, 63, 486, 10, 490, 62, 491, 100, 492, 42, 494, 101,
+    495, 102, 497, 62, 500, 100, 502, 56, 506, 57, 507, 56, 510, 57, 511, 10, 514, 42, 515, 53,
+    516, 62, 517, 11, 518, 10, 519, 12, 525, 104, 527, 105, 528, 106, 529, 107, 530, 108, 531,
+    109, 532, 110, 533, 111, 534, 112, 535, 113, 536, 114, 537, 115, 538, 116, 539, 117, 540,
+    118, 541, 119, 542, 120, 543, 121, 544, 122, 545, 123, 546, 124, 547, 125, 548, 126, 549,
+    127, 550, 103, 551, 11, 552, 62, 520, 63, 521, 56, 557, 57, 558, 56, 561, 57, 562, 56, 568,
+    57, 569, 56, 572, 57, 573, 30, 583, 128, 584, 129, 585, 130, 586, 131, 587, 132, 588, 39,
+    589, 133, 590, 134, 591, 62, 581, 63, 582, 70, 592, 71, 593, 39, 614, 128, 615, 132, 616,
+    139, 617, 135, 597, 136, 599, 73, 601, 137, 603, 39, 604, 62, 606, 74, 607, 138, 609, 139,
+    610, 140, 611, 42, 612, 129, 621, 133, 622, 134, 623, 42, 619, 30, 626, 128, 627, 141, 628,
+    142, 629, 129, 630, 130, 631, 131, 632, 132, 633, 39, 634, 62, 624, 63, 625, 10, 635, 143,
+    636, 64, 637, 62, 638, 144, 639, 129, 655, 145, 641, 146, 643, 147, 645, 148, 646, 149,
+    647, 150, 648, 151, 650, 152, 652, 153, 653, 42, 654, 56, 658, 57, 659, 30, 669, 154, 670,
+    155, 671, 39, 672, 156, 673, 62, 667, 63, 668, 64, 674, 157, 675, 73, 676, 154, 678, 155,
+    679, 158, 680, 159, 681, 160, 682, 161, 683, 162, 684, 163, 685, 73, 686, 164, 688, 42,
+    689, 145, 694, 62, 691, 102, 692, 63, 693, 10, 695, 145, 696, 146, 698, 165, 702, 62, 700,
+    63, 701, 10, 703, 166, 704, 10, 706, 61, 707, 64, 708, 167, 709, 168, 711, 169, 713, 170,
+    715, 171, 716, 172, 718, 173, 719, 10, 720, 67, 721, 174, 722, 56, 725, 57, 726, 30, 730,
+    176, 731, 62, 727, 175, 728, 63, 729, 177, 732, 178, 734, 179, 736, 180, 738, 181, 740,
+    182, 742, 183, 744, 184, 746, 135, 747, 73, 749, 185, 753, 62, 751, 63, 752, 79, 765, 192,
+    766, 42, 767, 195, 770, 196, 771, 198, 774, 177, 754, 186, 756, 187, 758, 188, 760, 189,
+    761, 190, 762, 191, 764, 193, 768, 194, 769, 197, 773, 199, 775, 203, 781, 204, 782, 187,
+    776, 200, 777, 201, 778, 64, 779, 202, 780, 185, 785, 62, 783, 63, 784, 56, 788, 57, 789,
+    185, 792, 62, 790, 63, 791, 185, 795, 62, 793, 63, 794, 185, 798, 62, 796, 63, 797, 185,
+    801, 62, 799, 63, 800, 209, 807, 70, 808, 210, 809, 211, 810, 212, 811, 209, 814, 214, 815,
+    215, 817, 217, 820, 218, 821, 219, 822, 220, 823, 221, 824, 205, 802, 206, 803, 207, 804,
+    208, 805, 213, 812, 216, 818, 185, 827, 62, 825, 63, 826, 223, 829, 224, 831, 225, 832,
+    209, 835, 70, 836, 205, 837, 227, 838, 228, 839, 229, 841, 231, 843, 232, 844, 233, 845,
+    222, 828, 226, 833, 230, 842, 185, 849, 62, 847, 63, 848, 56, 852, 57, 853, 11, 856, 234,
+    857, 235, 858, 236, 859, 237, 860, 238, 861, 239, 862, 240, 863, 241, 864, 62, 854, 63,
+    855, 56, 873, 57, 874, 10, 875, 242, 876, 243, 877, 244, 878, 245, 880, 246, 882, 10, 883,
+    243, 884, 244, 885, 245, 887, 247, 889, 248, 891, 10, 892, 242, 893, 249, 894, 64, 895,
+    250, 896, 10, 898, 67, 899, 246, 900, 252, 901, 251, 902, 253, 904, 14, 906, 10, 907, 255,
+    908, 39, 909, 254, 911, 182, 913, 10, 915, 256, 916, 257, 917, 252, 918, 255, 919, 39, 920,
+    254, 922, 182, 924, 258, 926, 259, 927, 260, 928, 261, 929, 262, 930, 263, 931, 264, 932,
+    265, 935, 204, 936, 266, 937, 267, 938, 268, 939, 269, 940, 270, 943, 271, 945, 272, 947,
+    273, 949, 274, 950, 256, 953, 257, 954, 260, 956, 256, 959, 256, 972, 262, 974, 11, 977,
+    275, 978, 234, 979, 235, 980, 39, 981, 254, 982, 62, 975, 63, 976, 56, 985, 57, 986, 56,
+    994, 57, 995, 56, 998, 57, 999, 10, 1000, 275, 1013, 276, 1014, 278, 1015, 275, 1001, 276,
+    1003, 101, 1005, 277, 1007, 278, 1009, 279, 1010, 42, 1011, 10, 1016, 39, 1029, 256, 1017,
+    280, 1018, 255, 1019, 252, 1020, 257, 1021, 262, 1022, 281, 1023, 282, 1024, 18, 1026, 42,
+    1027, 256, 1032, 280, 1034, 256, 1037, 280, 1039, 283, 1042, 284, 1043, 285, 1044, 254,
+    1045, 62, 1040, 63, 1041, 56, 1048, 57, 1049, 56, 1052, 57, 1053, 10, 1054, 286, 1055, 287,
+    1056, 288, 1057, 289, 1058, 290, 1059, 291, 1060, 292, 1061, 10, 1062, 294, 1082, 295,
+    1083, 284, 1084, 275, 1063, 101, 1065, 293, 1067, 294, 1069, 295, 1070, 296, 1071, 280,
+    1072, 297, 1073, 298, 1074, 299, 1075, 300, 1079, 42, 1080, 62, 1085, 6, 1086, 301, 1087,
+    39, 1090, 302, 1091, 62, 1088, 63, 1089, 280, 1092, 303, 1093, 304, 1094, 295, 1095, 14,
+    1096, 39, 1099, 285, 1100, 305, 1108, 243, 1109, 306, 1110, 256, 1111, 64, 1112, 62, 1097,
+    63, 1098, 280, 1101, 303, 1102, 304, 1103, 295, 1104, 14, 1105, 299, 1106, 57, 1115, 39,
+    1118, 285, 1119, 307, 1120, 103, 1121, 62, 1116, 63, 1117, 39, 1124, 285, 1125, 307, 1126,
+    103, 1127, 62, 1122, 63, 1123, 305, 1128, 243, 1129, 306, 1130, 256, 1131, 64, 1132, 217,
+    1143, 218, 1144, 64, 1145, 309, 1146, 310, 1147, 311, 1148, 217, 1155, 218, 1156, 295,
+    1159, 39, 1160, 9, 1133, 280, 1134, 295, 1135, 303, 1136, 304, 1137, 308, 1138, 312, 1149,
+    299, 1151, 42, 1157, 92, 1163, 62, 1161, 63, 1162, 321, 1173, 322, 1175, 313, 1164, 314,
+    1165, 315, 1166, 316, 1167, 317, 1168, 318, 1169, 319, 1170, 320, 1171, 323, 1176, 324,
+    1178, 325, 1180, 83, 1183, 62, 1181, 63, 1182, 10, 1184, 10, 1187, 217, 1188, 218, 1189,
+    326, 1190, 308, 1185, 327, 1193, 62, 1191, 63, 1192, 10, 1194, 10, 1198, 217, 1199, 218,
+    1200, 326, 1201, 311, 1202, 309, 1203, 310, 1204, 9, 1195, 308, 1196, 328, 1207, 62, 1205,
+    63, 1206, 10, 1208, 10, 1211, 329, 1212, 144, 1213, 330, 1214, 331, 1215, 332, 1216, 328,
+    1209, 333, 1217, 54, 1218, 55, 1219, 58, 1220, 59, 1221, 60, 1222, 334, 1225, 62, 1223, 63,
+    1224, 54, 1226, 55, 1227, 58, 1228, 59, 1229, 60, 1230, 340, 1242, 341, 1243, 342, 1244,
+    13, 1245, 62, 1231, 5, 1232, 335, 1233, 336, 1234, 337, 1235, 28, 1236, 29, 1237, 338,
+    1238, 339, 1239, 22, 1240, 63, 1241, 10, 1249, 343, 1250, 53, 1251, 60, 1252, 344, 1253,
+    14, 1248, 345, 1256, 62, 1254, 63, 1255, 346, 1257, 9, 1258, 11, 1259, 10, 1263, 12, 1267,
+    13, 1268, 275, 1269, 347, 1271, 67, 1273, 348, 1274, 349, 1275, 350, 1276, 351, 1277, 352,
+    1278, 353, 1279, 354, 1280, 10, 1281, 355, 1282, 207, 1283, 356, 1284, 10, 1285, 357, 1286,
+    358, 1287, 359, 1288, 360, 1289, 10, 1290, 357, 1291, 361, 1292, 362, 1293, 10, 1294, 363,
+    1295, 364, 1296, 365, 1297, 209, 1300, 367, 1301, 368, 1302, 369, 1303, 370, 1304, 376,
+    1306, 371, 1308, 372, 1309, 174, 1310, 373, 1311, 374, 1312, 375, 1313, 377, 1314, 91,
+    1316, 92, 1317, 62, 1298, 366, 1299, 63, 1315, 378, 1320, 39, 1321, 379, 1322, 62, 1318,
+    63, 1319, 10, 1323, 355, 1324, 380, 1325, 381, 1326, 382, 1327, 383, 1328, 384, 1329, 288,
+    1330, 385, 1331, 164, 1333, 386, 1334, 387, 1335, 277, 1338, 39, 1339, 62, 1336, 63, 1337,
+    10, 1340, 295, 1359, 39, 1360, 75, 1361, 57, 1341, 388, 1343, 389, 1344, 390, 1345, 278,
+    1346, 391, 1347, 275, 1348, 295, 1350, 280, 1351, 392, 1352, 75, 1354, 393, 1355, 42, 1357,
+    56, 1369, 57, 1370, 394, 1364, 177, 1365, 395, 1366, 62, 1362, 63, 1363, 10, 1382, 177,
+    1398, 275, 1383, 101, 1385, 293, 1387, 297, 1389, 396, 1390, 184, 1391, 397, 1392, 299,
+    1393, 300, 1395, 42, 1396, 56, 1407, 57, 1408, 103, 1401, 177, 1402, 302, 1403, 398, 1404,
+    62, 1399, 63, 1400, 177, 1417, 396, 1409, 184, 1410, 303, 1411, 304, 1412, 299, 1413, 42,
+    1415, 399, 1420, 62, 1418, 63, 1419, 79, 1423, 47, 1424, 401, 1425, 402, 1426, 403, 1427,
+    404, 1428, 73, 1430, 73, 1434, 54, 1436, 47, 1440, 400, 1421, 405, 1432, 42, 1438, 131,
+    1443, 406, 1444, 103, 1445, 62, 1441, 63, 1442, 56, 1448, 57, 1449, 56, 1454, 57, 1455, 10,
+    1458, 67, 1459, 9, 1460, 407, 1461, 42, 1462, 10, 1463, 408, 1464, 409, 1465, 223, 1468,
+    103, 1469, 62, 1466, 63, 1467, 56, 1472, 57, 1473, 10, 1474, 67, 1475, 410, 1476, 398,
+    1477, 411, 1478, 42, 1480, 410, 1482, 413, 1487, 62, 1484, 412, 1485, 63, 1486, 414, 1490,
+    62, 1488, 63, 1489, 10, 1491, 413, 1492, 103, 1494, 10, 1495, 415, 1496, 416, 1497, 417,
+    1498, 13, 1499, 418, 1500, 419, 1501, 420, 1502, 421, 1503, 422, 1504, 423, 1505, 424,
+    1507, 425, 1508, 10, 1509, 426, 1510, 427, 1511, 256, 1512, 428, 1513, 10, 1514, 416, 1522,
+    417, 1523, 419, 1524, 9, 1515, 429, 1516, 430, 1517, 431, 1518, 432, 1519, 42, 1520, 414,
+    1527, 62, 1525, 63, 1526, 414, 1530, 62, 1528, 63, 1529, 10, 1537, 10, 1547, 438, 1548,
+    439, 1549, 42, 1550, 10, 1552, 223, 1553, 440, 1554, 407, 1555, 407, 1557, 440, 1559, 10,
+    1561, 214, 1562, 407, 1563, 10, 1565, 223, 1566, 441, 1567, 224, 1568, 10, 1570, 214, 1571,
+    442, 1572, 10, 1575, 433, 1576, 93, 1577, 93, 1543, 433, 1546, 434, 1551, 435, 1560, 436,
+    1564, 437, 1569, 42, 1574, 10, 1578, 10, 1587, 443, 1588, 445, 1589, 446, 1590, 447, 1591,
+    448, 1592, 443, 1579, 444, 1580, 445, 1581, 446, 1582, 447, 1583, 448, 1584, 449, 1585, 42,
+    1586, 10, 1593, 10, 1601, 450, 1602, 451, 1603, 452, 1604, 453, 1605, 450, 1594, 451, 1595,
+    452, 1596, 453, 1597, 454, 1599, 42, 1600, 91, 1610, 92, 1611, 62, 1606, 455, 1607, 204,
+    1608, 63, 1609, 456, 1614, 457, 1615, 62, 1612, 63, 1613, 54, 1616, 55, 1617, 58, 1618, 59,
+    1619, 60, 1620, 54, 1621, 55, 1622, 58, 1623, 59, 1624, 60, 1625, 62, 1626, 63, 1627, 10,
+    1632, 300, 1633, 53, 1634, 458, 1635, 459, 1636, 460, 1637, 461, 1638, 462, 1640, 463,
+    1641, 464, 1642, 465, 1644, 466, 1646, 10, 1648, 52, 1649, 467, 1650, 468, 1651, 469, 1652,
+    10, 1653, 52, 1654, 6, 1655, 470, 1656, 471, 1657, 472, 1658, 473, 1659, 474, 1660, 193,
+    1661, 475, 1662, 476, 1663, 477, 1664, 93, 1665, 73, 1672, 480, 1674, 478, 1668, 479, 1670,
+    10, 1675, 439, 1676, 9, 1677, 481, 1678, 482, 1679, 483, 1681, 10, 1682, 484, 1683, 450,
+    1684, 485, 1685, 486, 1686, 487, 1687, 488, 1688, 489, 1689, 349, 1690, 348, 1691, 490,
+    1692, 491, 1693, 492, 1694, 10, 1695, 9, 1696, 439, 1697, 481, 1698, 6, 1700, 3, 1701, 66,
+    1702, 17, 1699,
+};
+// (name, list start, count) triples: DependentRequired.
+inline constexpr std::int32_t kTriples[9] = {
+    97, 205, 1, 98, 206, 1, 204, 708, 1,
+};
+
+inline constexpr Node kNodes[1703] = {
+    {0, 4}, {4, 4}, {8, 1}, {9, 1}, {10, 2}, {12, 4}, {16, 5}, {21, 4}, {25, 2}, {27, 4},
+    {31, 2}, {33, 2}, {35, 2}, {37, 4}, {41, 4}, {45, 4}, {49, 1}, {50, 1}, {51, 1}, {52, 1},
+    {53, 3}, {56, 4}, {60, 4}, {64, 3}, {67, 3}, {70, 1}, {71, 1}, {72, 5}, {77, 1}, {78, 1},
+    {79, 1}, {80, 1}, {81, 2}, {83, 1}, {84, 1}, {85, 1}, {86, 1}, {87, 1}, {88, 1}, {89, 6},
+    {95, 1}, {96, 1}, {97, 5}, {102, 3}, {105, 1}, {106, 1}, {107, 1}, {108, 1}, {109, 1},
+    {110, 1}, {111, 3}, {114, 3}, {117, 3}, {120, 1}, {121, 5}, {126, 3}, {129, 1}, {130, 1},
+    {131, 3}, {134, 2}, {136, 2}, {138, 5}, {143, 2}, {145, 5}, {150, 5}, {155, 5}, {160, 1},
+    {161, 1}, {162, 3}, {165, 1}, {166, 3}, {169, 3}, {172, 1}, {173, 1}, {174, 1}, {175, 1},
+    {176, 1}, {177, 1}, {178, 2}, {180, 1}, {181, 2}, {183, 1}, {184, 1}, {185, 1}, {186, 1},
+    {187, 5}, {192, 5}, {197, 5}, {202, 5}, {207, 5}, {212, 6}, {218, 2}, {220, 1}, {221, 1},
+    {222, 1}, {223, 5}, {228, 6}, {234, 1}, {235, 1}, {236, 1}, {237, 4}, {241, 4}, {245, 1},
+    {246, 1}, {247, 1}, {248, 1}, {249, 1}, {250, 3}, {253, 2}, {255, 1}, {256, 2}, {258, 1},
+    {259, 5}, {264, 1}, {265, 5}, {270, 1}, {271, 5}, {276, 4}, {280, 1}, {281, 4}, {285, 2},
+    {287, 3}, {290, 2}, {292, 3}, {295, 5}, {300, 4}, {304, 4}, {308, 4}, {312, 1}, {313, 1},
+    {314, 5}, {319, 1}, {320, 4}, {324, 1}, {325, 4}, {329, 1}, {330, 2}, {332, 1}, {333, 3},
+    {336, 2}, {338, 1}, {339, 1}, {340, 4}, {344, 4}, {348, 2}, {350, 1}, {351, 5}, {356, 2},
+    {358, 2}, {360, 5}, {365, 5}, {370, 5}, {375, 4}, {379, 2}, {381, 2}, {383, 4}, {387, 4},
+    {391, 4}, {395, 4}, {399, 5}, {404, 5}, {409, 5}, {414, 2}, {416, 2}, {418, 4}, {422, 4},
+    {426, 1}, {427, 4}, {431, 5}, {436, 5}, {441, 3}, {444, 3}, {447, 3}, {450, 5}, {455, 4},
+    {459, 5}, {464, 3}, {467, 2}, {469, 1}, {470, 1}, {471, 4}, {475, 2}, {477, 2}, {479, 1},
+    {480, 2}, {482, 1}, {483, 1}, {484, 1}, {485, 1}, {486, 1}, {487, 2}, {489, 1}, {490, 2},
+    {492, 1}, {493, 1}, {494, 2}, {496, 1}, {497, 3}, {500, 1}, {501, 2}, {503, 1}, {504, 2},
+    {506, 2}, {508, 2}, {510, 2}, {512, 2}, {514, 2}, {516, 1}, {517, 3}, {520, 1}, {521, 2},
+    {523, 1}, {524, 2}, {526, 1}, {527, 0}, {527, 0}, {527, 1}, {528, 1}, {529, 1}, {530, 1},
+    {531, 1}, {532, 2}, {534, 1}, {535, 1}, {536, 1}, {537, 1}, {538, 1}, {539, 1}, {540, 1},
+    {541, 3}, {544, 4}, {548, 2}, {550, 1}, {551, 1}, {552, 1}, {553, 1}, {554, 3}, {557, 2},
+    {559, 2}, {561, 1}, {562, 2}, {564, 1}, {565, 2}, {567, 1}, {568, 1}, {569, 1}, {570, 1},
+    {571, 1}, {572, 1}, {573, 3}, {576, 2}, {578, 1}, {579, 1}, {580, 1}, {581, 1}, {582, 1},
+    {583, 1}, {584, 1}, {585, 1}, {586, 3}, {589, 1}, {590, 1}, {591, 1}, {592, 1}, {593, 1},
+    {594, 1}, {595, 1}, {596, 1}, {597, 1}, {598, 1}, {599, 1}, {600, 1}, {601, 1}, {602, 1},
+    {603, 1}, {604, 1}, {605, 1}, {606, 1}, {607, 1}, {608, 1}, {609, 1}, {610, 1}, {611, 1},
+    {612, 1}, {613, 1}, {614, 1}, {615, 1}, {616, 1}, {617, 1}, {618, 1}, {619, 1}, {620, 1},
+    {621, 1}, {622, 1}, {623, 1}, {624, 1}, {625, 1}, {626, 1}, {627, 1}, {628, 1}, {629, 1},
+    {630, 1}, {631, 1}, {632, 1}, {633, 1}, {634, 1}, {635, 1}, {636, 1}, {637, 1}, {638, 1},
+    {639, 1}, {640, 1}, {641, 1}, {642, 1}, {643, 1}, {644, 1}, {645, 1}, {646, 1}, {647, 1},
+    {648, 1}, {649, 1}, {650, 1}, {651, 1}, {652, 1}, {653, 1}, {654, 1}, {655, 1}, {656, 1},
+    {657, 2}, {659, 1}, {660, 1}, {661, 1}, {662, 2}, {664, 1}, {665, 1}, {666, 1}, {667, 3},
+    {670, 0}, {670, 0}, {670, 0}, {670, 1}, {671, 1}, {672, 1}, {673, 1}, {674, 3}, {677, 0},
+    {677, 0}, {677, 0}, {677, 1}, {678, 3}, {681, 1}, {682, 2}, {684, 1}, {685, 1}, {686, 2},
+    {688, 1}, {689, 4}, {693, 1}, {694, 1}, {695, 1}, {696, 1}, {697, 3}, {700, 1}, {701, 2},
+    {703, 1}, {704, 1}, {705, 1}, {706, 2}, {708, 1}, {709, 1}, {710, 2}, {712, 1}, {713, 1},
+    {714, 2}, {716, 1}, {717, 1}, {718, 1}, {719, 1}, {720, 1}, {721, 1}, {722, 2}, {724, 1},
+    {725, 2}, {727, 1}, {728, 1}, {729, 1}, {730, 2}, {732, 1}, {733, 2}, {735, 1}, {736, 1},
+    {737, 1}, {738, 2}, {740, 1}, {741, 2}, {743, 1}, {744, 1}, {745, 1}, {746, 1}, {747, 1},
+    {748, 2}, {750, 2}, {752, 1}, {753, 1}, {754, 1}, {755, 1}, {756, 1}, {757, 4}, {761, 1},
+    {762, 1}, {763, 2}, {765, 1}, {766, 2}, {768, 1}, {769, 2}, {771, 1}, {772, 2}, {774, 1},
+    {775, 1}, {776, 2}, {778, 2}, {780, 2}, {782, 2}, {784, 2}, {786, 1}, {787, 4}, {791, 1},
+    {792, 1}, {793, 0}, {793, 1}, {794, 4}, {798, 1}, {799, 4}, {803, 2}, {805, 4}, {809, 1},
+    {810, 1}, {811, 1}, {812, 3}, {815, 1}, {816, 1}, {817, 1}, {818, 1}, {819, 4}, {823, 1},
+    {824, 1}, {825, 1}, {826, 4}, {830, 1}, {831, 1}, {832, 1}, {833, 4}, {837, 1}, {838, 1},
+    {839, 1}, {840, 4}, {844, 1}, {845, 1}, {846, 1}, {847, 1}, {848, 1}, {849, 1}, {850, 4},
+    {854, 1}, {855, 1}, {856, 1}, {857, 4}, {861, 1}, {862, 1}, {863, 1}, {864, 4}, {868, 1},
+    {869, 1}, {870, 1}, {871, 4}, {875, 1}, {876, 1}, {877, 1}, {878, 4}, {882, 1}, {883, 1},
+    {884, 1}, {885, 4}, {889, 1}, {890, 1}, {891, 1}, {892, 4}, {896, 1}, {897, 1}, {898, 1},
+    {899, 0}, {899, 1}, {900, 2}, {902, 1}, {903, 1}, {904, 2}, {906, 1}, {907, 1}, {908, 1},
+    {909, 2}, {911, 1}, {912, 1}, {913, 1}, {914, 2}, {916, 1}, {917, 1}, {918, 1}, {919, 2},
+    {921, 1}, {922, 1}, {923, 1}, {924, 3}, {927, 0}, {927, 1}, {928, 0}, {928, 2}, {930, 2},
+    {932, 1}, {933, 1}, {934, 0}, {934, 1}, {935, 7}, {942, 2}, {944, 1}, {945, 1}, {946, 1},
+    {947, 1}, {948, 1}, {949, 1}, {950, 1}, {951, 1}, {952, 1}, {953, 1}, {954, 1}, {955, 1},
+    {956, 1}, {957, 1}, {958, 1}, {959, 1}, {960, 1}, {961, 1}, {962, 1}, {963, 1}, {964, 1},
+    {965, 1}, {966, 1}, {967, 1}, {968, 1}, {969, 1}, {970, 1}, {971, 1}, {972, 1}, {973, 1},
+    {974, 1}, {975, 1}, {976, 1}, {977, 1}, {978, 1}, {979, 2}, {981, 1}, {982, 1}, {983, 1},
+    {984, 3}, {987, 0}, {987, 0}, {987, 1}, {988, 1}, {989, 1}, {990, 1}, {991, 2}, {993, 1},
+    {994, 1}, {995, 1}, {996, 1}, {997, 4}, {1001, 1}, {1002, 1}, {1003, 4}, {1007, 2},
+    {1009, 1}, {1010, 1}, {1011, 1}, {1012, 4}, {1016, 1}, {1017, 1}, {1018, 1}, {1019, 1},
+    {1020, 1}, {1021, 1}, {1022, 1}, {1023, 1}, {1024, 1}, {1025, 3}, {1028, 2}, {1030, 1},
+    {1031, 1}, {1032, 1}, {1033, 2}, {1035, 3}, {1038, 2}, {1040, 2}, {1042, 2}, {1044, 1},
+    {1045, 2}, {1047, 2}, {1049, 1}, {1050, 1}, {1051, 4}, {1055, 1}, {1056, 1}, {1057, 2},
+    {1059, 1}, {1060, 3}, {1063, 1}, {1064, 1}, {1065, 1}, {1066, 1}, {1067, 1}, {1068, 1},
+    {1069, 3}, {1072, 1}, {1073, 1}, {1074, 1}, {1075, 1}, {1076, 1}, {1077, 4}, {1081, 1},
+    {1082, 1}, {1083, 1}, {1084, 1}, {1085, 1}, {1086, 1}, {1087, 1}, {1088, 1}, {1089, 1},
+    {1090, 0}, {1090, 2}, {1092, 1}, {1093, 1}, {1094, 1}, {1095, 1}, {1096, 2}, {1098, 1},
+    {1099, 2}, {1101, 1}, {1102, 1}, {1103, 1}, {1104, 3}, {1107, 2}, {1109, 3}, {1112, 2},
+    {1114, 2}, {1116, 1}, {1117, 1}, {1118, 2}, {1120, 1}, {1121, 1}, {1122, 1}, {1123, 1},
+    {1124, 1}, {1125, 4}, {1129, 1}, {1130, 1}, {1131, 4}, {1135, 2}, {1137, 1}, {1138, 1},
+    {1139, 1}, {1140, 4}, {1144, 1}, {1145, 1}, {1146, 1}, {1147, 1}, {1148, 1}, {1149, 1},
+    {1150, 1}, {1151, 2}, {1153, 2}, {1155, 1}, {1156, 1}, {1157, 1}, {1158, 1}, {1159, 1},
+    {1160, 1}, {1161, 1}, {1162, 1}, {1163, 2}, {1165, 1}, {1166, 1}, {1167, 2}, {1169, 1},
+    {1170, 1}, {1171, 1}, {1172, 4}, {1176, 1}, {1177, 0}, {1177, 2}, {1179, 1}, {1180, 2},
+    {1182, 1}, {1183, 1}, {1184, 4}, {1188, 1}, {1189, 0}, {1189, 3}, {1192, 1}, {1193, 0},
+    {1193, 2}, {1195, 1}, {1196, 3}, {1199, 1}, {1200, 3}, {1203, 1}, {1204, 2}, {1206, 1},
+    {1207, 1}, {1208, 2}, {1210, 1}, {1211, 3}, {1214, 1}, {1215, 0}, {1215, 2}, {1217, 2},
+    {1219, 1}, {1220, 1}, {1221, 1}, {1222, 2}, {1224, 1}, {1225, 2}, {1227, 4}, {1231, 1},
+    {1232, 1}, {1233, 2}, {1235, 1}, {1236, 2}, {1238, 1}, {1239, 2}, {1241, 1}, {1242, 2},
+    {1244, 1}, {1245, 2}, {1247, 1}, {1248, 2}, {1250, 1}, {1251, 2}, {1253, 1}, {1254, 2},
+    {1256, 2}, {1258, 3}, {1261, 2}, {1263, 1}, {1264, 1}, {1265, 4}, {1269, 1}, {1270, 2},
+    {1272, 1}, {1273, 2}, {1275, 1}, {1276, 2}, {1278, 1}, {1279, 1}, {1280, 1}, {1281, 2},
+    {1283, 1}, {1284, 3}, {1287, 1}, {1288, 2}, {1290, 1}, {1291, 2}, {1293, 2}, {1295, 2},
+    {1297, 2}, {1299, 1}, {1300, 2}, {1302, 1}, {1303, 1}, {1304, 1}, {1305, 1}, {1306, 2},
+    {1308, 1}, {1309, 2}, {1311, 2}, {1313, 2}, {1315, 1}, {1316, 4}, {1320, 1}, {1321, 1},
+    {1322, 1}, {1323, 1}, {1324, 2}, {1326, 1}, {1327, 4}, {1331, 1}, {1332, 1}, {1333, 4},
+    {1337, 1}, {1338, 1}, {1339, 4}, {1343, 1}, {1344, 1}, {1345, 4}, {1349, 1}, {1350, 1},
+    {1351, 1}, {1352, 1}, {1353, 2}, {1355, 3}, {1358, 2}, {1360, 1}, {1361, 1}, {1362, 1},
+    {1363, 1}, {1364, 2}, {1366, 2}, {1368, 2}, {1370, 4}, {1374, 1}, {1375, 1}, {1376, 2},
+    {1378, 3}, {1381, 2}, {1383, 2}, {1385, 1}, {1386, 1}, {1387, 1}, {1388, 1}, {1389, 4},
+    {1393, 1}, {1394, 2}, {1396, 4}, {1400, 1}, {1401, 1}, {1402, 1}, {1403, 2}, {1405, 3},
+    {1408, 2}, {1410, 1}, {1411, 1}, {1412, 1}, {1413, 4}, {1417, 1}, {1418, 1}, {1419, 2},
+    {1421, 1}, {1422, 1}, {1423, 4}, {1427, 1}, {1428, 1}, {1429, 4}, {1433, 1}, {1434, 1},
+    {1435, 1}, {1436, 1}, {1437, 2}, {1439, 1}, {1440, 5}, {1445, 1}, {1446, 1}, {1447, 1},
+    {1448, 1}, {1449, 1}, {1450, 1}, {1451, 1}, {1452, 1}, {1453, 1}, {1454, 2}, {1456, 1},
+    {1457, 1}, {1458, 1}, {1459, 2}, {1461, 1}, {1462, 1}, {1463, 1}, {1464, 1}, {1465, 2},
+    {1467, 0}, {1467, 2}, {1469, 3}, {1472, 3}, {1475, 2}, {1477, 3}, {1480, 1}, {1481, 1},
+    {1482, 0}, {1482, 2}, {1484, 3}, {1487, 2}, {1489, 3}, {1492, 1}, {1493, 3}, {1496, 1},
+    {1497, 1}, {1498, 0}, {1498, 2}, {1500, 2}, {1502, 1}, {1503, 2}, {1505, 1}, {1506, 0},
+    {1506, 2}, {1508, 1}, {1509, 2}, {1511, 2}, {1513, 1}, {1514, 2}, {1516, 1}, {1517, 2},
+    {1519, 0}, {1519, 2}, {1521, 2}, {1523, 1}, {1524, 2}, {1526, 1}, {1527, 2}, {1529, 1},
+    {1530, 0}, {1530, 1}, {1531, 1}, {1532, 2}, {1534, 2}, {1536, 2}, {1538, 1}, {1539, 2},
+    {1541, 1}, {1542, 2}, {1544, 1}, {1545, 1}, {1546, 1}, {1547, 1}, {1548, 1}, {1549, 1},
+    {1550, 1}, {1551, 4}, {1555, 1}, {1556, 1}, {1557, 1}, {1558, 2}, {1560, 1}, {1561, 1},
+    {1562, 2}, {1564, 2}, {1566, 2}, {1568, 1}, {1569, 2}, {1571, 1}, {1572, 2}, {1574, 2},
+    {1576, 2}, {1578, 1}, {1579, 2}, {1581, 1}, {1582, 1}, {1583, 2}, {1585, 1}, {1586, 1},
+    {1587, 2}, {1589, 1}, {1590, 1}, {1591, 2}, {1593, 1}, {1594, 2}, {1596, 1}, {1597, 1},
+    {1598, 1}, {1599, 1}, {1600, 1}, {1601, 2}, {1603, 1}, {1604, 1}, {1605, 1}, {1606, 1},
+    {1607, 2}, {1609, 1}, {1610, 2}, {1612, 1}, {1613, 1}, {1614, 4}, {1618, 1}, {1619, 1},
+    {1620, 1}, {1621, 1}, {1622, 1}, {1623, 1}, {1624, 1}, {1625, 1}, {1626, 1}, {1627, 3},
+    {1630, 0}, {1630, 2}, {1632, 0}, {1632, 0}, {1632, 1}, {1633, 1}, {1634, 1}, {1635, 1},
+    {1636, 2}, {1638, 1}, {1639, 1}, {1640, 1}, {1641, 2}, {1643, 0}, {1643, 3}, {1646, 1},
+    {1647, 2}, {1649, 2}, {1651, 2}, {1653, 1}, {1654, 4}, {1658, 2}, {1660, 1}, {1661, 1},
+    {1662, 3}, {1665, 1}, {1666, 1}, {1667, 1}, {1668, 1}, {1669, 0}, {1669, 1}, {1670, 3},
+    {1673, 2}, {1675, 2}, {1677, 1}, {1678, 1}, {1679, 1}, {1680, 2}, {1682, 2}, {1684, 1},
+    {1685, 3}, {1688, 1}, {1689, 1}, {1690, 1}, {1691, 2}, {1693, 1}, {1694, 1}, {1695, 1},
+    {1696, 1}, {1697, 2}, {1699, 1}, {1700, 1}, {1701, 1}, {1702, 1}, {1703, 4}, {1707, 1},
+    {1708, 1}, {1709, 1}, {1710, 1}, {1711, 1}, {1712, 1}, {1713, 1}, {1714, 2}, {1716, 1},
+    {1717, 1}, {1718, 1}, {1719, 2}, {1721, 0}, {1721, 2}, {1723, 2}, {1725, 2}, {1727, 1},
+    {1728, 1}, {1729, 1}, {1730, 1}, {1731, 0}, {1731, 2}, {1733, 1}, {1734, 2}, {1736, 1},
+    {1737, 2}, {1739, 1}, {1740, 1}, {1741, 1}, {1742, 1}, {1743, 3}, {1746, 2}, {1748, 2},
+    {1750, 2}, {1752, 1}, {1753, 1}, {1754, 1}, {1755, 1}, {1756, 3}, {1759, 1}, {1760, 1},
+    {1761, 1}, {1762, 1}, {1763, 1}, {1764, 1}, {1765, 1}, {1766, 1}, {1767, 4}, {1771, 1},
+    {1772, 1}, {1773, 2}, {1775, 2}, {1777, 1}, {1778, 1}, {1779, 2}, {1781, 1}, {1782, 4},
+    {1786, 1}, {1787, 1}, {1788, 2}, {1790, 2}, {1792, 1}, {1793, 1}, {1794, 2}, {1796, 2},
+    {1798, 2}, {1800, 2}, {1802, 2}, {1804, 1}, {1805, 2}, {1807, 1}, {1808, 1}, {1809, 1},
+    {1810, 2}, {1812, 1}, {1813, 4}, {1817, 1}, {1818, 1}, {1819, 1}, {1820, 1}, {1821, 1},
+    {1822, 4}, {1826, 1}, {1827, 1}, {1828, 1}, {1829, 1}, {1830, 2}, {1832, 2}, {1834, 1},
+    {1835, 3}, {1838, 1}, {1839, 1}, {1840, 3}, {1843, 1}, {1844, 2}, {1846, 1}, {1847, 2},
+    {1849, 1}, {1850, 4}, {1854, 2}, {1856, 3}, {1859, 2}, {1861, 2}, {1863, 1}, {1864, 1},
+    {1865, 1}, {1866, 2}, {1868, 2}, {1870, 1}, {1871, 2}, {1873, 1}, {1874, 1}, {1875, 1},
+    {1876, 2}, {1878, 2}, {1880, 3}, {1883, 1}, {1884, 1}, {1885, 1}, {1886, 1}, {1887, 4},
+    {1891, 1}, {1892, 3}, {1895, 1}, {1896, 1}, {1897, 1}, {1898, 1}, {1899, 3}, {1902, 1},
+    {1903, 2}, {1905, 3}, {1908, 4}, {1912, 1}, {1913, 1}, {1914, 2}, {1916, 1}, {1917, 2},
+    {1919, 2}, {1921, 2}, {1923, 1}, {1924, 4}, {1928, 1}, {1929, 0}, {1929, 2}, {1931, 5},
+    {1936, 0}, {1936, 2}, {1938, 2}, {1940, 2}, {1942, 1}, {1943, 4}, {1947, 1}, {1948, 0},
+    {1948, 2}, {1950, 2}, {1952, 5}, {1957, 0}, {1957, 2}, {1959, 2}, {1961, 1}, {1962, 2},
+    {1964, 1}, {1965, 1}, {1966, 1}, {1967, 4}, {1971, 1}, {1972, 0}, {1972, 2}, {1974, 5},
+    {1979, 0}, {1979, 2}, {1981, 1}, {1982, 1}, {1983, 1}, {1984, 1}, {1985, 1}, {1986, 1},
+    {1987, 1}, {1988, 1}, {1989, 1}, {1990, 1}, {1991, 1}, {1992, 4}, {1996, 1}, {1997, 1},
+    {1998, 1}, {1999, 1}, {2000, 1}, {2001, 1}, {2002, 1}, {2003, 2}, {2005, 1}, {2006, 1},
+    {2007, 1}, {2008, 1}, {2009, 1}, {2010, 2}, {2012, 1}, {2013, 1}, {2014, 5}, {2019, 1},
+    {2020, 1}, {2021, 1}, {2022, 1}, {2023, 1}, {2024, 1}, {2025, 4}, {2029, 0}, {2029, 2},
+    {2031, 1}, {2032, 2}, {2034, 1}, {2035, 1}, {2036, 4}, {2040, 1}, {2041, 1}, {2042, 2},
+    {2044, 1}, {2045, 2}, {2047, 1}, {2048, 1}, {2049, 1}, {2050, 2}, {2052, 1}, {2053, 1},
+    {2054, 1}, {2055, 2}, {2057, 4}, {2061, 2}, {2063, 2}, {2065, 2}, {2067, 2}, {2069, 1},
+    {2070, 2}, {2072, 2}, {2074, 1}, {2075, 1}, {2076, 1}, {2077, 1}, {2078, 0}, {2078, 2},
+    {2080, 2}, {2082, 2}, {2084, 0}, {2084, 2}, {2086, 2}, {2088, 2}, {2090, 1}, {2091, 0},
+    {2091, 2}, {2093, 2}, {2095, 1}, {2096, 0}, {2096, 2}, {2098, 2}, {2100, 2}, {2102, 1},
+    {2103, 4}, {2107, 2}, {2109, 3}, {2112, 2}, {2114, 2}, {2116, 4}, {2120, 1}, {2121, 4},
+    {2125, 2}, {2127, 2}, {2129, 2}, {2131, 1}, {2132, 1}, {2133, 1}, {2134, 2}, {2136, 1},
+    {2137, 4}, {2141, 1}, {2142, 1}, {2143, 1}, {2144, 4}, {2148, 1}, {2149, 1}, {2150, 1},
+    {2151, 0}, {2151, 1}, {2152, 1}, {2153, 1}, {2154, 1}, {2155, 1}, {2156, 2}, {2158, 2},
+    {2160, 2}, {2162, 1}, {2163, 1}, {2164, 1}, {2165, 1}, {2166, 1}, {2167, 4}, {2171, 1},
+    {2172, 1}, {2173, 0}, {2173, 4}, {2177, 2}, {2179, 2}, {2181, 2}, {2183, 2}, {2185, 1},
+    {2186, 1}, {2187, 2}, {2189, 1}, {2190, 1}, {2191, 3}, {2194, 2}, {2196, 2}, {2198, 1},
+    {2199, 4}, {2203, 1}, {2204, 3}, {2207, 1}, {2208, 1}, {2209, 1}, {2210, 1}, {2211, 1},
+    {2212, 4}, {2216, 1}, {2217, 1}, {2218, 1}, {2219, 1}, {2220, 1}, {2221, 1}, {2222, 1},
+    {2223, 3}, {2226, 0}, {2226, 0}, {2226, 0}, {2226, 1}, {2227, 3}, {2230, 0}, {2230, 0},
+    {2230, 0}, {2230, 1}, {2231, 1}, {2232, 0}, {2232, 2}, {2234, 1}, {2235, 2}, {2237, 1},
+    {2238, 2}, {2240, 1}, {2241, 2}, {2243, 2}, {2245, 2}, {2247, 1}, {2248, 2}, {2250, 1},
+    {2251, 1}, {2252, 3}, {2255, 1}, {2256, 1}, {2257, 1}, {2258, 4}, {2262, 1}, {2263, 1},
+    {2264, 1}, {2265, 1}, {2266, 1}, {2267, 1}, {2268, 1}, {2269, 2}, {2271, 2}, {2273, 2},
+    {2275, 2}, {2277, 1}, {2278, 2}, {2280, 1}, {2281, 3}, {2284, 1}, {2285, 1}, {2286, 1},
+    {2287, 4}, {2291, 1}, {2292, 2}, {2294, 3}, {2297, 1}, {2298, 1}, {2299, 1}, {2300, 1},
+    {2301, 1}, {2302, 4}, {2306, 2}, {2308, 2}, {2310, 2}, {2312, 2}, {2314, 2}, {2316, 4},
+    {2320, 2}, {2322, 2}, {2324, 1}, {2325, 3}, {2328, 1}, {2329, 1}, {2330, 1}, {2331, 4},
+    {2335, 1}, {2336, 1}, {2337, 1}, {2338, 1}, {2339, 1}, {2340, 1}, {2341, 3}, {2344, 0},
+    {2344, 1}, {2345, 1}, {2346, 1}, {2347, 1}, {2348, 3}, {2351, 1}, {2352, 1}, {2353, 0},
+    {2353, 2}, {2355, 2}, {2357, 1}, {2358, 1}, {2359, 0}, {2359, 1}, {2360, 1}, {2361, 1},
+    {2362, 4}, {2366, 1}, {2367, 1}, {2368, 1}, {2369, 1}, {2370, 1}, {2371, 2}, {2373, 0},
+    {2373, 2}, {2375, 1}, {2376, 1}, {2377, 2}, {2379, 2}, {2381, 1}, {2382, 2}, {2384, 1},
+    {2385, 1}, {2386, 1}, {2387, 1}, {2388, 4}, {2392, 1}, {2393, 1}, {2394, 4}, {2398, 1},
+    {2399, 0}, {2399, 2}, {2401, 1}, {2402, 1}, {2403, 0}, {2403, 2}, {2405, 1}, {2406, 1},
+    {2407, 2}, {2409, 1}, {2410, 2}, {2412, 1}, {2413, 1}, {2414, 1}, {2415, 2}, {2417, 1},
+    {2418, 1}, {2419, 1}, {2420, 0}, {2420, 2}, {2422, 2}, {2424, 1}, {2425, 1}, {2426, 0},
+    {2426, 2}, {2428, 1}, {2429, 2}, {2431, 1}, {2432, 1}, {2433, 3}, {2436, 1}, {2437, 1},
+    {2438, 1}, {2439, 1}, {2440, 1}, {2441, 4}, {2445, 1}, {2446, 1}, {2447, 4}, {2451, 1},
+    {2452, 1}, {2453, 4}, {2457, 1}, {2458, 4}, {2462, 1}, {2463, 1}, {2464, 0}, {2464, 1},
+    {2465, 1}, {2466, 1}, {2467, 1}, {2468, 1}, {2469, 1}, {2470, 2}, {2472, 1}, {2473, 5},
+    {2478, 0}, {2478, 1}, {2479, 2}, {2481, 2}, {2483, 6}, {2489, 0}, {2489, 1}, {2490, 1},
+    {2491, 1}, {2492, 2}, {2494, 1}, {2495, 1}, {2496, 1}, {2497, 5}, {2502, 0}, {2502, 1},
+    {2503, 1}, {2504, 5}, {2509, 0}, {2509, 1}, {2510, 2}, {2512, 1}, {2513, 5}, {2518, 0},
+    {2518, 1}, {2519, 4}, {2523, 1}, {2524, 4}, {2528, 0}, {2528, 1}, {2529, 1}, {2530, 0},
+    {2530, 1}, {2531, 1}, {2532, 1}, {2533, 1}, {2534, 1}, {2535, 1}, {2536, 1}, {2537, 4},
+    {2541, 0}, {2541, 1}, {2542, 1}, {2543, 1}, {2544, 1}, {2545, 1}, {2546, 0}, {2546, 1},
+    {2547, 1}, {2548, 1}, {2549, 3}, {2552, 1}, {2553, 1}, {2554, 4}, {2558, 0}, {2558, 1},
+    {2559, 1}, {2560, 1}, {2561, 1}, {2562, 1}, {2563, 1}, {2564, 2}, {2566, 4}, {2570, 1},
+    {2571, 1}, {2572, 1}, {2573, 4}, {2577, 1}, {2578, 1}, {2579, 1}, {2580, 1}, {2581, 1},
+    {2582, 1}, {2583, 1}, {2584, 1}, {2585, 1}, {2586, 1}, {2587, 1}, {2588, 1}, {2589, 2},
+    {2591, 2}, {2593, 1}, {2594, 1}, {2595, 1}, {2596, 1}, {2597, 0}, {2597, 1}, {2598, 1},
+    {2599, 2}, {2601, 2}, {2603, 2}, {2605, 2}, {2607, 1}, {2608, 2}, {2610, 2}, {2612, 2},
+    {2614, 1}, {2615, 2}, {2617, 1}, {2618, 2}, {2620, 1}, {2621, 0}, {2621, 2}, {2623, 1},
+    {2624, 1}, {2625, 1}, {2626, 0}, {2626, 2}, {2628, 1}, {2629, 1}, {2630, 1}, {2631, 1},
+    {2632, 1}, {2633, 1}, {2634, 2}, {2636, 2}, {2638, 1}, {2639, 1}, {2640, 1}, {2641, 1},
+    {2642, 1}, {2643, 2}, {2645, 2}, {2647, 2}, {2649, 4}, {2653, 4}, {2657, 2}, {2659, 2},
+    {2661, 0}, {2661, 1}, {2662, 2}, {2664, 1}, {2665, 2}, {2667, 1}, {2668, 1}, {2669, 1},
+    {2670, 1}, {2671, 1}, {2672, 1}, {2673, 1}, {2674, 1}, {2675, 1}, {2676, 1}, {2677, 1},
+    {2678, 1}, {2679, 1}, {2680, 1}, {2681, 1}, {2682, 0}, {2682, 2}, {2684, 1}, {2685, 1},
+    {2686, 4}, {2690, 2}, {2692, 1}, {2693, 1},
+};
+
+inline constexpr Op kOps[2694] = {
+    {kType, 4, 0, 0},  // n0 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 0, 3, 0},  // required: qvf_version, source, sections
+    {kProperties, 56, 13, 0},  // properties: qvf_version, schema_uri, byte_order, source, provenance, met...
+    {kType, 4, 0, 0},  // n1 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 10, 2, 0},  // required: value, units
+    {kProperties, 82, 2, 0},  // properties: value, units
+    {kEnum, 14, 25, 0},  // n2 enum
+    {kEnum, 39, 3, 0},  // n3 enum
+    {kType, 4, 0, 0},  // n4 type
+    {kProperties, 86, 4, 0},  // properties: isovalue, colormap, opacity, replication
+    {kType, 8, 0, 0},  // n5 type
+    {kItems, 232, 0, 0},  // items
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kType, 4, 0, 0},  // n6 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 42, 3, 0},  // required: position, focal_point, view_up
+    {kProperties, 94, 5, 0},  // properties: position, focal_point, view_up, view_angle, parallel_scale
+    {kOneOf, 49, 2, 0},  // oneOf
+    {kType, 4, 0, 0},  // n7 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 51, 2, 0},  // required: name, camera
+    {kProperties, 104, 3, 0},  // properties: name, description, camera
+    {kType, 32, 0, 0},  // n8 type
+    {kPattern, 2, 0, 0},  // pattern ^[a-f0-9]{64}$
+    {kType, 32, 0, 0},  // n9 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kPattern, 3, 0, 0},  // pattern ^[^/][^\0]*$
+    {kNot, 245, 0, 0},  // not
+    {kType, 32, 0, 0},  // n10 type
+    {kEnum, 53, 10, 0},  // enum
+    {kType, 64, 0, 0},  // n11 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n12 type
+    {kPattern, 5, 0, 0},  // pattern ^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$
+    {kType, 4, 0, 0},  // n13 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 63, 5, 0},  // required: path, format, dtype, shape, sha256
+    {kProperties, 110, 7, 0},  // properties: path, format, dtype, shape, sha256, size, media_type
+    {kType, 4, 0, 0},  // n14 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 68, 3, 0},  // required: path, format, sha256
+    {kProperties, 124, 5, 0},  // properties: path, format, sha256, size, media_type
+    {kType, 4, 0, 0},  // n15 type
+    {kRequired, 71, 3, 0},  // required: id, kind, members
+    {kProperties, 134, 9, 0},  // properties: id, kind, label, component, critical, structure_ref, run_ref...
+    {kOneOf, 74, 57, 0},  // oneOf
+    {kAllOf, 133, 2, 0},  // n16 allOf
+    {kAllOf, 137, 2, 0},  // n17 allOf
+    {kAllOf, 145, 2, 0},  // n18 allOf
+    {kAllOf, 153, 2, 0},  // n19 allOf
+    {kType, 4, 0, 0},  // n20 type
+    {kRequired, 155, 3, 0},  // required: symbol, position, atomic_number
+    {kProperties, 168, 4, 0},  // properties: symbol, position, atomic_number, b_factor
+    {kType, 8, 0, 0},  // n21 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 353, 0, 0},  // items
+    {kType, 4, 0, 0},  // n22 type
+    {kRequired, 158, 1, 0},  // required: atoms
+    {kProperties, 176, 4, 0},  // properties: atoms, pbc, lattice_vectors, dimensionality
+    {kAllOf, 172, 6, 0},  // allOf
+    {kType, 4, 0, 0},  // n23 type
+    {kRequired, 178, 4, 0},  // required: name, seq, chain, atom_indices
+    {kProperties, 206, 4, 0},  // properties: name, seq, chain, atom_indices
+    {kType, 4, 0, 0},  // n24 type
+    {kRequired, 182, 4, 0},  // required: type, chain, start_seq, end_seq
+    {kProperties, 214, 4, 0},  // properties: type, chain, start_seq, end_seq
+    {kProperties, 226, 12, 0},  // n25 properties: kind, members, chains, residues, secondary_structure, b_fact...
+    {kProperties, 254, 2, 0},  // n26 properties: kind, members
+    {kType, 4, 0, 0},  // n27 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 258, 1, 0},  // patternProperties
+    {kRequired, 192, 3, 0},  // required: origin, voxel_vectors, shape
+    {kProperties, 264, 7, 0},  // properties: origin, voxel_vectors, shape, periodic, includes_endpoint, s...
+    {kProperties, 282, 2, 0},  // n28 properties: kind, members
+    {kProperties, 290, 2, 0},  // n29 properties: kind, members
+    {kProperties, 298, 2, 0},  // n30 properties: kind, members
+    {kProperties, 306, 2, 0},  // n31 properties: kind, members
+    {kProperties, 314, 5, 0},  // n32 properties: kind, operand_a, operand_b, description, members
+    {kDependentRequired, 0, 2, 0},  // dependentRequired
+    {kProperties, 328, 2, 0},  // n33 properties: kind, members
+    {kProperties, 336, 2, 0},  // n34 properties: kind, members
+    {kProperties, 344, 2, 0},  // n35 properties: kind, members
+    {kProperties, 352, 2, 0},  // n36 properties: kind, members
+    {kProperties, 360, 2, 0},  // n37 properties: kind, members
+    {kProperties, 370, 2, 0},  // n38 properties: kind, members
+    {kType, 4, 0, 0},  // n39 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 374, 1, 0},  // patternProperties
+    {kRequired, 220, 2, 0},  // required: kind, values
+    {kProperties, 376, 5, 0},  // properties: kind, values, units, labels, trajectory_ref
+    {kAllOf, 227, 1, 0},  // allOf
+    {kAllOf, 228, 2, 0},  // n40 allOf
+    {kAllOf, 232, 2, 0},  // n41 allOf
+    {kType, 4, 0, 0},  // n42 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 398, 1, 0},  // patternProperties
+    {kRequired, 234, 3, 0},  // required: units, description, kind
+    {kProperties, 400, 3, 0},  // properties: units, description, kind
+    {kType, 4, 0, 0},  // n43 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 406, 2, 0},  // patternProperties
+    {kProperties, 464, 2, 0},  // n44 properties: kind, members
+    {kAllOf, 245, 2, 0},  // n45 allOf
+    {kAllOf, 250, 2, 0},  // n46 allOf
+    {kAllOf, 252, 2, 0},  // n47 allOf
+    {kAllOf, 261, 2, 0},  // n48 allOf
+    {kProperties, 502, 2, 0},  // n49 properties: kind, members
+    {kType, 4, 0, 0},  // n50 type
+    {kRequired, 265, 2, 0},  // required: symbol, atomic_number
+    {kProperties, 506, 2, 0},  // properties: symbol, atomic_number
+    {kType, 4, 0, 0},  // n51 type
+    {kAnyOf, 270, 3, 0},  // anyOf
+    {kProperties, 518, 11, 0},  // properties: symbols, atomic_numbers, atoms, n_frames, energies, kind, pb...
+    {kType, 4, 0, 0},  // n52 type
+    {kAllOf, 286, 1, 0},  // allOf
+    {kProperties, 546, 1, 0},  // properties: units
+    {kProperties, 566, 2, 0},  // n53 properties: kind, members
+    {kType, 4, 0, 0},  // n54 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 570, 1, 0},  // patternProperties
+    {kRequired, 289, 3, 0},  // required: frame_index, label, kind
+    {kProperties, 572, 4, 0},  // properties: frame_index, label, kind, energy_eh
+    {kType, 4, 0, 0},  // n55 type
+    {kAllOf, 297, 1, 0},  // allOf
+    {kProperties, 582, 10, 0},  // properties: waypoints, reaction_coordinate, reaction_coordinate_label, r...
+    {kAllOf, 305, 2, 0},  // n56 allOf
+    {kProperties, 616, 2, 0},  // n57 properties: kind, members
+    {kType, 4, 0, 0},  // n58 type
+    {kRequired, 311, 1, 0},  // required: label
+    {kProperties, 620, 3, 0},  // properties: label, unit, atoms
+    {kType, 4, 0, 0},  // n59 type
+    {kProperties, 626, 11, 0},  // properties: axis_a, axis_b, axis_a_label, axis_b_label, coordinate_a_lab...
+    {kProperties, 650, 3, 0},  // n60 properties: kind, trajectory_ref, members
+    {kRequired, 313, 4, 0},  // required: id, kind, members, trajectory_ref
+    {kType, 4, 0, 0},  // n61 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 656, 1, 0},  // patternProperties
+    {kRequired, 317, 1, 0},  // required: waypoints
+    {kProperties, 658, 2, 0},  // properties: waypoints, reaction_coordinate
+    {kProperties, 664, 2, 0},  // n62 properties: kind, members
+    {kRequired, 319, 3, 0},  // required: id, kind, members
+    {kType, 4, 0, 0},  // n63 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 668, 1, 0},  // patternProperties
+    {kRequired, 322, 1, 0},  // required: steps
+    {kProperties, 670, 1, 0},  // properties: steps
+    {kType, 4, 0, 0},  // n64 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 672, 1, 0},  // patternProperties
+    {kRequired, 323, 3, 0},  // required: id, reactants, products
+    {kProperties, 674, 9, 0},  // properties: id, label, reactants, products, reagents, arrow, conditions,...
+    {kType, 4, 0, 0},  // n65 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 692, 1, 0},  // patternProperties
+    {kRequired, 330, 1, 0},  // required: structure_ref
+    {kProperties, 694, 2, 0},  // properties: structure_ref, coefficient
+    {kAllOf, 331, 2, 0},  // n66 allOf
+    {kProperties, 706, 3, 0},  // n67 properties: kind, hessian_ref, members
+    {kType, 4, 0, 0},  // n68 type
+    {kRequired, 335, 1, 0},  // required: frequencies
+    {kProperties, 712, 10, 0},  // properties: frequencies, ir_intensities, raman_activities, reduced_masse...
+    {kProperties, 734, 2, 0},  // n69 properties: kind, members
+    {kType, 4, 0, 0},  // n70 type
+    {kRequired, 337, 2, 0},  // required: frequencies, intensities
+    {kProperties, 750, 11, 0},  // properties: frequencies, intensities, x, x_units, y_units, peaks, broade...
+    {kType, 4, 0, 0},  // n71 type
+    {kRequired, 345, 1, 0},  // required: x
+    {kProperties, 776, 5, 0},  // properties: x, y, width, label, assignment
+    {kProperties, 788, 2, 0},  // n72 properties: kind, members
+    {kAllOf, 347, 2, 0},  // n73 allOf
+    {kProperties, 798, 2, 0},  // n74 properties: kind, members
+    {kProperties, 804, 2, 0},  // n75 properties: kind, members
+    {kProperties, 810, 2, 0},  // n76 properties: kind, members
+    {kProperties, 816, 2, 0},  // n77 properties: kind, members
+    {kType, 4, 0, 0},  // n78 type
+    {kProperties, 846, 6, 0},  // properties: isotope, reference, solvent, chemical_shifts, shielding_tens...
+    {kProperties, 860, 2, 0},  // n79 properties: kind, members
+    {kType, 4, 0, 0},  // n80 type
+    {kProperties, 888, 3, 0},  // properties: g_tensor, hyperfine, zero_field_splitting
+    {kProperties, 896, 2, 0},  // n81 properties: kind, members
+    {kAllOf, 361, 2, 0},  // n82 allOf
+    {kProperties, 922, 2, 0},  // n83 properties: kind, members
+    {kAllOf, 375, 2, 0},  // n84 allOf
+    {kType, 4, 0, 0},  // n85 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 930, 1, 0},  // patternProperties
+    {kRequired, 377, 4, 0},  // required: center, l, exponents, coefficients
+    {kProperties, 932, 5, 0},  // properties: center, l, exponents, coefficients, pure
+    {kType, 4, 0, 0},  // n86 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 942, 1, 0},  // patternProperties
+    {kRequired, 381, 4, 0},  // required: l, exponents, coefficients, powers
+    {kProperties, 944, 5, 0},  // properties: l, exponents, coefficients, powers, local
+    {kType, 4, 0, 0},  // n87 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 954, 1, 0},  // patternProperties
+    {kRequired, 385, 2, 0},  // required: center, n_core_electrons
+    {kProperties, 956, 4, 0},  // properties: center, n_core_electrons, label, projectors
+    {kType, 4, 0, 0},  // n88 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 964, 1, 0},  // patternProperties
+    {kRequired, 387, 2, 0},  // required: structure_ref, shells
+    {kProperties, 966, 6, 0},  // properties: structure_ref, pure, n_ao, shells, ecp, n_electrons
+    {kType, 4, 0, 0},  // n89 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 978, 1, 0},  // patternProperties
+    {kRequired, 389, 2, 0},  // required: energies, occupations
+    {kProperties, 980, 4, 0},  // properties: n_mo, energies, occupations, symmetry_labels
+    {kType, 4, 0, 0},  // n90 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 988, 1, 0},  // patternProperties
+    {kRequired, 391, 1, 0},  // required: spin
+    {kProperties, 990, 25, 0},  // properties: spin, orbital_kind, n_ao, n_mo, energies, occupations, symme...
+    {kAllOf, 440, 3, 0},  // allOf
+    {kProperties, 1064, 2, 0},  // n91 properties: kind, members
+    {kRequired, 449, 3, 0},  // required: id, kind, members
+    {kAllOf, 457, 2, 0},  // n92 allOf
+    {kAllOf, 459, 2, 0},  // n93 allOf
+    {kAllOf, 461, 2, 0},  // n94 allOf
+    {kType, 4, 0, 0},  // n95 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1080, 1, 0},  // patternProperties
+    {kRequired, 463, 1, 0},  // required: kpoints
+    {kProperties, 1088, 7, 0},  // properties: kpoints, weights, labels, mesh, shift, time_reversal, units
+    {kType, 4, 0, 0},  // n96 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1102, 1, 0},  // patternProperties
+    {kRequired, 464, 6, 0},  // required: spin, n_spin, n_mo, n_ao, complex, k_point_convention
+    {kProperties, 1106, 10, 0},  // properties: spin, n_spin, n_mo, n_ao, orbital_kind, complex, k_point_con...
+    {kAllOf, 485, 2, 0},  // allOf
+    {kProperties, 1142, 2, 0},  // n97 properties: kind, members
+    {kAllOf, 489, 2, 0},  // n98 allOf
+    {kAllOf, 491, 2, 0},  // n99 allOf
+    {kType, 4, 0, 0},  // n100 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1154, 1, 0},  // patternProperties
+    {kProperties, 1156, 7, 0},  // properties: start, end, n_points, label_start, label_end, k_start, k_end
+    {kType, 4, 0, 0},  // n101 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1170, 1, 0},  // patternProperties
+    {kProperties, 1178, 15, 0},  // properties: kpoints, labels, segments, fermi, fermi_energy_ev, spinor, n...
+    {kProperties, 1212, 7, 0},  // n102 properties: kind, members, n_spin, smearing, smearing_type, fermi_energy...
+    {kProperties, 1240, 8, 0},  // n103 properties: kind, members, n_spin, smearing, smearing_type, fermi_energy...
+    {kAllOf, 505, 2, 0},  // n104 allOf
+    {kProperties, 1266, 2, 0},  // n105 properties: kind, members
+    {kProperties, 1278, 2, 0},  // n106 properties: kind, members
+    {kType, 4, 0, 0},  // n107 type
+    {kRequired, 515, 1, 0},  // required: label
+    {kProperties, 1282, 5, 0},  // properties: atom, l, m, spin, label
+    {kType, 4, 0, 0},  // n108 type
+    {kProperties, 1312, 9, 0},  // properties: method, n_spin, fermi_energy_ev, smearing, smearing_type, pa...
+    {kProperties, 1332, 2, 0},  // n109 properties: kind, members
+    {kType, 4, 0, 0},  // n110 type
+    {kProperties, 1340, 11, 0},  // properties: spacegroup_number, international, hall, point_group, hermann...
+    {kProperties, 1364, 2, 0},  // n111 properties: kind, members
+    {kType, 4, 0, 0},  // n112 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1368, 1, 0},  // patternProperties
+    {kRequired, 525, 1, 0},  // required: pairs
+    {kProperties, 1378, 1, 0},  // properties: pairs
+    {kProperties, 1382, 2, 0},  // n113 properties: kind, members
+    {kType, 4, 0, 0},  // n114 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1386, 1, 0},  // patternProperties
+    {kRequired, 529, 2, 0},  // required: method, pairs
+    {kProperties, 1402, 2, 0},  // properties: method, pairs
+    {kProperties, 1408, 2, 0},  // n115 properties: kind, members
+    {kType, 4, 0, 0},  // n116 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1412, 1, 0},  // patternProperties
+    {kRequired, 535, 1, 0},  // required: iterations
+    {kProperties, 1426, 2, 0},  // properties: iterations, converged
+    {kType, 4, 0, 0},  // n117 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 538, 3, 0},  // required: path, format, sha256
+    {kProperties, 1430, 5, 0},  // properties: path, format, sha256, size, media_type
+    {kProperties, 1442, 2, 0},  // n118 properties: kind, members
+    {kType, 4, 0, 0},  // n119 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 542, 3, 0},  // required: path, format, sha256
+    {kProperties, 1446, 5, 0},  // properties: path, format, sha256, size, media_type
+    {kProperties, 1464, 11, 0},  // n120 properties: kind, program, program_version, command, exit_status, starte...
+    {kRequired, 552, 4, 0},  // required: id, kind, members, program
+    {kType, 4, 0, 0},  // n121 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1496, 1, 0},  // patternProperties
+    {kProperties, 1500, 2, 0},  // n122 properties: kind, members
+    {kRequired, 557, 3, 0},  // required: id, kind, members
+    {kType, 4, 0, 0},  // n123 type
+    {kRequired, 560, 1, 0},  // required: job_type
+    {kProperties, 1504, 16, 0},  // properties: job_type, method, basis, functional, charge, multiplicity, k...
+    {kType, 4, 0, 0},  // n124 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1536, 1, 0},  // patternProperties
+    {kRequired, 569, 1, 0},  // required: model
+    {kProperties, 1538, 3, 0},  // properties: model, solvent, epsilon
+    {kType, 4, 0, 0},  // n125 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1544, 1, 0},  // patternProperties
+    {kProperties, 1546, 4, 0},  // properties: convergence, max_iterations, guess, damping
+    {kType, 4, 0, 0},  // n126 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1554, 1, 0},  // patternProperties
+    {kProperties, 1556, 3, 0},  // properties: convergence, max_steps, coordinates
+    {kType, 4, 0, 0},  // n127 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1562, 1, 0},  // patternProperties
+    {kProperties, 1564, 3, 0},  // properties: n_cores, memory_mb, walltime_s
+    {kProperties, 1600, 3, 0},  // n128 properties: kind, ao_metadata, members
+    {kProperties, 1612, 2, 0},  // n129 properties: kind, members
+    {kType, 4, 0, 0},  // n130 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1616, 1, 0},  // patternProperties
+    {kRequired, 596, 1, 0},  // required: model
+    {kProperties, 1618, 11, 0},  // properties: model, V0, E0, B0, B0_prime, residual_rms, n_points, pressur...
+    {kProperties, 1644, 2, 0},  // n131 properties: kind, members
+    {kType, 4, 0, 0},  // n132 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1648, 1, 0},  // patternProperties
+    {kProperties, 1656, 13, 0},  // properties: shape, nk1, nk2, nk3, shift, symmetry_expanded, kpoints, fer...
+    {kProperties, 1692, 2, 0},  // n133 properties: kind, members
+    {kType, 4, 0, 0},  // n134 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1696, 1, 0},  // patternProperties
+    {kProperties, 1700, 10, 0},  // properties: kpoints, labels, segments, n_kpoints, n_atoms, n_modes, has_...
+    {kProperties, 1732, 2, 0},  // n135 properties: kind, members
+    {kType, 4, 0, 0},  // n136 type
+    {kProperties, 1738, 6, 0},  // properties: n_atoms, n_modes, smearing, smearing_type, channels, units
+    {kProperties, 1752, 2, 0},  // n137 properties: kind, members
+    {kType, 4, 0, 0},  // n138 type
+    {kRequired, 625, 1, 0},  // required: points
+    {kProperties, 1776, 3, 0},  // properties: points, bond_paths, units
+    {kProperties, 1788, 2, 0},  // n139 properties: kind, members
+    {kRequired, 633, 3, 0},  // required: id, kind, members
+    {kAllOf, 638, 2, 0},  // n140 allOf
+    {kAllOf, 642, 2, 0},  // n141 allOf
+    {kType, 4, 0, 0},  // n142 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1800, 1, 0},  // patternProperties
+    {kProperties, 1802, 4, 0},  // properties: structure_ref, method, convention, units
+    {kType, 4, 0, 0},  // n143 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1810, 1, 0},  // patternProperties
+    {kProperties, 1812, 2, 0},  // properties: energy, length
+    {kProperties, 1820, 2, 0},  // n144 properties: kind, members
+    {kRequired, 646, 3, 0},  // required: id, kind, members
+    {kAllOf, 649, 2, 0},  // n145 allOf
+    {kType, 4, 0, 0},  // n146 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1828, 1, 0},  // patternProperties
+    {kProperties, 1830, 5, 0},  // properties: structure_ref, mass_weighted, projected, atom_masses_amu, un...
+    {kIf, 1481, 1483, -1},  // if
+    {kProperties, 1844, 3, 0},  // n147 properties: kind, wavefunction_ref, members
+    {kRequired, 654, 3, 0},  // required: id, kind, members
+    {kProperties, 1852, 2, 0},  // n148 properties: kind, members
+    {kRequired, 658, 3, 0},  // required: id, kind, members
+    {kType, 4, 0, 0},  // n149 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1856, 1, 0},  // patternProperties
+    {kRequired, 661, 1, 0},  // required: states
+    {kProperties, 1858, 2, 0},  // properties: states, meta
+    {kType, 4, 0, 0},  // n150 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1862, 1, 0},  // patternProperties
+    {kRequired, 662, 2, 0},  // required: index, excitation_energy
+    {kProperties, 1864, 12, 0},  // properties: index, excitation_energy, total_energy, multiplicity, symmet...
+    {kType, 4, 0, 0},  // n151 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1888, 1, 0},  // patternProperties
+    {kRequired, 664, 3, 0},  // required: from_mo, to_mo, weight
+    {kProperties, 1890, 4, 0},  // properties: from_mo, to_mo, spin, weight
+    {kType, 4, 0, 0},  // n152 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1898, 1, 0},  // patternProperties
+    {kProperties, 1906, 6, 0},  // properties: method, reference_state, n_states, tda, spin_flip, units
+    {kProperties, 1920, 2, 0},  // n153 properties: kind, members
+    {kRequired, 670, 3, 0},  // required: id, kind, members
+    {kProperties, 1926, 2, 0},  // n154 properties: kind, members
+    {kRequired, 674, 3, 0},  // required: id, kind, members
+    {kType, 8, 0, 0},  // n155 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1531, 0, 0},  // items
+    {kType, 8, 0, 0},  // n156 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1532, 0, 0},  // items
+    {kType, 8, 0, 0},  // n157 type
+    {kMinItems, 6, 0, 0},  // minItems
+    {kMaxItems, 6, 0, 0},  // maxItems
+    {kItems, 1534, 0, 0},  // items
+    {kType, 8, 0, 0},  // n158 type
+    {kMinItems, 27, 0, 0},  // minItems
+    {kMaxItems, 27, 0, 0},  // maxItems
+    {kItems, 1536, 0, 0},  // items
+    {kType, 4, 0, 0},  // n159 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1930, 1, 0},  // patternProperties
+    {kAnyOf, 682, 5, 0},  // anyOf
+    {kProperties, 1978, 7, 0},  // properties: origin, dipole, quadrupole, octupole, polarizability, hyperp...
+    {kType, 4, 0, 0},  // n160 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1992, 1, 0},  // patternProperties
+    {kRequired, 701, 1, 0},  // required: stiffness
+    {kProperties, 2006, 8, 0},  // properties: stiffness, compliance, bulk_modulus_gpa, shear_modulus_gpa, ...
+    {kType, 4, 0, 0},  // n161 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2022, 1, 0},  // patternProperties
+    {kRequired, 705, 1, 0},  // required: electronic
+    {kProperties, 2034, 6, 0},  // properties: electronic, ionic, static, born_charges, piezoelectric, unit...
+    {kProperties, 2050, 4, 0},  // n162 properties: kind, excited_states_ref, state_index, members
+    {kDependentRequired, 6, 1, 0},  // dependentRequired
+    {kProperties, 2062, 2, 0},  // n163 properties: kind, members
+    {kRequired, 710, 3, 0},  // required: id, kind, members
+    {kType, 4, 0, 0},  // n164 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 713, 4, 0},  // required: path, format, sha256, media_type
+    {kProperties, 2066, 5, 0},  // properties: path, format, sha256, size, media_type
+    {kType, 4, 0, 0},  // n165 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 719, 4, 0},  // required: path, format, sha256, media_type
+    {kProperties, 2076, 5, 0},  // properties: path, format, sha256, size, media_type
+    {kProperties, 2086, 2, 0},  // n166 properties: kind, members
+    {kType, 4, 0, 0},  // n167 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2090, 1, 0},  // patternProperties
+    {kProperties, 2092, 11, 0},  // properties: title, description, created_utc, modified_utc, uuid, authors...
+    {kType, 4, 0, 0},  // n168 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2114, 1, 0},  // patternProperties
+    {kRequired, 729, 1, 0},  // required: name
+    {kProperties, 2116, 4, 0},  // properties: name, orcid, affiliation, email
+    {kType, 4, 0, 0},  // n169 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2124, 1, 0},  // patternProperties
+    {kRequired, 730, 1, 0},  // required: name
+    {kProperties, 2126, 3, 0},  // properties: name, version, url
+    {kType, 4, 0, 0},  // n170 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kProperties, 2132, 6, 0},  // properties: zpve_eh, enthalpy_eh, entropy_cal_mol_k, gibbs_free_energy_e...
+    {kType, 4, 0, 0},  // n171 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kProperties, 2144, 3, 0},  // properties: total_debye, vector_debye, origin
+    {kType, 4, 0, 0},  // n172 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kProperties, 2154, 2, 0},  // properties: frozen_atoms, distance_constraints
+    {kType, 4, 0, 0},  // n173 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2158, 1, 0},  // patternProperties
+    {kRequired, 735, 1, 0},  // required: total
+    {kProperties, 2160, 5, 0},  // properties: total, method, components, by_method, units_note
+    {kType, 4, 0, 0},  // n174 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2170, 1, 0},  // patternProperties
+    {kProperties, 2172, 12, 0},  // properties: nuclear_repulsion, electronic, one_electron, two_electron, e...
+    {kType, 4, 0, 0},  // n175 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2196, 1, 0},  // patternProperties
+    {kRequired, 736, 2, 0},  // required: method, total
+    {kProperties, 2198, 3, 0},  // properties: method, total, components
+    {kType, 4, 0, 0},  // n176 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2210, 1, 0},  // patternProperties
+    {kType, 64, 0, 0},  // n177 type
+    {kConst, 0, 0, 0},  // const 1
+    {kType, 32, 0, 0},  // n178 type
+    {kConst, 1, 0, 0},  // n179 const "little"
+    {kType, 4, 0, 0},  // n180 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 3, 3, 0},  // required: program, version, calculation
+    {kProperties, 0, 3, 0},  // properties: program, version, calculation
+    {kType, 32, 0, 0},  // n181 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n182 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n183 type
+    {kType, 4, 0, 0},  // n184 type
+    {kProperties, 6, 21, 0},  // properties: method, functional, basis, charge, multiplicity, n_electrons...
+    {kType, 32, 0, 0},  // n185 type
+    {kType, 32, 0, 0},  // n186 type
+    {kType, 32, 0, 0},  // n187 type
+    {kType, 64, 0, 0},  // n188 type
+    {kType, 64, 0, 0},  // n189 type
+    {kType, 64, 0, 0},  // n190 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 2, 0, 0},  // n191 type
+    {kType, 64, 0, 0},  // n192 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 1, 0, 0},  // n193 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n194 $ref #/$defs/ValueWithUnits
+    {kType, 16, 0, 0},  // n195 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n196 type
+    {kType, 64, 0, 0},  // n197 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 1, 0, 0},  // maximum
+    {kEnum, 6, 4, 0},  // n198 enum
+    {kType, 8, 0, 0},  // n199 type
+    {kItems, 200, 0, 0},  // items
+    {kRef, 169, 0, 0},  // n200 $ref #/$defs/ProvenanceSoftware
+    {kType, 32, 0, 0},  // n201 type
+    {kPattern, 0, 0, 0},  // pattern ^[0-9a-fA-F]{7,64}$
+    {kType, 64, 0, 0},  // n202 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n203 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n204 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n205 type
+    {kPattern, 1, 0, 0},  // pattern ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?Z$
+    {kType, 32, 0, 0},  // n206 type
+    {kPattern, 1, 0, 0},  // pattern ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?Z$
+    {kRef, 167, 0, 0},  // n207 $ref #/$defs/Metadata
+    {kType, 4, 0, 0},  // n208 type
+    {kAdditionalProperties, 209, 0, 0},  // additionalProperties
+    {kProperties, 48, 4, 0},  // properties: auto_open, bookmarks, camera, crossfade
+    {kRef, 4, 0, 0},  // n209 $ref #/$defs/ViewerHint
+    {kType, 8, 0, 0},  // n210 type
+    {kItems, 211, 0, 0},  // items
+    {kType, 32, 0, 0},  // n211 type
+    {kType, 8, 0, 0},  // n212 type
+    {kItems, 213, 0, 0},  // items
+    {kRef, 7, 0, 0},  // n213 $ref #/$defs/Bookmark
+    {kRef, 170, 0, 0},  // n216 $ref #/$defs/Thermochemistry
+    {kRef, 171, 0, 0},  // n217 $ref #/$defs/DipoleMoment
+    {kRef, 172, 0, 0},  // n218 $ref #/$defs/Constraints
+    {kRef, 173, 0, 0},  // n219 $ref #/$defs/Energies
+    {kRef, 176, 0, 0},  // n220 $ref #/$defs/Extensions
+    {kType, 8, 0, 0},  // n221 type
+    {kItems, 222, 0, 0},  // items
+    {kRef, 15, 0, 0},  // n222 $ref #/$defs/Section
+    {kType, 16, 0, 0},  // n223 type
+    {kOneOf, 12, 2, 0},  // n224 oneOf
+    {kRef, 2, 0, 0},  // n225 $ref #/$defs/UnitName
+    {kRef, 3, 0, 0},  // n226 $ref #/$defs/LegacyUnitName
+    {kType, 16, 0, 0},  // n227 type
+    {kType, 32, 0, 0},  // n228 type
+    {kType, 16, 0, 0},  // n229 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 2, 0, 0},  // maximum
+    {kType, 8, 0, 0},  // n230 type
+    {kItems, 231, 0, 0},  // items
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n231 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n232 type
+    {kRef, 5, 0, 0},  // n233 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n234 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n235 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n236 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kExclusiveMaximum, 3, 0, 0},  // exclusiveMaximum
+    {kType, 16, 0, 0},  // n237 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kRequired, 45, 1, 0},  // n238 required: view_angle
+    {kNot, 239, 0, 0},  // not
+    {kRequired, 46, 1, 0},  // n239 required: parallel_scale
+    {kRequired, 47, 1, 0},  // n240 required: parallel_scale
+    {kNot, 241, 0, 0},  // not
+    {kRequired, 48, 1, 0},  // n241 required: view_angle
+    {kType, 32, 0, 0},  // n242 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n243 type
+    {kRef, 6, 0, 0},  // n244 $ref #/$defs/Camera
+    {kPattern, 4, 0, 0},  // n245 pattern (^|/)\.\.(/|$)
+    {kRef, 9, 0, 0},  // n246 $ref #/$defs/ZipPath
+    {kConst, 44, 0, 0},  // n247 const "binary"
+    {kRef, 10, 0, 0},  // n248 $ref #/$defs/NumpyDtype
+    {kType, 8, 0, 0},  // n249 type
+    {kItems, 250, 0, 0},  // items
+    {kMinItems, 1, 0, 0},  // minItems
+    {kType, 64, 0, 0},  // n250 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 8, 0, 0},  // n251 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n252 $ref #/$defs/MemberSize
+    {kRef, 12, 0, 0},  // n253 $ref #/$defs/MediaType
+    {kRef, 9, 0, 0},  // n254 $ref #/$defs/ZipPath
+    {kConst, 45, 0, 0},  // n255 const "json"
+    {kRef, 8, 0, 0},  // n256 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n257 $ref #/$defs/MemberSize
+    {kRef, 12, 0, 0},  // n258 $ref #/$defs/MediaType
+    {kType, 32, 0, 0},  // n259 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kPattern, 6, 0, 0},  // pattern ^[A-Za-z0-9_.-]+$
+    {kType, 32, 0, 0},  // n260 type
+    {kType, 32, 0, 0},  // n261 type
+    {kType, 32, 0, 0},  // n262 type
+    {kType, 2, 0, 0},  // n263 type
+    {kType, 32, 0, 0},  // n264 type
+    {kType, 32, 0, 0},  // n265 type
+    {kType, 32, 0, 0},  // n266 type
+    {kType, 4, 0, 0},  // n267 type
+    {kRef, 25, 0, 0},  // n268 $ref #/$defs/SectionStructure
+    {kRef, 26, 0, 0},  // n269 $ref #/$defs/SectionVolumeDensity
+    {kRef, 28, 0, 0},  // n270 $ref #/$defs/SectionVolumeOrbital
+    {kRef, 29, 0, 0},  // n271 $ref #/$defs/SectionVolumeSpin
+    {kRef, 30, 0, 0},  // n272 $ref #/$defs/SectionVolumeELF
+    {kRef, 32, 0, 0},  // n273 $ref #/$defs/SectionVolumeDifference
+    {kRef, 33, 0, 0},  // n274 $ref #/$defs/SectionVolumePotential
+    {kRef, 34, 0, 0},  // n275 $ref #/$defs/SectionVolumeRDG
+    {kRef, 31, 0, 0},  // n276 $ref #/$defs/SectionVolumeGeneric
+    {kRef, 35, 0, 0},  // n277 $ref #/$defs/SectionVolumeLaplacian
+    {kRef, 36, 0, 0},  // n278 $ref #/$defs/SectionVolumeVector
+    {kRef, 37, 0, 0},  // n279 $ref #/$defs/SectionVolumeComplex
+    {kRef, 38, 0, 0},  // n280 $ref #/$defs/SectionVolumeSeries
+    {kRef, 83, 0, 0},  // n281 $ref #/$defs/SectionWavefunctionGTO
+    {kRef, 91, 0, 0},  // n282 $ref #/$defs/SectionWavefunctionBloch
+    {kRef, 44, 0, 0},  // n283 $ref #/$defs/SectionAtomProperties
+    {kRef, 49, 0, 0},  // n284 $ref #/$defs/SectionTrajectory
+    {kRef, 53, 0, 0},  // n285 $ref #/$defs/SectionReactionPath
+    {kRef, 60, 0, 0},  // n286 $ref #/$defs/SectionReactionWaypoints
+    {kRef, 62, 0, 0},  // n287 $ref #/$defs/SectionReactionScheme
+    {kRef, 57, 0, 0},  // n288 $ref #/$defs/SectionScanSurface
+    {kRef, 67, 0, 0},  // n289 $ref #/$defs/SectionVibrations
+    {kRef, 69, 0, 0},  // n290 $ref #/$defs/SectionSpectraIR
+    {kRef, 72, 0, 0},  // n291 $ref #/$defs/SectionSpectraRaman
+    {kRef, 74, 0, 0},  // n292 $ref #/$defs/SectionSpectraUVVis
+    {kRef, 75, 0, 0},  // n293 $ref #/$defs/SectionSpectraECD
+    {kRef, 76, 0, 0},  // n294 $ref #/$defs/SectionSpectraVCD
+    {kRef, 77, 0, 0},  // n295 $ref #/$defs/SectionSpectraNMR
+    {kRef, 79, 0, 0},  // n296 $ref #/$defs/SectionSpectraEPR
+    {kRef, 81, 0, 0},  // n297 $ref #/$defs/SectionSpectraGeneric
+    {kRef, 97, 0, 0},  // n298 $ref #/$defs/SectionBands
+    {kRef, 102, 0, 0},  // n299 $ref #/$defs/SectionDOSTotal
+    {kRef, 103, 0, 0},  // n300 $ref #/$defs/SectionDOSProjected
+    {kRef, 105, 0, 0},  // n301 $ref #/$defs/SectionDOSCOOP
+    {kRef, 106, 0, 0},  // n302 $ref #/$defs/SectionDOSCOHP
+    {kRef, 109, 0, 0},  // n303 $ref #/$defs/SectionStructureSymmetry
+    {kRef, 111, 0, 0},  // n304 $ref #/$defs/SectionBonds
+    {kRef, 113, 0, 0},  // n305 $ref #/$defs/SectionBondOrders
+    {kRef, 115, 0, 0},  // n306 $ref #/$defs/SectionSCFHistory
+    {kRef, 118, 0, 0},  // n307 $ref #/$defs/SectionCitations
+    {kRef, 120, 0, 0},  // n308 $ref #/$defs/SectionRunRecord
+    {kRef, 122, 0, 0},  // n309 $ref #/$defs/SectionJobSpec
+    {kRef, 128, 0, 0},  // n310 $ref #/$defs/SectionBasisAO
+    {kRef, 129, 0, 0},  // n311 $ref #/$defs/SectionEquationOfState
+    {kRef, 131, 0, 0},  // n312 $ref #/$defs/SectionFermiSurface
+    {kRef, 133, 0, 0},  // n313 $ref #/$defs/SectionPhononBands
+    {kRef, 135, 0, 0},  // n314 $ref #/$defs/SectionPhononDOS
+    {kRef, 137, 0, 0},  // n315 $ref #/$defs/SectionTopologyQTAIM
+    {kRef, 139, 0, 0},  // n316 $ref #/$defs/SectionForces
+    {kRef, 144, 0, 0},  // n317 $ref #/$defs/SectionHessian
+    {kRef, 147, 0, 0},  // n318 $ref #/$defs/SectionExcitedStates
+    {kRef, 162, 0, 0},  // n319 $ref #/$defs/SectionVolumeTransitionDensity
+    {kRef, 163, 0, 0},  // n320 $ref #/$defs/SectionPreview
+    {kRef, 148, 0, 0},  // n321 $ref #/$defs/SectionPropertiesElectric
+    {kRef, 153, 0, 0},  // n322 $ref #/$defs/SectionPropertiesElastic
+    {kRef, 154, 0, 0},  // n323 $ref #/$defs/SectionPropertiesDielectric
+    {kRef, 166, 0, 0},  // n324 $ref #/$defs/SectionVendor
+    {kRef, 13, 0, 0},  // n325 $ref #/$defs/BinaryMember
+    {kProperties, 152, 2, 0},  // n326 properties: dtype, shape
+    {kEnum, 131, 2, 0},  // n327 enum
+    {kMinItems, 3, 0, 0},  // n328 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n329 $ref #/$defs/BinaryMember
+    {kProperties, 156, 2, 0},  // n330 properties: dtype, shape
+    {kEnum, 135, 2, 0},  // n331 enum
+    {kMinItems, 4, 0, 0},  // n332 minItems
+    {kMaxItems, 4, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n333 $ref #/$defs/BinaryMember
+    {kProperties, 160, 2, 0},  // n334 properties: dtype, shape
+    {kEnum, 139, 2, 0},  // n335 enum
+    {kMinItems, 4, 0, 0},  // n336 minItems
+    {kMaxItems, 4, 0, 0},  // maxItems
+    {kPrefixItems, 141, 4, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n340 const 3
+    {kRef, 13, 0, 0},  // n341 $ref #/$defs/BinaryMember
+    {kProperties, 164, 2, 0},  // n342 properties: dtype, shape
+    {kEnum, 147, 2, 0},  // n343 enum
+    {kMinItems, 4, 0, 0},  // n344 minItems
+    {kMaxItems, 4, 0, 0},  // maxItems
+    {kPrefixItems, 149, 4, 0},  // prefixItems
+    {kConst, 47, 0, 0},  // n348 const 2
+    {kType, 32, 0, 0},  // n349 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kMaxLength, 3, 0, 0},  // maxLength
+    {kRef, 5, 0, 0},  // n350 $ref #/$defs/Vec3
+    {kType, 64, 0, 0},  // n351 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n352 type
+    {kRef, 5, 0, 0},  // n353 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n354 type
+    {kItems, 355, 0, 0},  // items
+    {kRef, 20, 0, 0},  // n355 $ref #/$defs/StructureAtom
+    {kType, 8, 0, 0},  // n356 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 357, 0, 0},  // items
+    {kType, 2, 0, 0},  // n357 type
+    {kOneOf, 159, 2, 0},  // n358 oneOf
+    {kRef, 21, 0, 0},  // n359 $ref #/$defs/Lattice3x3
+    {kType, 1, 0, 0},  // n360 type
+    {kType, 64, 0, 0},  // n361 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 1, 0, 0},  // maximum
+    {kIf, 363, 365, -1},  // n362 if
+    {kRequired, 161, 1, 0},  // n363 required: lattice_vectors
+    {kProperties, 184, 1, 0},  // properties: lattice_vectors
+    {kType, 8, 0, 0},  // n364 type
+    {kRequired, 162, 1, 0},  // n365 required: pbc
+    {kIf, 367, 370, -1},  // n366 if
+    {kRequired, 163, 1, 0},  // n367 required: pbc
+    {kProperties, 186, 1, 0},  // properties: pbc
+    {kContains, 369, 1, -1},  // n368 contains
+    {kConst, 48, 0, 0},  // n369 const true
+    {kRequired, 164, 1, 0},  // n370 required: lattice_vectors
+    {kProperties, 188, 1, 0},  // properties: lattice_vectors
+    {kType, 8, 0, 0},  // n371 type
+    {kIf, 373, 375, -1},  // n372 if
+    {kRequired, 165, 1, 0},  // n373 required: dimensionality
+    {kProperties, 190, 1, 0},  // properties: dimensionality
+    {kConst, 49, 0, 0},  // n374 const 0
+    {kProperties, 192, 1, 0},  // n375 properties: pbc
+    {kNot, 377, 0, 0},  // n376 not
+    {kContains, 378, 1, -1},  // n377 contains
+    {kConst, 48, 0, 0},  // n378 const true
+    {kIf, 380, 382, -1},  // n379 if
+    {kRequired, 166, 1, 0},  // n380 required: dimensionality
+    {kProperties, 194, 1, 0},  // properties: dimensionality
+    {kConst, 0, 0, 0},  // n381 const 1
+    {kRequired, 167, 1, 0},  // n382 required: pbc
+    {kProperties, 196, 1, 0},  // properties: pbc
+    {kContains, 384, 1, 1},  // n383 contains
+    {kConst, 48, 0, 0},  // n384 const true
+    {kIf, 386, 388, -1},  // n385 if
+    {kRequired, 168, 1, 0},  // n386 required: dimensionality
+    {kProperties, 198, 1, 0},  // properties: dimensionality
+    {kConst, 47, 0, 0},  // n387 const 2
+    {kRequired, 169, 1, 0},  // n388 required: pbc
+    {kProperties, 200, 1, 0},  // properties: pbc
+    {kContains, 390, 2, 2},  // n389 contains
+    {kConst, 48, 0, 0},  // n390 const true
+    {kIf, 392, 394, -1},  // n391 if
+    {kRequired, 170, 1, 0},  // n392 required: dimensionality
+    {kProperties, 202, 1, 0},  // properties: dimensionality
+    {kConst, 46, 0, 0},  // n393 const 3
+    {kRequired, 171, 1, 0},  // n394 required: pbc
+    {kProperties, 204, 1, 0},  // properties: pbc
+    {kContains, 396, 3, 3},  // n395 contains
+    {kConst, 48, 0, 0},  // n396 const true
+    {kType, 32, 0, 0},  // n397 type
+    {kType, 64, 0, 0},  // n398 type
+    {kType, 32, 0, 0},  // n399 type
+    {kType, 8, 0, 0},  // n400 type
+    {kItems, 401, 0, 0},  // items
+    {kType, 64, 0, 0},  // n401 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kEnum, 186, 3, 0},  // n402 enum
+    {kType, 32, 0, 0},  // n403 type
+    {kType, 64, 0, 0},  // n404 type
+    {kType, 64, 0, 0},  // n405 type
+    {kConst, 53, 0, 0},  // n406 const "structure"
+    {kType, 4, 0, 0},  // n407 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 189, 1, 0},  // required: structure
+    {kProperties, 222, 2, 0},  // properties: structure, bonds
+    {kRef, 14, 0, 0},  // n408 $ref #/$defs/JsonMember
+    {kRef, 14, 0, 0},  // n409 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n410 type
+    {kItems, 411, 0, 0},  // items
+    {kType, 32, 0, 0},  // n411 type
+    {kType, 8, 0, 0},  // n412 type
+    {kItems, 413, 0, 0},  // items
+    {kRef, 23, 0, 0},  // n413 $ref #/$defs/BiomoleculeResidue
+    {kType, 8, 0, 0},  // n414 type
+    {kItems, 415, 0, 0},  // items
+    {kRef, 24, 0, 0},  // n415 $ref #/$defs/BiomoleculeSecondaryStructure
+    {kType, 8, 0, 0},  // n416 type
+    {kItems, 417, 0, 0},  // items
+    {kType, 16, 0, 0},  // n417 type
+    {kType, 64, 0, 0},  // n418 type
+    {kType, 64, 0, 0},  // n419 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n420 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n421 type
+    {kPattern, 7, 0, 0},  // pattern ^\S+$
+    {kType, 32, 0, 0},  // n422 type
+    {kPattern, 8, 0, 0},  // pattern ^InChI=\S+$
+    {kType, 32, 0, 0},  // n423 type
+    {kPattern, 9, 0, 0},  // pattern ^[A-Z]{14}-[A-Z]{10}-[A-Z]$
+    {kConst, 54, 0, 0},  // n424 const "volume.density"
+    {kType, 4, 0, 0},  // n425 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 190, 2, 0},  // required: grid, data
+    {kProperties, 250, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n426 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n427 $ref #/$defs/Volume3DBinary
+    {kRef, 5, 0, 0},  // n429 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n430 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 431, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n431 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n432 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 433, 0, 0},  // items
+    {kType, 64, 0, 0},  // n433 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n434 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 435, 0, 0},  // items
+    {kType, 2, 0, 0},  // n435 type
+    {kType, 2, 0, 0},  // n436 type
+    {kType, 32, 0, 0},  // n437 type
+    {kType, 4, 0, 0},  // n438 type
+    {kAdditionalProperties, 439, 0, 0},  // additionalProperties
+    {kProperties, 260, 2, 0},  // properties: origin, voxel_vectors
+    {kRef, 2, 0, 0},  // n439 $ref #/$defs/UnitName
+    {kConst, 7, 0, 0},  // n440 const "bohr"
+    {kConst, 7, 0, 0},  // n441 const "bohr"
+    {kConst, 55, 0, 0},  // n442 const "volume.orbital"
+    {kType, 4, 0, 0},  // n443 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 195, 2, 0},  // required: grid, data
+    {kProperties, 278, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n444 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n445 $ref #/$defs/Volume3DBinary
+    {kConst, 56, 0, 0},  // n446 const "volume.spin"
+    {kType, 4, 0, 0},  // n447 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 197, 2, 0},  // required: grid, data
+    {kProperties, 286, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n448 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n449 $ref #/$defs/Volume3DBinary
+    {kConst, 57, 0, 0},  // n450 const "volume.elf"
+    {kType, 4, 0, 0},  // n451 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 199, 2, 0},  // required: grid, data
+    {kProperties, 294, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n452 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n453 $ref #/$defs/Volume3DBinary
+    {kConst, 58, 0, 0},  // n454 const "volume.generic"
+    {kType, 4, 0, 0},  // n455 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 201, 2, 0},  // required: grid, data
+    {kProperties, 302, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n456 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n457 $ref #/$defs/Volume3DBinary
+    {kConst, 59, 0, 0},  // n458 const "volume.difference"
+    {kType, 32, 0, 0},  // n459 type
+    {kType, 32, 0, 0},  // n460 type
+    {kType, 32, 0, 0},  // n461 type
+    {kType, 4, 0, 0},  // n462 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 203, 2, 0},  // required: grid, data
+    {kProperties, 310, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n463 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n464 $ref #/$defs/Volume3DBinary
+    {kConst, 60, 0, 0},  // n465 const "volume.potential"
+    {kType, 4, 0, 0},  // n466 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 207, 2, 0},  // required: grid, data
+    {kProperties, 324, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n467 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n468 $ref #/$defs/Volume3DBinary
+    {kConst, 61, 0, 0},  // n469 const "volume.rdg"
+    {kType, 4, 0, 0},  // n470 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 209, 2, 0},  // required: grid, data
+    {kProperties, 332, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n471 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n472 $ref #/$defs/Volume3DBinary
+    {kConst, 62, 0, 0},  // n473 const "volume.laplacian"
+    {kType, 4, 0, 0},  // n474 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 211, 2, 0},  // required: grid, data
+    {kProperties, 340, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n475 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n476 $ref #/$defs/Volume3DBinary
+    {kConst, 63, 0, 0},  // n477 const "volume.vector"
+    {kType, 4, 0, 0},  // n478 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 213, 2, 0},  // required: grid, data
+    {kProperties, 348, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n479 $ref #/$defs/JsonMember
+    {kRef, 18, 0, 0},  // n480 $ref #/$defs/Volume4DVectorBinary
+    {kConst, 64, 0, 0},  // n481 const "volume.complex"
+    {kType, 4, 0, 0},  // n482 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 215, 2, 0},  // required: grid, data
+    {kProperties, 356, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n483 $ref #/$defs/JsonMember
+    {kRef, 19, 0, 0},  // n484 $ref #/$defs/Volume4DComplexBinary
+    {kConst, 65, 0, 0},  // n485 const "volume.series"
+    {kType, 4, 0, 0},  // n486 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 217, 3, 0},  // required: grid, data, axis
+    {kProperties, 364, 3, 0},  // properties: grid, data, axis
+    {kRef, 14, 0, 0},  // n487 $ref #/$defs/JsonMember
+    {kRef, 17, 0, 0},  // n488 $ref #/$defs/Volume4DBinary
+    {kRef, 14, 0, 0},  // n489 $ref #/$defs/JsonMember
+    {kEnum, 222, 4, 0},  // n491 enum
+    {kType, 8, 0, 0},  // n492 type
+    {kItems, 493, 0, 0},  // items
+    {kType, 16, 0, 0},  // n493 type
+    {kRef, 2, 0, 0},  // n494 $ref #/$defs/UnitName
+    {kType, 8, 0, 0},  // n495 type
+    {kItems, 496, 0, 0},  // items
+    {kType, 32, 0, 0},  // n496 type
+    {kType, 32, 0, 0},  // n497 type
+    {kIf, 499, 501, -1},  // n498 if
+    {kRequired, 226, 1, 0},  // n499 required: kind
+    {kProperties, 386, 1, 0},  // properties: kind
+    {kConst, 67, 0, 0},  // n500 const "frame"
+    {kProperties, 388, 1, 0},  // n501 properties: values
+    {kItems, 503, 0, 0},  // n502 items
+    {kType, 64, 0, 0},  // n503 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 13, 0, 0},  // n504 $ref #/$defs/BinaryMember
+    {kProperties, 390, 2, 0},  // n505 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n506 const "float64"
+    {kMinItems, 1, 0, 0},  // n507 minItems
+    {kMaxItems, 1, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n508 $ref #/$defs/BinaryMember
+    {kProperties, 394, 2, 0},  // n509 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n510 const "float64"
+    {kMinItems, 2, 0, 0},  // n511 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 230, 2, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n513 const 3
+    {kRef, 2, 0, 0},  // n515 $ref #/$defs/UnitName
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n516 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kEnum, 237, 2, 0},  // n517 enum
+    {kRef, 42, 0, 0},  // n518 $ref #/$defs/AtomPropertyMetaEntry
+    {kConst, 72, 0, 0},  // n520 const "atom_properties"
+    {kType, 4, 0, 0},  // n521 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kMinProperties, 1, 0, 0},  // minProperties
+    {kNot, 522, 0, 0},  // not
+    {kIf, 523, 526, -1},  // if
+    {kProperties, 412, 25, 0},  // properties: mulliken_charge, loewdin_charge, hirshfeld_charge, iao_charg...
+    {kPatternProperties, 462, 1, 0},  // patternProperties
+    {kRequired, 239, 1, 0},  // n522 required: meta
+    {kMaxProperties, 1, 0, 0},  // maxProperties
+    {kNot, 524, 0, 0},  // n523 not
+    {kPatternProperties, 410, 1, 0},  // n524 patternProperties
+    {kFalse, 0, 0, 0},  // n525 false
+    {kRequired, 240, 1, 0},  // n526 required: meta
+    {kRef, 40, 0, 0},  // n527 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n528 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n529 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n530 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n531 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n532 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n533 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n534 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n535 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n536 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n537 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n538 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n539 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n540 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n541 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n542 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n543 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n544 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n545 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n546 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n547 $ref #/$defs/AtomChargeBinary
+    {kRef, 40, 0, 0},  // n548 $ref #/$defs/AtomChargeBinary
+    {kRef, 41, 0, 0},  // n549 $ref #/$defs/AtomVectorBinary
+    {kRef, 41, 0, 0},  // n550 $ref #/$defs/AtomVectorBinary
+    {kRef, 14, 0, 0},  // n551 $ref #/$defs/JsonMember
+    {kAnyOf, 241, 2, 0},  // n552 anyOf
+    {kRef, 40, 0, 0},  // n553 $ref #/$defs/AtomChargeBinary
+    {kRef, 41, 0, 0},  // n554 $ref #/$defs/AtomVectorBinary
+    {kRef, 13, 0, 0},  // n555 $ref #/$defs/BinaryMember
+    {kProperties, 468, 2, 0},  // n556 properties: dtype, shape
+    {kEnum, 243, 2, 0},  // n557 enum
+    {kMinItems, 3, 0, 0},  // n558 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n559 $ref #/$defs/BinaryMember
+    {kProperties, 472, 2, 0},  // n560 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n561 const "float64"
+    {kMinItems, 3, 0, 0},  // n562 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kPrefixItems, 247, 3, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n565 const 3
+    {kRef, 13, 0, 0},  // n566 $ref #/$defs/BinaryMember
+    {kProperties, 476, 2, 0},  // n567 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n568 const "float64"
+    {kMinItems, 1, 0, 0},  // n569 minItems
+    {kMaxItems, 1, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n570 $ref #/$defs/BinaryMember
+    {kProperties, 480, 2, 0},  // n571 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n572 const "float64"
+    {kOneOf, 259, 2, 0},  // n573 oneOf
+    {kType, 8, 0, 0},  // n574 type
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 254, 2, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n575 const 3
+    {kConst, 46, 0, 0},  // n576 const 3
+    {kType, 8, 0, 0},  // n577 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kPrefixItems, 256, 3, 0},  // prefixItems
+    {kType, 64, 0, 0},  // n578 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kConst, 46, 0, 0},  // n579 const 3
+    {kConst, 46, 0, 0},  // n580 const 3
+    {kConst, 73, 0, 0},  // n581 const "trajectory"
+    {kType, 4, 0, 0},  // n582 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 263, 2, 0},  // required: metadata, coords
+    {kProperties, 484, 9, 0},  // properties: metadata, coords, lattice, velocities, gradient, times, ener...
+    {kRef, 14, 0, 0},  // n583 $ref #/$defs/JsonMember
+    {kRef, 45, 0, 0},  // n584 $ref #/$defs/TrajectoryCoords
+    {kRef, 48, 0, 0},  // n585 $ref #/$defs/TrajectoryLattice
+    {kRef, 46, 0, 0},  // n586 $ref #/$defs/TrajectoryFrameVectors
+    {kRef, 46, 0, 0},  // n587 $ref #/$defs/TrajectoryFrameVectors
+    {kRef, 47, 0, 0},  // n588 $ref #/$defs/TrajectoryFrameScalars
+    {kRef, 47, 0, 0},  // n589 $ref #/$defs/TrajectoryFrameScalars
+    {kRef, 47, 0, 0},  // n590 $ref #/$defs/TrajectoryFrameScalars
+    {kRef, 47, 0, 0},  // n591 $ref #/$defs/TrajectoryFrameScalars
+    {kType, 32, 0, 0},  // n592 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kMaxLength, 3, 0, 0},  // maxLength
+    {kType, 64, 0, 0},  // n593 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRequired, 267, 1, 0},  // n594 required: symbols
+    {kRequired, 268, 1, 0},  // n595 required: atomic_numbers
+    {kRequired, 269, 1, 0},  // n596 required: atoms
+    {kType, 8, 0, 0},  // n597 type
+    {kItems, 598, 0, 0},  // items
+    {kType, 32, 0, 0},  // n598 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kMaxLength, 3, 0, 0},  // maxLength
+    {kType, 8, 0, 0},  // n599 type
+    {kItems, 600, 0, 0},  // items
+    {kType, 64, 0, 0},  // n600 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n601 type
+    {kItems, 602, 0, 0},  // items
+    {kRef, 50, 0, 0},  // n602 $ref #/$defs/TrajectoryAtom
+    {kType, 64, 0, 0},  // n603 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n604 type
+    {kItems, 605, 0, 0},  // items
+    {kType, 16, 0, 0},  // n605 type
+    {kEnum, 273, 6, 0},  // n606 enum
+    {kType, 8, 0, 0},  // n607 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 608, 0, 0},  // items
+    {kType, 2, 0, 0},  // n608 type
+    {kEnum, 279, 5, 0},  // n609 enum
+    {kType, 16, 0, 0},  // n610 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kEnum, 284, 2, 0},  // n611 enum
+    {kType, 4, 0, 0},  // n612 type
+    {kAdditionalProperties, 613, 0, 0},  // additionalProperties
+    {kProperties, 510, 4, 0},  // properties: energies, coords, times, timestep_fs
+    {kRef, 2, 0, 0},  // n613 $ref #/$defs/UnitName
+    {kConst, 8, 0, 0},  // n614 const "hartree"
+    {kConst, 6, 0, 0},  // n615 const "angstrom"
+    {kConst, 22, 0, 0},  // n616 const "fs"
+    {kConst, 22, 0, 0},  // n617 const "fs"
+    {kRef, 51, 0, 0},  // n618 $ref #/$defs/TrajectoryMetadataCommon
+    {kType, 4, 0, 0},  // n619 type
+    {kAdditionalProperties, 620, 0, 0},  // additionalProperties
+    {kProperties, 540, 3, 0},  // properties: lattice, cell_volumes, temperatures
+    {kRef, 2, 0, 0},  // n620 $ref #/$defs/UnitName
+    {kConst, 6, 0, 0},  // n621 const "angstrom"
+    {kConst, 19, 0, 0},  // n622 const "a3"
+    {kConst, 24, 0, 0},  // n623 const "kelvin"
+    {kConst, 83, 0, 0},  // n624 const "reaction.path"
+    {kType, 4, 0, 0},  // n625 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 287, 2, 0},  // required: metadata, coords
+    {kProperties, 548, 9, 0},  // properties: metadata, coords, frame_volumes, volume_grid, lattice, veloc...
+    {kRef, 14, 0, 0},  // n626 $ref #/$defs/JsonMember
+    {kRef, 45, 0, 0},  // n627 $ref #/$defs/TrajectoryCoords
+    {kRef, 17, 0, 0},  // n628 $ref #/$defs/Volume4DBinary
+    {kRef, 14, 0, 0},  // n629 $ref #/$defs/JsonMember
+    {kRef, 56, 0, 0},  // n630 $ref #/$defs/ReactionPathLattice
+    {kRef, 46, 0, 0},  // n631 $ref #/$defs/TrajectoryFrameVectors
+    {kRef, 46, 0, 0},  // n632 $ref #/$defs/TrajectoryFrameVectors
+    {kRef, 47, 0, 0},  // n633 $ref #/$defs/TrajectoryFrameScalars
+    {kRef, 47, 0, 0},  // n634 $ref #/$defs/TrajectoryFrameScalars
+    {kType, 64, 0, 0},  // n636 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n637 type
+    {kEnum, 292, 5, 0},  // n638 enum
+    {kType, 16, 0, 0},  // n639 type
+    {kRef, 51, 0, 0},  // n640 $ref #/$defs/TrajectoryMetadataCommon
+    {kType, 8, 0, 0},  // n641 type
+    {kItems, 642, 0, 0},  // items
+    {kRef, 54, 0, 0},  // n642 $ref #/$defs/ReactionWaypoint
+    {kType, 8, 0, 0},  // n643 type
+    {kItems, 644, 0, 0},  // items
+    {kType, 16, 0, 0},  // n644 type
+    {kType, 32, 0, 0},  // n645 type
+    {kType, 32, 0, 0},  // n646 type
+    {kType, 64, 0, 0},  // n647 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 1, 0, 0},  // maximum
+    {kType, 8, 0, 0},  // n648 type
+    {kItems, 649, 0, 0},  // items
+    {kType, 64, 0, 0},  // n649 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 1, 0, 0},  // maximum
+    {kType, 8, 0, 0},  // n650 type
+    {kItems, 651, 0, 0},  // items
+    {kType, 64, 0, 0},  // n651 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n652 type
+    {kType, 16, 0, 0},  // n653 type
+    {kType, 4, 0, 0},  // n654 type
+    {kProperties, 580, 1, 0},  // properties: lattice
+    {kConst, 7, 0, 0},  // n655 const "bohr"
+    {kRef, 13, 0, 0},  // n656 $ref #/$defs/BinaryMember
+    {kProperties, 602, 2, 0},  // n657 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n658 const "float64"
+    {kOneOf, 303, 2, 0},  // n659 oneOf
+    {kType, 8, 0, 0},  // n660 type
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 298, 2, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n661 const 3
+    {kConst, 46, 0, 0},  // n662 const 3
+    {kType, 8, 0, 0},  // n663 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kPrefixItems, 300, 3, 0},  // prefixItems
+    {kType, 64, 0, 0},  // n664 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kConst, 46, 0, 0},  // n665 const 3
+    {kConst, 46, 0, 0},  // n666 const 3
+    {kConst, 89, 0, 0},  // n667 const "scan.surface"
+    {kType, 4, 0, 0},  // n668 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 307, 4, 0},  // required: metadata, axis_a, axis_b, energies
+    {kProperties, 606, 5, 0},  // properties: metadata, axis_a, axis_b, energies, geometries
+    {kRef, 14, 0, 0},  // n669 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n670 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n671 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n672 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n673 $ref #/$defs/BinaryMember
+    {kType, 32, 0, 0},  // n674 type
+    {kType, 32, 0, 0},  // n675 type
+    {kType, 8, 0, 0},  // n676 type
+    {kItems, 677, 0, 0},  // items
+    {kType, 64, 0, 0},  // n677 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 58, 0, 0},  // n678 $ref #/$defs/ScanSurfaceAxis
+    {kRef, 58, 0, 0},  // n679 $ref #/$defs/ScanSurfaceAxis
+    {kType, 32, 0, 0},  // n680 type
+    {kType, 32, 0, 0},  // n681 type
+    {kType, 32, 0, 0},  // n682 type
+    {kType, 32, 0, 0},  // n683 type
+    {kType, 32, 0, 0},  // n684 type
+    {kType, 32, 0, 0},  // n685 type
+    {kType, 8, 0, 0},  // n686 type
+    {kItems, 687, 0, 0},  // items
+    {kRef, 50, 0, 0},  // n687 $ref #/$defs/TrajectoryAtom
+    {kType, 32, 0, 0},  // n688 type
+    {kType, 4, 0, 0},  // n689 type
+    {kAdditionalProperties, 690, 0, 0},  // additionalProperties
+    {kRef, 2, 0, 0},  // n690 $ref #/$defs/UnitName
+    {kConst, 90, 0, 0},  // n691 const "reaction.waypoints"
+    {kType, 32, 0, 0},  // n692 type
+    {kType, 4, 0, 0},  // n693 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 312, 1, 0},  // required: waypoints
+    {kProperties, 648, 1, 0},  // properties: waypoints
+    {kRef, 14, 0, 0},  // n694 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n696 type
+    {kItems, 697, 0, 0},  // items
+    {kRef, 54, 0, 0},  // n697 $ref #/$defs/ReactionWaypoint
+    {kType, 8, 0, 0},  // n698 type
+    {kItems, 699, 0, 0},  // items
+    {kType, 16, 0, 0},  // n699 type
+    {kConst, 91, 0, 0},  // n700 const "reaction.scheme"
+    {kType, 4, 0, 0},  // n701 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 318, 1, 0},  // required: scheme
+    {kProperties, 662, 1, 0},  // properties: scheme
+    {kRef, 14, 0, 0},  // n702 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n704 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 705, 0, 0},  // items
+    {kRef, 64, 0, 0},  // n705 $ref #/$defs/ReactionStep
+    {kType, 32, 0, 0},  // n707 type
+    {kPattern, 6, 0, 0},  // pattern ^[A-Za-z0-9_.-]+$
+    {kType, 32, 0, 0},  // n708 type
+    {kType, 8, 0, 0},  // n709 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 710, 0, 0},  // items
+    {kRef, 65, 0, 0},  // n710 $ref #/$defs/ReactionParticipant
+    {kType, 8, 0, 0},  // n711 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 712, 0, 0},  // items
+    {kRef, 65, 0, 0},  // n712 $ref #/$defs/ReactionParticipant
+    {kType, 8, 0, 0},  // n713 type
+    {kItems, 714, 0, 0},  // items
+    {kRef, 65, 0, 0},  // n714 $ref #/$defs/ReactionParticipant
+    {kEnum, 326, 4, 0},  // n715 enum
+    {kType, 8, 0, 0},  // n716 type
+    {kItems, 717, 0, 0},  // items
+    {kType, 32, 0, 0},  // n717 type
+    {kType, 16, 0, 0},  // n718 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 4, 0, 0},  // maximum
+    {kType, 32, 0, 0},  // n719 type
+    {kType, 32, 0, 0},  // n721 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 16, 0, 0},  // n722 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kRef, 13, 0, 0},  // n723 $ref #/$defs/BinaryMember
+    {kProperties, 698, 2, 0},  // n724 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n725 const "float64"
+    {kMinItems, 3, 0, 0},  // n726 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kConst, 96, 0, 0},  // n727 const "vibrations"
+    {kType, 32, 0, 0},  // n728 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 4, 0, 0},  // n729 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 333, 2, 0},  // required: metadata, displacements
+    {kProperties, 702, 2, 0},  // properties: metadata, displacements
+    {kRef, 14, 0, 0},  // n730 $ref #/$defs/JsonMember
+    {kRef, 66, 0, 0},  // n731 $ref #/$defs/VibrationsDisplacements
+    {kType, 8, 0, 0},  // n732 type
+    {kItems, 733, 0, 0},  // items
+    {kType, 16, 0, 0},  // n733 type
+    {kType, 8, 0, 0},  // n734 type
+    {kItems, 735, 0, 0},  // items
+    {kType, 16, 0, 0},  // n735 type
+    {kType, 8, 0, 0},  // n736 type
+    {kItems, 737, 0, 0},  // items
+    {kType, 16, 0, 0},  // n737 type
+    {kType, 8, 0, 0},  // n738 type
+    {kItems, 739, 0, 0},  // items
+    {kType, 16, 0, 0},  // n739 type
+    {kType, 8, 0, 0},  // n740 type
+    {kItems, 741, 0, 0},  // items
+    {kType, 16, 0, 0},  // n741 type
+    {kType, 8, 0, 0},  // n742 type
+    {kItems, 743, 0, 0},  // items
+    {kType, 32, 0, 0},  // n743 type
+    {kType, 8, 0, 0},  // n744 type
+    {kItems, 745, 0, 0},  // items
+    {kType, 2, 0, 0},  // n745 type
+    {kType, 64, 0, 0},  // n746 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n747 type
+    {kItems, 748, 0, 0},  // items
+    {kType, 32, 0, 0},  // n748 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kMaxLength, 3, 0, 0},  // maxLength
+    {kType, 8, 0, 0},  // n749 type
+    {kItems, 750, 0, 0},  // items
+    {kRef, 20, 0, 0},  // n750 $ref #/$defs/StructureAtom
+    {kConst, 97, 0, 0},  // n751 const "spectra.ir"
+    {kType, 4, 0, 0},  // n752 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 336, 1, 0},  // required: spectrum
+    {kProperties, 732, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n753 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n754 type
+    {kItems, 755, 0, 0},  // items
+    {kType, 16, 0, 0},  // n755 type
+    {kType, 8, 0, 0},  // n756 type
+    {kItems, 757, 0, 0},  // items
+    {kType, 16, 0, 0},  // n757 type
+    {kType, 8, 0, 0},  // n758 type
+    {kItems, 759, 0, 0},  // items
+    {kType, 16, 0, 0},  // n759 type
+    {kRef, 2, 0, 0},  // n760 $ref #/$defs/UnitName
+    {kRef, 2, 0, 0},  // n761 $ref #/$defs/UnitName
+    {kType, 8, 0, 0},  // n762 type
+    {kItems, 763, 0, 0},  // items
+    {kRef, 71, 0, 0},  // n763 $ref #/$defs/SpectrumPeak
+    {kType, 4, 0, 0},  // n764 type
+    {kRequired, 339, 1, 0},  // required: type
+    {kProperties, 738, 3, 0},  // properties: type, fwhm, units
+    {kEnum, 340, 3, 0},  // n765 enum
+    {kType, 16, 0, 0},  // n766 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kRef, 2, 0, 0},  // n767 $ref #/$defs/UnitName
+    {kType, 16, 0, 0},  // n768 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 4, 0, 0},  // n769 type
+    {kProperties, 744, 2, 0},  // properties: laser_nm, depolarization_ratios
+    {kType, 16, 0, 0},  // n770 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 8, 0, 0},  // n771 type
+    {kItems, 772, 0, 0},  // items
+    {kType, 16, 0, 0},  // n772 type
+    {kType, 4, 0, 0},  // n773 type
+    {kProperties, 748, 1, 0},  // properties: x_axis
+    {kEnum, 343, 2, 0},  // n774 enum
+    {kType, 32, 0, 0},  // n775 type
+    {kType, 16, 0, 0},  // n776 type
+    {kType, 16, 0, 0},  // n777 type
+    {kType, 16, 0, 0},  // n778 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n779 type
+    {kType, 4, 0, 0},  // n780 type
+    {kProperties, 772, 2, 0},  // properties: mode_index, state_index
+    {kType, 64, 0, 0},  // n781 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n782 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kConst, 103, 0, 0},  // n783 const "spectra.raman"
+    {kType, 4, 0, 0},  // n784 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 346, 1, 0},  // required: spectrum
+    {kProperties, 786, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n785 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n786 $ref #/$defs/BinaryMember
+    {kProperties, 792, 2, 0},  // n787 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n788 const "float64"
+    {kMinItems, 3, 0, 0},  // n789 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kConst, 104, 0, 0},  // n790 const "spectra.uvvis"
+    {kType, 4, 0, 0},  // n791 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 349, 1, 0},  // required: spectrum
+    {kProperties, 796, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n792 $ref #/$defs/JsonMember
+    {kConst, 105, 0, 0},  // n793 const "spectra.ecd"
+    {kType, 4, 0, 0},  // n794 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 350, 1, 0},  // required: spectrum
+    {kProperties, 802, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n795 $ref #/$defs/JsonMember
+    {kConst, 106, 0, 0},  // n796 const "spectra.vcd"
+    {kType, 4, 0, 0},  // n797 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 351, 1, 0},  // required: spectrum
+    {kProperties, 808, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n798 $ref #/$defs/JsonMember
+    {kConst, 107, 0, 0},  // n799 const "spectra.nmr"
+    {kType, 4, 0, 0},  // n800 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 352, 1, 0},  // required: spectrum
+    {kProperties, 814, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n801 $ref #/$defs/JsonMember
+    {kType, 32, 0, 0},  // n802 type
+    {kType, 32, 0, 0},  // n803 type
+    {kType, 32, 0, 0},  // n804 type
+    {kType, 8, 0, 0},  // n805 type
+    {kItems, 806, 0, 0},  // items
+    {kType, 4, 0, 0},  // n806 type
+    {kRequired, 353, 2, 0},  // required: atom_index, isotropic_shift_ppm
+    {kProperties, 820, 5, 0},  // properties: atom_index, symbol, isotropic_shift_ppm, anisotropy_ppm, asy...
+    {kType, 64, 0, 0},  // n807 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n808 type
+    {kType, 16, 0, 0},  // n809 type
+    {kType, 16, 0, 0},  // n810 type
+    {kType, 16, 0, 0},  // n811 type
+    {kType, 8, 0, 0},  // n812 type
+    {kItems, 813, 0, 0},  // items
+    {kType, 4, 0, 0},  // n813 type
+    {kProperties, 830, 3, 0},  // properties: atom_index, tensor, isotropic_ppm
+    {kType, 64, 0, 0},  // n814 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n815 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 816, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n816 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n817 type
+    {kType, 8, 0, 0},  // n818 type
+    {kItems, 819, 0, 0},  // items
+    {kType, 4, 0, 0},  // n819 type
+    {kRequired, 355, 3, 0},  // required: i, j, value_hz
+    {kProperties, 836, 5, 0},  // properties: i, j, value_hz, isotope_i, isotope_j
+    {kType, 64, 0, 0},  // n820 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n821 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n822 type
+    {kType, 32, 0, 0},  // n823 type
+    {kType, 32, 0, 0},  // n824 type
+    {kConst, 108, 0, 0},  // n825 const "spectra.epr"
+    {kType, 4, 0, 0},  // n826 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 358, 1, 0},  // required: spectrum
+    {kProperties, 858, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n827 $ref #/$defs/JsonMember
+    {kType, 4, 0, 0},  // n828 type
+    {kProperties, 864, 3, 0},  // properties: matrix, isotropic, principal
+    {kType, 8, 0, 0},  // n829 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 830, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n830 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n831 type
+    {kRef, 5, 0, 0},  // n832 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n833 type
+    {kItems, 834, 0, 0},  // items
+    {kType, 4, 0, 0},  // n834 type
+    {kRequired, 359, 1, 0},  // required: atom_index
+    {kProperties, 870, 6, 0},  // properties: atom_index, symbol, isotope, a_iso_mhz, a_tensor_mhz, a_prin...
+    {kType, 64, 0, 0},  // n835 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n836 type
+    {kType, 32, 0, 0},  // n837 type
+    {kType, 16, 0, 0},  // n838 type
+    {kType, 8, 0, 0},  // n839 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 840, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n840 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n841 $ref #/$defs/Vec3
+    {kType, 4, 0, 0},  // n842 type
+    {kProperties, 882, 3, 0},  // properties: d_mhz, e_mhz, tensor_mhz
+    {kType, 16, 0, 0},  // n843 type
+    {kType, 16, 0, 0},  // n844 type
+    {kType, 8, 0, 0},  // n845 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 846, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n846 $ref #/$defs/Vec3
+    {kConst, 109, 0, 0},  // n847 const "spectra.generic"
+    {kType, 4, 0, 0},  // n848 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 360, 1, 0},  // required: spectrum
+    {kProperties, 894, 1, 0},  // properties: spectrum
+    {kRef, 14, 0, 0},  // n849 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n850 $ref #/$defs/BinaryMember
+    {kProperties, 900, 2, 0},  // n851 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n852 const "float64"
+    {kMinItems, 2, 0, 0},  // n853 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kConst, 110, 0, 0},  // n854 const "wavefunction.gto"
+    {kType, 4, 0, 0},  // n855 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 363, 2, 0},  // required: basis, mo_metadata
+    {kProperties, 904, 9, 0},  // properties: basis, mo_metadata, mo_coefficients, mo_coefficients_alpha, ...
+    {kOneOf, 373, 2, 0},  // oneOf
+    {kRef, 14, 0, 0},  // n856 $ref #/$defs/JsonMember
+    {kRef, 14, 0, 0},  // n857 $ref #/$defs/JsonMember
+    {kRef, 82, 0, 0},  // n858 $ref #/$defs/MoCoefficientsBinary
+    {kRef, 82, 0, 0},  // n859 $ref #/$defs/MoCoefficientsBinary
+    {kRef, 82, 0, 0},  // n860 $ref #/$defs/MoCoefficientsBinary
+    {kRef, 84, 0, 0},  // n861 $ref #/$defs/WavefunctionAoMatrix
+    {kRef, 84, 0, 0},  // n862 $ref #/$defs/WavefunctionAoMatrix
+    {kRef, 84, 0, 0},  // n863 $ref #/$defs/WavefunctionAoMatrix
+    {kRef, 84, 0, 0},  // n864 $ref #/$defs/WavefunctionAoMatrix
+    {kRequired, 365, 1, 0},  // n865 required: mo_coefficients
+    {kNot, 866, 0, 0},  // not
+    {kAnyOf, 368, 2, 0},  // n866 anyOf
+    {kRequired, 366, 1, 0},  // n867 required: mo_coefficients_alpha
+    {kRequired, 367, 1, 0},  // n868 required: mo_coefficients_beta
+    {kRequired, 370, 2, 0},  // n869 required: mo_coefficients_alpha, mo_coefficients_beta
+    {kNot, 870, 0, 0},  // not
+    {kRequired, 372, 1, 0},  // n870 required: mo_coefficients
+    {kRef, 13, 0, 0},  // n871 $ref #/$defs/BinaryMember
+    {kProperties, 926, 2, 0},  // n872 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n873 const "float64"
+    {kMinItems, 2, 0, 0},  // n874 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n876 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n877 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 5, 0, 0},  // maximum
+    {kType, 8, 0, 0},  // n878 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 879, 0, 0},  // items
+    {kType, 16, 0, 0},  // n879 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 8, 0, 0},  // n880 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 881, 0, 0},  // items
+    {kType, 16, 0, 0},  // n881 type
+    {kType, 2, 0, 0},  // n882 type
+    {kType, 64, 0, 0},  // n884 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n885 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 886, 0, 0},  // items
+    {kType, 16, 0, 0},  // n886 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 8, 0, 0},  // n887 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 888, 0, 0},  // items
+    {kType, 16, 0, 0},  // n888 type
+    {kType, 8, 0, 0},  // n889 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 890, 0, 0},  // items
+    {kType, 64, 0, 0},  // n890 type
+    {kType, 2, 0, 0},  // n891 type
+    {kType, 64, 0, 0},  // n893 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n894 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n895 type
+    {kType, 8, 0, 0},  // n896 type
+    {kItems, 897, 0, 0},  // items
+    {kRef, 86, 0, 0},  // n897 $ref #/$defs/BasisEcpProjector
+    {kType, 32, 0, 0},  // n899 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 2, 0, 0},  // n900 type
+    {kType, 64, 0, 0},  // n901 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n902 type
+    {kItems, 903, 0, 0},  // items
+    {kRef, 85, 0, 0},  // n903 $ref #/$defs/BasisShell
+    {kType, 8, 0, 0},  // n904 type
+    {kItems, 905, 0, 0},  // items
+    {kRef, 87, 0, 0},  // n905 $ref #/$defs/BasisEcpCentre
+    {kType, 64, 0, 0},  // n906 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n908 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n909 type
+    {kItems, 910, 0, 0},  // items
+    {kType, 16, 0, 0},  // n910 type
+    {kType, 8, 0, 0},  // n911 type
+    {kItems, 912, 0, 0},  // items
+    {kType, 16, 0, 0},  // n912 type
+    {kType, 8, 0, 0},  // n913 type
+    {kItems, 914, 0, 0},  // items
+    {kType, 32, 0, 0},  // n914 type
+    {kEnum, 392, 4, 0},  // n916 enum
+    {kEnum, 396, 10, 0},  // n917 enum
+    {kType, 64, 0, 0},  // n918 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n919 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n920 type
+    {kItems, 921, 0, 0},  // items
+    {kType, 16, 0, 0},  // n921 type
+    {kType, 8, 0, 0},  // n922 type
+    {kItems, 923, 0, 0},  // items
+    {kType, 16, 0, 0},  // n923 type
+    {kType, 8, 0, 0},  // n924 type
+    {kItems, 925, 0, 0},  // items
+    {kType, 32, 0, 0},  // n925 type
+    {kRef, 89, 0, 0},  // n926 $ref #/$defs/MoSpinChannel
+    {kRef, 89, 0, 0},  // n927 $ref #/$defs/MoSpinChannel
+    {kEnum, 406, 2, 0},  // n928 enum
+    {kRef, 5, 0, 0},  // n929 $ref #/$defs/Vec3
+    {kType, 2, 0, 0},  // n930 type
+    {kEnum, 408, 2, 0},  // n931 enum
+    {kType, 8, 0, 0},  // n932 type
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 410, 2, 0},  // prefixItems
+    {kConst, 126, 0, 0},  // n933 const "real"
+    {kConst, 128, 0, 0},  // n934 const "imag"
+    {kType, 32, 0, 0},  // n935 type
+    {kType, 64, 0, 0},  // n936 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kEnum, 412, 2, 0},  // n937 enum
+    {kType, 32, 0, 0},  // n938 type
+    {kType, 32, 0, 0},  // n939 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 8, 0, 0},  // n940 type
+    {kItems, 941, 0, 0},  // items
+    {kType, 8, 0, 0},  // n941 type
+    {kItems, 942, 0, 0},  // items
+    {kType, 16, 0, 0},  // n942 type
+    {kType, 8, 0, 0},  // n943 type
+    {kItems, 944, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n944 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n945 type
+    {kItems, 946, 0, 0},  // items
+    {kType, 64, 0, 0},  // n946 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n947 type
+    {kItems, 948, 0, 0},  // items
+    {kType, 16, 0, 0},  // n948 type
+    {kType, 64, 0, 0},  // n949 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n950 type
+    {kIf, 952, 955, -1},  // n951 if
+    {kRequired, 414, 3, 0},  // n952 required: spin, orbital_kind, nto_role
+    {kProperties, 1040, 2, 0},  // properties: spin, orbital_kind
+    {kConst, 112, 0, 0},  // n953 const "unrestricted"
+    {kConst, 118, 0, 0},  // n954 const "nto"
+    {kRequired, 417, 4, 0},  // n955 required: occupation_semantics, state_ref, state_index, nto_role
+    {kProperties, 1044, 1, 0},  // properties: occupation_semantics
+    {kConst, 125, 0, 0},  // n956 const "transition_weight"
+    {kIf, 958, 960, 966},  // n957 if
+    {kRequired, 421, 1, 0},  // n958 required: spin
+    {kProperties, 1046, 1, 0},  // properties: spin
+    {kConst, 112, 0, 0},  // n959 const "unrestricted"
+    {kRequired, 422, 2, 0},  // n960 required: alpha, beta
+    {kNot, 961, 0, 0},  // not
+    {kAnyOf, 428, 4, 0},  // n961 anyOf
+    {kRequired, 424, 1, 0},  // n962 required: n_mo
+    {kRequired, 425, 1, 0},  // n963 required: energies
+    {kRequired, 426, 1, 0},  // n964 required: occupations
+    {kRequired, 427, 1, 0},  // n965 required: symmetry_labels
+    {kRequired, 432, 2, 0},  // n966 required: energies, occupations
+    {kNot, 967, 0, 0},  // not
+    {kAnyOf, 436, 2, 0},  // n967 anyOf
+    {kRequired, 434, 1, 0},  // n968 required: alpha
+    {kRequired, 435, 1, 0},  // n969 required: beta
+    {kIf, 971, 973, -1},  // n970 if
+    {kRequired, 438, 1, 0},  // n971 required: spin
+    {kProperties, 1048, 1, 0},  // properties: spin
+    {kConst, 114, 0, 0},  // n972 const "generalized"
+    {kRequired, 439, 1, 0},  // n973 required: complex
+    {kProperties, 1050, 1, 0},  // properties: complex
+    {kConst, 48, 0, 0},  // n974 const true
+    {kConst, 131, 0, 0},  // n975 const "wavefunction.bloch"
+    {kType, 4, 0, 0},  // n976 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 443, 6, 0},  // required: basis, kpoints, mo_metadata, mo_coefficients, energies, occu...
+    {kProperties, 1052, 6, 0},  // properties: basis, kpoints, mo_metadata, mo_coefficients, energies, occu...
+    {kRef, 14, 0, 0},  // n977 $ref #/$defs/JsonMember
+    {kRef, 14, 0, 0},  // n978 $ref #/$defs/JsonMember
+    {kRef, 14, 0, 0},  // n979 $ref #/$defs/JsonMember
+    {kRef, 92, 0, 0},  // n980 $ref #/$defs/BlochMoCoefficients
+    {kRef, 93, 0, 0},  // n981 $ref #/$defs/BlochEnergies
+    {kRef, 94, 0, 0},  // n982 $ref #/$defs/BlochOccupations
+    {kRef, 13, 0, 0},  // n983 $ref #/$defs/BinaryMember
+    {kProperties, 1068, 2, 0},  // n984 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n985 const "float64"
+    {kMinItems, 5, 0, 0},  // n986 minItems
+    {kMaxItems, 5, 0, 0},  // maxItems
+    {kPrefixItems, 452, 5, 0},  // prefixItems
+    {kMinimum, 2, 0, 0},  // n988 minimum
+    {kMaximum, 6, 0, 0},  // maximum
+    {kConst, 47, 0, 0},  // n991 const 2
+    {kRef, 13, 0, 0},  // n992 $ref #/$defs/BinaryMember
+    {kProperties, 1072, 2, 0},  // n993 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n994 const "float64"
+    {kMinItems, 3, 0, 0},  // n995 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n996 $ref #/$defs/BinaryMember
+    {kProperties, 1076, 2, 0},  // n997 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n998 const "float64"
+    {kMinItems, 3, 0, 0},  // n999 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kType, 8, 0, 0},  // n1001 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 1002, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1002 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1003 type
+    {kItems, 1004, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1004 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1005 type
+    {kItems, 1006, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1006 type
+    {kType, 8, 0, 0},  // n1007 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1008, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1008 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kRef, 5, 0, 0},  // n1009 $ref #/$defs/Vec3
+    {kType, 2, 0, 0},  // n1010 type
+    {kType, 4, 0, 0},  // n1011 type
+    {kAdditionalProperties, 1012, 0, 0},  // additionalProperties
+    {kProperties, 1082, 3, 0},  // properties: kpoints, weights, shift
+    {kRef, 2, 0, 0},  // n1012 $ref #/$defs/UnitName
+    {kConst, 30, 0, 0},  // n1013 const "dimensionless"
+    {kConst, 30, 0, 0},  // n1014 const "dimensionless"
+    {kConst, 30, 0, 0},  // n1015 const "dimensionless"
+    {kEnum, 470, 2, 0},  // n1017 enum
+    {kType, 64, 0, 0},  // n1018 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 6, 0, 0},  // maximum
+    {kType, 64, 0, 0},  // n1019 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1020 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kEnum, 472, 10, 0},  // n1021 enum
+    {kConst, 48, 0, 0},  // n1022 const true
+    {kEnum, 482, 1, 0},  // n1023 enum
+    {kType, 8, 0, 0},  // n1024 type
+    {kItems, 1025, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1025 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 1, 0, 0},  // n1026 $ref #/$defs/ValueWithUnits
+    {kType, 4, 0, 0},  // n1027 type
+    {kAdditionalProperties, 1028, 0, 0},  // additionalProperties
+    {kProperties, 1104, 1, 0},  // properties: energies
+    {kRef, 2, 0, 0},  // n1028 $ref #/$defs/UnitName
+    {kConst, 8, 0, 0},  // n1029 const "hartree"
+    {kIf, 1031, 1033, -1},  // n1030 if
+    {kRequired, 483, 1, 0},  // n1031 required: spin
+    {kProperties, 1126, 1, 0},  // properties: spin
+    {kConst, 111, 0, 0},  // n1032 const "restricted"
+    {kProperties, 1128, 1, 0},  // n1033 properties: n_spin
+    {kConst, 0, 0, 0},  // n1034 const 1
+    {kIf, 1036, 1038, -1},  // n1035 if
+    {kRequired, 484, 1, 0},  // n1036 required: spin
+    {kProperties, 1130, 1, 0},  // properties: spin
+    {kConst, 112, 0, 0},  // n1037 const "unrestricted"
+    {kProperties, 1132, 1, 0},  // n1038 properties: n_spin
+    {kConst, 47, 0, 0},  // n1039 const 2
+    {kConst, 133, 0, 0},  // n1040 const "bands"
+    {kType, 4, 0, 0},  // n1041 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 487, 2, 0},  // required: kpath, eigenvalues
+    {kProperties, 1134, 4, 0},  // properties: kpath, eigenvalues, projections, occupations
+    {kRef, 14, 0, 0},  // n1042 $ref #/$defs/JsonMember
+    {kRef, 73, 0, 0},  // n1043 $ref #/$defs/BandsEigenvalues
+    {kRef, 98, 0, 0},  // n1044 $ref #/$defs/BandsProjections
+    {kRef, 99, 0, 0},  // n1045 $ref #/$defs/BandsOccupations
+    {kRef, 13, 0, 0},  // n1046 $ref #/$defs/BinaryMember
+    {kProperties, 1146, 2, 0},  // n1047 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1048 const "float64"
+    {kMinItems, 3, 0, 0},  // n1049 minItems
+    {kMaxItems, 4, 0, 0},  // maxItems
+    {kRef, 13, 0, 0},  // n1050 $ref #/$defs/BinaryMember
+    {kProperties, 1150, 2, 0},  // n1051 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1052 const "float64"
+    {kMinItems, 3, 0, 0},  // n1053 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1055 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1056 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1057 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1058 type
+    {kType, 32, 0, 0},  // n1059 type
+    {kRef, 5, 0, 0},  // n1060 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n1061 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1063 type
+    {kItems, 1064, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1064 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1065 type
+    {kItems, 1066, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1066 type
+    {kType, 8, 0, 0},  // n1067 type
+    {kItems, 1068, 0, 0},  // items
+    {kRef, 100, 0, 0},  // n1068 $ref #/$defs/KpathSegment
+    {kType, 16, 0, 0},  // n1069 type
+    {kType, 16, 0, 0},  // n1070 type
+    {kType, 2, 0, 0},  // n1071 type
+    {kType, 64, 0, 0},  // n1072 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 6, 0, 0},  // maximum
+    {kType, 64, 0, 0},  // n1073 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1074 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1075 type
+    {kItems, 1076, 0, 0},  // items
+    {kAnyOf, 493, 2, 0},  // n1076 anyOf
+    {kRef, 107, 0, 0},  // n1077 $ref #/$defs/DosChannel
+    {kType, 32, 0, 0},  // n1078 type
+    {kType, 32, 0, 0},  // n1079 type
+    {kType, 4, 0, 0},  // n1080 type
+    {kAdditionalProperties, 1081, 0, 0},  // additionalProperties
+    {kProperties, 1172, 3, 0},  // properties: fermi, fermi_energy_ev, eigenvalues
+    {kRef, 2, 0, 0},  // n1081 $ref #/$defs/UnitName
+    {kConst, 9, 0, 0},  // n1082 const "ev"
+    {kConst, 9, 0, 0},  // n1083 const "ev"
+    {kConst, 9, 0, 0},  // n1084 const "ev"
+    {kConst, 133, 0, 0},  // n1085 const "bands"
+    {kType, 32, 0, 0},  // n1086 type
+    {kType, 2, 0, 0},  // n1087 type
+    {kConst, 134, 0, 0},  // n1088 const "dos.total"
+    {kType, 4, 0, 0},  // n1089 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 495, 2, 0},  // required: energies, dos
+    {kProperties, 1208, 2, 0},  // properties: energies, dos
+    {kRef, 13, 0, 0},  // n1090 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1091 $ref #/$defs/BinaryMember
+    {kType, 64, 0, 0},  // n1092 type
+    {kEnum, 497, 2, 0},  // enum
+    {kType, 16, 0, 0},  // n1093 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1094 type
+    {kType, 16, 0, 0},  // n1095 type
+    {kType, 16, 0, 0},  // n1096 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kConst, 135, 0, 0},  // n1097 const "dos.projected"
+    {kType, 4, 0, 0},  // n1098 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 499, 2, 0},  // required: energies, projections
+    {kProperties, 1226, 2, 0},  // properties: energies, projections
+    {kRef, 13, 0, 0},  // n1099 $ref #/$defs/BinaryMember
+    {kRef, 104, 0, 0},  // n1100 $ref #/$defs/DOSProjectedProjections
+    {kType, 64, 0, 0},  // n1101 type
+    {kEnum, 501, 2, 0},  // enum
+    {kType, 16, 0, 0},  // n1102 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1103 type
+    {kType, 16, 0, 0},  // n1104 type
+    {kType, 16, 0, 0},  // n1105 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1106 type
+    {kItems, 1107, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1107 type
+    {kProperties, 1230, 5, 0},  // properties: atom, l, m, spin, label
+    {kType, 64, 0, 0},  // n1108 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1109 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1110 type
+    {kType, 64, 0, 0},  // n1111 type
+    {kEnum, 503, 2, 0},  // enum
+    {kType, 32, 0, 0},  // n1112 type
+    {kRef, 13, 0, 0},  // n1113 $ref #/$defs/BinaryMember
+    {kProperties, 1256, 1, 0},  // n1114 properties: shape
+    {kMinItems, 2, 0, 0},  // n1115 minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kConst, 136, 0, 0},  // n1116 const "dos.coop"
+    {kType, 4, 0, 0},  // n1117 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 507, 4, 0},  // required: energies, projections, integrated, meta
+    {kProperties, 1258, 4, 0},  // properties: energies, projections, integrated, meta
+    {kRef, 13, 0, 0},  // n1118 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1119 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1120 $ref #/$defs/BinaryMember
+    {kRef, 14, 0, 0},  // n1121 $ref #/$defs/JsonMember
+    {kConst, 137, 0, 0},  // n1122 const "dos.cohp"
+    {kType, 4, 0, 0},  // n1123 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 511, 4, 0},  // required: energies, projections, integrated, meta
+    {kProperties, 1270, 4, 0},  // properties: energies, projections, integrated, meta
+    {kRef, 13, 0, 0},  // n1124 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1125 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1126 $ref #/$defs/BinaryMember
+    {kRef, 14, 0, 0},  // n1127 $ref #/$defs/JsonMember
+    {kType, 64, 0, 0},  // n1128 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1129 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1130 type
+    {kType, 64, 0, 0},  // n1131 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kMaximum, 2, 0, 0},  // maximum
+    {kType, 32, 0, 0},  // n1132 type
+    {kType, 32, 0, 0},  // n1133 type
+    {kType, 64, 0, 0},  // n1134 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 6, 0, 0},  // maximum
+    {kType, 16, 0, 0},  // n1135 type
+    {kType, 16, 0, 0},  // n1136 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1137 type
+    {kType, 8, 0, 0},  // n1138 type
+    {kItems, 1139, 0, 0},  // items
+    {kAnyOf, 518, 2, 0},  // n1139 anyOf
+    {kType, 8, 0, 0},  // n1140 type
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kItems, 1141, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1141 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 4, 0, 0},  // n1142 type
+    {kRequired, 516, 2, 0},  // required: i, j
+    {kProperties, 1292, 6, 0},  // properties: i, j, label, symbol_i, symbol_j, distance_ang
+    {kType, 64, 0, 0},  // n1143 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1144 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1145 type
+    {kType, 32, 0, 0},  // n1146 type
+    {kType, 32, 0, 0},  // n1147 type
+    {kType, 16, 0, 0},  // n1148 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1149 type
+    {kItems, 1150, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1150 type
+    {kType, 8, 0, 0},  // n1151 type
+    {kItems, 1152, 0, 0},  // items
+    {kAllOf, 520, 2, 0},  // n1152 allOf
+    {kRef, 107, 0, 0},  // n1153 $ref #/$defs/DosChannel
+    {kProperties, 1304, 2, 0},  // n1154 properties: i, j
+    {kType, 64, 0, 0},  // n1155 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1156 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 4, 0, 0},  // n1157 type
+    {kAdditionalProperties, 1158, 0, 0},  // additionalProperties
+    {kProperties, 1308, 2, 0},  // properties: fermi_energy_ev, energies
+    {kRef, 2, 0, 0},  // n1158 $ref #/$defs/UnitName
+    {kConst, 9, 0, 0},  // n1159 const "ev"
+    {kConst, 9, 0, 0},  // n1160 const "ev"
+    {kConst, 138, 0, 0},  // n1161 const "structure.symmetry"
+    {kType, 4, 0, 0},  // n1162 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 522, 1, 0},  // required: data
+    {kProperties, 1330, 1, 0},  // properties: data
+    {kRef, 14, 0, 0},  // n1163 $ref #/$defs/JsonMember
+    {kType, 64, 0, 0},  // n1164 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 7, 0, 0},  // maximum
+    {kType, 32, 0, 0},  // n1165 type
+    {kType, 32, 0, 0},  // n1166 type
+    {kType, 32, 0, 0},  // n1167 type
+    {kType, 32, 0, 0},  // n1168 type
+    {kType, 64, 0, 0},  // n1169 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 7, 0, 0},  // maximum
+    {kType, 32, 0, 0},  // n1170 type
+    {kType, 8, 0, 0},  // n1171 type
+    {kItems, 1172, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1172 type
+    {kRequired, 523, 1, 0},  // required: rotation
+    {kProperties, 1336, 2, 0},  // properties: rotation, translation
+    {kType, 8, 0, 0},  // n1173 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1174, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1174 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n1175 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1176 type
+    {kItems, 1177, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1177 type
+    {kType, 8, 0, 0},  // n1178 type
+    {kItems, 1179, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1179 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1180 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kConst, 139, 0, 0},  // n1181 const "bonds"
+    {kType, 4, 0, 0},  // n1182 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 524, 1, 0},  // required: bonds
+    {kProperties, 1362, 1, 0},  // properties: bonds
+    {kRef, 14, 0, 0},  // n1183 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n1185 type
+    {kItems, 1186, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1186 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1370, 1, 0},  // patternProperties
+    {kRequired, 526, 2, 0},  // required: i, j
+    {kProperties, 1372, 3, 0},  // properties: i, j, order
+    {kType, 64, 0, 0},  // n1188 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1189 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1190 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kConst, 140, 0, 0},  // n1191 const "bond_orders"
+    {kType, 4, 0, 0},  // n1192 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 528, 1, 0},  // required: bond_orders
+    {kProperties, 1380, 1, 0},  // properties: bond_orders
+    {kRef, 14, 0, 0},  // n1193 $ref #/$defs/JsonMember
+    {kType, 32, 0, 0},  // n1195 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 8, 0, 0},  // n1196 type
+    {kItems, 1197, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1197 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1388, 1, 0},  // patternProperties
+    {kRequired, 531, 3, 0},  // required: i, j, order
+    {kProperties, 1390, 6, 0},  // properties: i, j, order, distance_ang, symbol_i, symbol_j
+    {kType, 64, 0, 0},  // n1199 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1200 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1201 type
+    {kType, 16, 0, 0},  // n1202 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1203 type
+    {kType, 32, 0, 0},  // n1204 type
+    {kConst, 141, 0, 0},  // n1205 const "scf_history"
+    {kType, 4, 0, 0},  // n1206 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 534, 1, 0},  // required: iterations
+    {kProperties, 1406, 1, 0},  // properties: iterations
+    {kRef, 14, 0, 0},  // n1207 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n1209 type
+    {kItems, 1210, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1210 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1414, 1, 0},  // patternProperties
+    {kRequired, 536, 2, 0},  // required: iter, energy_eh
+    {kProperties, 1416, 5, 0},  // properties: iter, energy_eh, delta_e, diis_error, rms_density_change
+    {kType, 64, 0, 0},  // n1212 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1213 type
+    {kType, 16, 0, 0},  // n1214 type
+    {kType, 16, 0, 0},  // n1215 type
+    {kType, 16, 0, 0},  // n1216 type
+    {kType, 2, 0, 0},  // n1217 type
+    {kRef, 9, 0, 0},  // n1218 $ref #/$defs/ZipPath
+    {kConst, 44, 0, 0},  // n1219 const "binary"
+    {kRef, 8, 0, 0},  // n1220 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n1221 $ref #/$defs/MemberSize
+    {kRef, 12, 0, 0},  // n1222 $ref #/$defs/MediaType
+    {kConst, 142, 0, 0},  // n1223 const "citations"
+    {kType, 4, 0, 0},  // n1224 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 541, 1, 0},  // required: references
+    {kProperties, 1440, 1, 0},  // properties: references
+    {kRef, 117, 0, 0},  // n1225 $ref #/$defs/CitationsReferences
+    {kRef, 9, 0, 0},  // n1226 $ref #/$defs/ZipPath
+    {kConst, 44, 0, 0},  // n1227 const "binary"
+    {kRef, 8, 0, 0},  // n1228 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n1229 $ref #/$defs/MemberSize
+    {kRef, 12, 0, 0},  // n1230 $ref #/$defs/MediaType
+    {kConst, 143, 0, 0},  // n1231 const "run.record"
+    {kType, 32, 0, 0},  // n1232 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1233 type
+    {kType, 32, 0, 0},  // n1234 type
+    {kType, 64, 0, 0},  // n1235 type
+    {kType, 32, 0, 0},  // n1236 type
+    {kType, 32, 0, 0},  // n1237 type
+    {kType, 64, 0, 0},  // n1238 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1239 type
+    {kEnum, 545, 3, 0},  // n1240 enum
+    {kType, 4, 0, 0},  // n1241 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kProperties, 1456, 3, 0},  // properties: input, log, files
+    {kPatternProperties, 1462, 1, 0},  // patternProperties
+    {kAnyOf, 550, 2, 0},  // anyOf
+    {kRef, 119, 0, 0},  // n1242 $ref #/$defs/OpaqueBinaryMember
+    {kRef, 119, 0, 0},  // n1243 $ref #/$defs/OpaqueBinaryMember
+    {kRef, 14, 0, 0},  // n1244 $ref #/$defs/JsonMember
+    {kRef, 119, 0, 0},  // n1245 $ref #/$defs/OpaqueBinaryMember
+    {kRequired, 548, 1, 0},  // n1246 required: input
+    {kRequired, 549, 1, 0},  // n1247 required: log
+    {kType, 4, 0, 0},  // n1248 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1486, 1, 0},  // patternProperties
+    {kProperties, 1488, 4, 0},  // properties: filename, description, media_type, truncated
+    {kType, 32, 0, 0},  // n1250 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1251 type
+    {kType, 32, 0, 0},  // n1252 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 2, 0, 0},  // n1253 type
+    {kConst, 144, 0, 0},  // n1254 const "job.spec"
+    {kType, 4, 0, 0},  // n1255 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 556, 1, 0},  // required: spec
+    {kProperties, 1498, 1, 0},  // properties: spec
+    {kRef, 14, 0, 0},  // n1256 $ref #/$defs/JsonMember
+    {kEnum, 561, 2, 0},  // n1257 enum
+    {kType, 32, 0, 0},  // n1258 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kAnyOf, 563, 3, 0},  // n1259 anyOf
+    {kType, 32, 0, 0},  // n1260 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 1, 0, 0},  // n1261 type
+    {kConst, 147, 0, 0},  // n1262 const ""
+    {kAnyOf, 566, 3, 0},  // n1263 anyOf
+    {kType, 32, 0, 0},  // n1264 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 1, 0, 0},  // n1265 type
+    {kConst, 147, 0, 0},  // n1266 const ""
+    {kType, 64, 0, 0},  // n1267 type
+    {kType, 64, 0, 0},  // n1268 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1269 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1270, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1270 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1271 type
+    {kItems, 1272, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1272 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1273 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kRef, 124, 0, 0},  // n1274 $ref #/$defs/JobSpecSolvation
+    {kType, 32, 0, 0},  // n1275 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1276 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kRef, 125, 0, 0},  // n1277 $ref #/$defs/JobSpecScf
+    {kRef, 126, 0, 0},  // n1278 $ref #/$defs/JobSpecGeometry
+    {kRef, 127, 0, 0},  // n1279 $ref #/$defs/JobSpecResources
+    {kType, 4, 0, 0},  // n1280 type
+    {kType, 32, 0, 0},  // n1282 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1283 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 16, 0, 0},  // n1284 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 16, 0, 0},  // n1286 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 64, 0, 0},  // n1287 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1288 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 16, 0, 0},  // n1289 type
+    {kType, 16, 0, 0},  // n1291 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 64, 0, 0},  // n1292 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kEnum, 570, 3, 0},  // n1293 enum
+    {kType, 64, 0, 0},  // n1295 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1296 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1297 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kConst, 151, 0, 0},  // n1298 const "basis.ao"
+    {kType, 4, 0, 0},  // n1299 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 573, 11, 0},  // required: atom_index, atom_symbol, shell_index, primitive_index, angul...
+    {kProperties, 1570, 13, 0},  // properties: atom_index, atom_symbol, shell_index, primitive_index, angul...
+    {kType, 64, 0, 0},  // n1300 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1301 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kMaxLength, 3, 0, 0},  // maxLength
+    {kType, 64, 0, 0},  // n1302 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1303 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1304 type
+    {kItems, 1305, 0, 0},  // items
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1305 type
+    {kType, 8, 0, 0},  // n1306 type
+    {kItems, 1307, 0, 0},  // items
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1307 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1308 type
+    {kEnum, 584, 7, 0},  // enum
+    {kType, 16, 0, 0},  // n1309 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 16, 0, 0},  // n1310 type
+    {kType, 2, 0, 0},  // n1311 type
+    {kType, 2, 0, 0},  // n1312 type
+    {kType, 64, 0, 0},  // n1313 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1314 type
+    {kType, 4, 0, 0},  // n1315 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 591, 2, 0},  // required: grid, data
+    {kProperties, 1596, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n1316 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n1317 $ref #/$defs/Volume3DBinary
+    {kConst, 159, 0, 0},  // n1318 const "equation_of_state"
+    {kType, 4, 0, 0},  // n1319 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 593, 3, 0},  // required: volumes, energies, fit
+    {kProperties, 1606, 3, 0},  // properties: volumes, energies, fit
+    {kRef, 13, 0, 0},  // n1320 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1321 $ref #/$defs/BinaryMember
+    {kRef, 14, 0, 0},  // n1322 $ref #/$defs/JsonMember
+    {kEnum, 597, 5, 0},  // n1324 enum
+    {kType, 16, 0, 0},  // n1325 type
+    {kType, 16, 0, 0},  // n1326 type
+    {kType, 16, 0, 0},  // n1327 type
+    {kType, 16, 0, 0},  // n1328 type
+    {kType, 16, 0, 0},  // n1329 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1330 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1331 type
+    {kItems, 1332, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1332 type
+    {kType, 32, 0, 0},  // n1333 type
+    {kType, 32, 0, 0},  // n1334 type
+    {kType, 32, 0, 0},  // n1335 type
+    {kConst, 165, 0, 0},  // n1336 const "fermi_surface"
+    {kType, 4, 0, 0},  // n1337 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 602, 2, 0},  // required: mesh, energies
+    {kProperties, 1640, 2, 0},  // properties: mesh, energies
+    {kRef, 14, 0, 0},  // n1338 $ref #/$defs/JsonMember
+    {kRef, 17, 0, 0},  // n1339 $ref #/$defs/Volume4DBinary
+    {kType, 8, 0, 0},  // n1341 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1342, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1342 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1343 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1344 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1345 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kRef, 5, 0, 0},  // n1346 $ref #/$defs/Vec3
+    {kType, 2, 0, 0},  // n1347 type
+    {kType, 8, 0, 0},  // n1348 type
+    {kItems, 1349, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1349 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n1350 type
+    {kType, 64, 0, 0},  // n1351 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kMaximum, 6, 0, 0},  // maximum
+    {kType, 8, 0, 0},  // n1352 type
+    {kItems, 1353, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1353 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 21, 0, 0},  // n1354 $ref #/$defs/Lattice3x3
+    {kType, 8, 0, 0},  // n1355 type
+    {kMinItems, 3, 0, 0},  // minItems
+    {kMaxItems, 3, 0, 0},  // maxItems
+    {kItems, 1356, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1356 $ref #/$defs/Vec3
+    {kType, 4, 0, 0},  // n1357 type
+    {kAdditionalProperties, 1358, 0, 0},  // additionalProperties
+    {kProperties, 1650, 3, 0},  // properties: fermi_energy_ev, energies, lattice_vectors
+    {kRef, 2, 0, 0},  // n1358 $ref #/$defs/UnitName
+    {kConst, 9, 0, 0},  // n1359 const "ev"
+    {kConst, 9, 0, 0},  // n1360 const "ev"
+    {kConst, 6, 0, 0},  // n1361 const "angstrom"
+    {kConst, 166, 0, 0},  // n1362 const "phonon_bands"
+    {kType, 4, 0, 0},  // n1363 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 604, 2, 0},  // required: qpath, frequencies
+    {kProperties, 1686, 3, 0},  // properties: qpath, frequencies, eigenvectors
+    {kRef, 14, 0, 0},  // n1364 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n1365 $ref #/$defs/BinaryMember
+    {kAllOf, 617, 2, 0},  // n1366 allOf
+    {kRef, 13, 0, 0},  // n1367 $ref #/$defs/BinaryMember
+    {kProperties, 1682, 2, 0},  // n1368 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1369 const "float64"
+    {kAnyOf, 615, 2, 0},  // n1370 anyOf
+    {kMinItems, 4, 0, 0},  // n1371 minItems
+    {kMaxItems, 4, 0, 0},  // maxItems
+    {kPrefixItems, 606, 4, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n1375 const 3
+    {kMinItems, 5, 0, 0},  // n1376 minItems
+    {kMaxItems, 5, 0, 0},  // maxItems
+    {kPrefixItems, 610, 5, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n1380 const 3
+    {kConst, 47, 0, 0},  // n1381 const 2
+    {kType, 8, 0, 0},  // n1383 type
+    {kItems, 1384, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1384 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1385 type
+    {kItems, 1386, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1386 type
+    {kType, 8, 0, 0},  // n1387 type
+    {kItems, 1388, 0, 0},  // items
+    {kRef, 100, 0, 0},  // n1388 $ref #/$defs/KpathSegment
+    {kType, 64, 0, 0},  // n1389 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1390 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1391 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 2, 0, 0},  // n1392 type
+    {kType, 8, 0, 0},  // n1393 type
+    {kItems, 1394, 0, 0},  // items
+    {kRef, 107, 0, 0},  // n1394 $ref #/$defs/DosChannel
+    {kType, 32, 0, 0},  // n1395 type
+    {kType, 4, 0, 0},  // n1396 type
+    {kAdditionalProperties, 1397, 0, 0},  // additionalProperties
+    {kProperties, 1698, 1, 0},  // properties: frequencies
+    {kRef, 2, 0, 0},  // n1397 $ref #/$defs/UnitName
+    {kConst, 12, 0, 0},  // n1398 const "cm-1"
+    {kConst, 167, 0, 0},  // n1399 const "phonon_dos"
+    {kType, 4, 0, 0},  // n1400 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 619, 3, 0},  // required: meta, frequencies, dos
+    {kProperties, 1724, 4, 0},  // properties: meta, frequencies, dos, projected
+    {kRef, 14, 0, 0},  // n1401 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n1402 $ref #/$defs/BinaryMember
+    {kRef, 13, 0, 0},  // n1403 $ref #/$defs/BinaryMember
+    {kAllOf, 622, 2, 0},  // n1404 allOf
+    {kRef, 13, 0, 0},  // n1405 $ref #/$defs/BinaryMember
+    {kProperties, 1720, 2, 0},  // n1406 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1407 const "float64"
+    {kMinItems, 2, 0, 0},  // n1408 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1409 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1410 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1411 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1412 type
+    {kType, 8, 0, 0},  // n1413 type
+    {kItems, 1414, 0, 0},  // items
+    {kRef, 107, 0, 0},  // n1414 $ref #/$defs/DosChannel
+    {kType, 4, 0, 0},  // n1415 type
+    {kAdditionalProperties, 1416, 0, 0},  // additionalProperties
+    {kProperties, 1736, 1, 0},  // properties: frequencies
+    {kRef, 2, 0, 0},  // n1416 $ref #/$defs/UnitName
+    {kConst, 12, 0, 0},  // n1417 const "cm-1"
+    {kConst, 168, 0, 0},  // n1418 const "topology.qtaim"
+    {kType, 4, 0, 0},  // n1419 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 624, 1, 0},  // required: critical_points
+    {kProperties, 1750, 1, 0},  // properties: critical_points
+    {kRef, 14, 0, 0},  // n1420 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n1421 type
+    {kItems, 1422, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1422 type
+    {kRequired, 626, 2, 0},  // required: type, position
+    {kProperties, 1756, 7, 0},  // properties: type, position, rho, laplacian, ellipticity, atom_pair, atom...
+    {kEnum, 628, 4, 0},  // n1423 enum
+    {kRef, 5, 0, 0},  // n1424 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n1425 type
+    {kType, 16, 0, 0},  // n1426 type
+    {kType, 16, 0, 0},  // n1427 type
+    {kType, 8, 0, 0},  // n1428 type
+    {kItems, 1429, 0, 0},  // items
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1429 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1430 type
+    {kItems, 1431, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1431 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1432 type
+    {kItems, 1433, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1433 type
+    {kProperties, 1770, 2, 0},  // properties: atoms, path
+    {kType, 8, 0, 0},  // n1434 type
+    {kItems, 1435, 0, 0},  // items
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1435 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1436 type
+    {kItems, 1437, 0, 0},  // items
+    {kRef, 5, 0, 0},  // n1437 $ref #/$defs/Vec3
+    {kType, 4, 0, 0},  // n1438 type
+    {kAdditionalProperties, 1439, 0, 0},  // additionalProperties
+    {kProperties, 1774, 1, 0},  // properties: position
+    {kRef, 2, 0, 0},  // n1439 $ref #/$defs/UnitName
+    {kRef, 2, 0, 0},  // n1440 $ref #/$defs/UnitName
+    {kConst, 173, 0, 0},  // n1441 const "forces"
+    {kType, 4, 0, 0},  // n1442 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 632, 1, 0},  // required: gradient
+    {kProperties, 1782, 3, 0},  // properties: gradient, stress, meta
+    {kRef, 140, 0, 0},  // n1443 $ref #/$defs/ForcesGradient
+    {kRef, 141, 0, 0},  // n1444 $ref #/$defs/ForcesStress
+    {kRef, 14, 0, 0},  // n1445 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n1446 $ref #/$defs/BinaryMember
+    {kProperties, 1792, 2, 0},  // n1447 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1448 const "float64"
+    {kMinItems, 2, 0, 0},  // n1449 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 636, 2, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n1451 const 3
+    {kRef, 13, 0, 0},  // n1452 $ref #/$defs/BinaryMember
+    {kProperties, 1796, 2, 0},  // n1453 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1454 const "float64"
+    {kMinItems, 2, 0, 0},  // n1455 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kPrefixItems, 640, 2, 0},  // prefixItems
+    {kConst, 46, 0, 0},  // n1456 const 3
+    {kConst, 46, 0, 0},  // n1457 const 3
+    {kType, 32, 0, 0},  // n1459 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1460 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kEnum, 644, 1, 0},  // n1461 enum
+    {kRef, 143, 0, 0},  // n1462 $ref #/$defs/DerivativeUnits
+    {kConst, 8, 0, 0},  // n1464 const "hartree"
+    {kConst, 7, 0, 0},  // n1465 const "bohr"
+    {kConst, 175, 0, 0},  // n1466 const "hessian"
+    {kType, 4, 0, 0},  // n1467 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 645, 1, 0},  // required: matrix
+    {kProperties, 1816, 2, 0},  // properties: matrix, meta
+    {kRef, 145, 0, 0},  // n1468 $ref #/$defs/HessianMatrix
+    {kRef, 14, 0, 0},  // n1469 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n1470 $ref #/$defs/BinaryMember
+    {kProperties, 1824, 2, 0},  // n1471 properties: dtype, shape
+    {kConst, 43, 0, 0},  // n1472 const "float64"
+    {kMinItems, 2, 0, 0},  // n1473 minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 32, 0, 0},  // n1475 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 2, 0, 0},  // n1476 type
+    {kType, 2, 0, 0},  // n1477 type
+    {kType, 8, 0, 0},  // n1478 type
+    {kItems, 1479, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1479 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kRef, 143, 0, 0},  // n1480 $ref #/$defs/DerivativeUnits
+    {kProperties, 1840, 1, 0},  // n1481 properties: mass_weighted
+    {kRequired, 651, 1, 0},  // required: mass_weighted
+    {kConst, 48, 0, 0},  // n1482 const true
+    {kRequired, 652, 1, 0},  // n1483 required: atom_masses_amu
+    {kConst, 176, 0, 0},  // n1484 const "excited_states"
+    {kType, 32, 0, 0},  // n1485 type
+    {kType, 4, 0, 0},  // n1486 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 653, 1, 0},  // required: states
+    {kProperties, 1842, 1, 0},  // properties: states
+    {kRef, 14, 0, 0},  // n1487 $ref #/$defs/JsonMember
+    {kConst, 177, 0, 0},  // n1488 const "properties.electric"
+    {kType, 4, 0, 0},  // n1489 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 657, 1, 0},  // required: properties
+    {kProperties, 1850, 1, 0},  // properties: properties
+    {kRef, 14, 0, 0},  // n1490 $ref #/$defs/JsonMember
+    {kType, 8, 0, 0},  // n1492 type
+    {kItems, 1493, 0, 0},  // items
+    {kRef, 150, 0, 0},  // n1493 $ref #/$defs/ExcitedState
+    {kRef, 152, 0, 0},  // n1494 $ref #/$defs/ExcitedStatesMeta
+    {kType, 64, 0, 0},  // n1496 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kRef, 1, 0, 0},  // n1497 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1498 $ref #/$defs/ValueWithUnits
+    {kType, 64, 0, 0},  // n1499 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 32, 0, 0},  // n1500 type
+    {kType, 16, 0, 0},  // n1501 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1502 type
+    {kRef, 5, 0, 0},  // n1503 $ref #/$defs/Vec3
+    {kRef, 5, 0, 0},  // n1504 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1505 type
+    {kItems, 1506, 0, 0},  // items
+    {kRef, 151, 0, 0},  // n1506 $ref #/$defs/ExcitedStateContribution
+    {kType, 32, 0, 0},  // n1507 type
+    {kType, 32, 0, 0},  // n1508 type
+    {kType, 64, 0, 0},  // n1510 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 64, 0, 0},  // n1511 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kEnum, 667, 2, 0},  // n1512 enum
+    {kType, 16, 0, 0},  // n1513 type
+    {kType, 32, 0, 0},  // n1515 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1516 type
+    {kType, 64, 0, 0},  // n1517 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 2, 0, 0},  // n1518 type
+    {kType, 2, 0, 0},  // n1519 type
+    {kType, 4, 0, 0},  // n1520 type
+    {kAdditionalProperties, 1521, 0, 0},  // additionalProperties
+    {kProperties, 1900, 3, 0},  // properties: excitation_energy, total_energy, oscillator_strength
+    {kRef, 2, 0, 0},  // n1521 $ref #/$defs/UnitName
+    {kRef, 2, 0, 0},  // n1522 $ref #/$defs/UnitName
+    {kRef, 2, 0, 0},  // n1523 $ref #/$defs/UnitName
+    {kConst, 30, 0, 0},  // n1524 const "dimensionless"
+    {kConst, 180, 0, 0},  // n1525 const "properties.elastic"
+    {kType, 4, 0, 0},  // n1526 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 669, 1, 0},  // required: properties
+    {kProperties, 1918, 1, 0},  // properties: properties
+    {kRef, 14, 0, 0},  // n1527 $ref #/$defs/JsonMember
+    {kConst, 181, 0, 0},  // n1528 const "properties.dielectric"
+    {kType, 4, 0, 0},  // n1529 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 673, 1, 0},  // required: properties
+    {kProperties, 1924, 1, 0},  // properties: properties
+    {kRef, 14, 0, 0},  // n1530 $ref #/$defs/JsonMember
+    {kRef, 5, 0, 0},  // n1531 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1532 type
+    {kMinItems, 6, 0, 0},  // minItems
+    {kMaxItems, 6, 0, 0},  // maxItems
+    {kItems, 1533, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1533 type
+    {kType, 8, 0, 0},  // n1534 type
+    {kMinItems, 6, 0, 0},  // minItems
+    {kMaxItems, 6, 0, 0},  // maxItems
+    {kItems, 1535, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1535 type
+    {kType, 16, 0, 0},  // n1536 type
+    {kRequired, 677, 1, 0},  // n1538 required: dipole
+    {kRequired, 678, 1, 0},  // n1539 required: quadrupole
+    {kRequired, 679, 1, 0},  // n1540 required: octupole
+    {kRequired, 680, 1, 0},  // n1541 required: polarizability
+    {kRequired, 681, 1, 0},  // n1542 required: hyperpolarizability
+    {kOneOf, 687, 2, 0},  // n1543 oneOf
+    {kType, 32, 0, 0},  // n1544 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kRef, 5, 0, 0},  // n1545 $ref #/$defs/Vec3
+    {kType, 4, 0, 0},  // n1546 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1932, 1, 0},  // patternProperties
+    {kRequired, 689, 1, 0},  // required: vector
+    {kProperties, 1934, 3, 0},  // properties: vector, total, units
+    {kRef, 5, 0, 0},  // n1548 $ref #/$defs/Vec3
+    {kType, 16, 0, 0},  // n1549 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kRef, 2, 0, 0},  // n1550 $ref #/$defs/UnitName
+    {kConst, 14, 0, 0},  // const "debye"
+    {kType, 4, 0, 0},  // n1551 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1940, 1, 0},  // patternProperties
+    {kRequired, 690, 3, 0},  // required: matrix, traceless, convention
+    {kProperties, 1942, 3, 0},  // properties: matrix, traceless, convention
+    {kIf, 1556, 1558, -1},  // if
+    {kRef, 155, 0, 0},  // n1553 $ref #/$defs/Matrix3x3
+    {kType, 2, 0, 0},  // n1554 type
+    {kEnum, 693, 2, 0},  // n1555 enum
+    {kProperties, 1948, 1, 0},  // n1556 properties: convention
+    {kRequired, 695, 1, 0},  // required: convention
+    {kConst, 182, 0, 0},  // n1557 const "buckingham"
+    {kProperties, 1950, 1, 0},  // n1558 properties: traceless
+    {kConst, 48, 0, 0},  // n1559 const true
+    {kType, 4, 0, 0},  // n1560 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1952, 1, 0},  // patternProperties
+    {kRequired, 696, 1, 0},  // required: tensor
+    {kProperties, 1954, 2, 0},  // properties: tensor, convention
+    {kRef, 158, 0, 0},  // n1562 $ref #/$defs/Tensor3x3x3
+    {kEnum, 697, 2, 0},  // n1563 enum
+    {kType, 4, 0, 0},  // n1564 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1958, 1, 0},  // patternProperties
+    {kRequired, 699, 1, 0},  // required: matrix
+    {kProperties, 1960, 3, 0},  // properties: matrix, frequency_ev, isotropic
+    {kRef, 155, 0, 0},  // n1566 $ref #/$defs/Matrix3x3
+    {kType, 16, 0, 0},  // n1567 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1568 type
+    {kType, 4, 0, 0},  // n1569 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1966, 1, 0},  // patternProperties
+    {kRequired, 700, 1, 0},  // required: tensor
+    {kProperties, 1968, 2, 0},  // properties: tensor, frequencies_ev
+    {kRef, 158, 0, 0},  // n1571 $ref #/$defs/Tensor3x3x3
+    {kType, 8, 0, 0},  // n1572 type
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kItems, 1573, 0, 0},  // items
+    {kType, 16, 0, 0},  // n1573 type
+    {kType, 4, 0, 0},  // n1574 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1972, 1, 0},  // patternProperties
+    {kProperties, 1974, 2, 0},  // properties: dipole, origin
+    {kConst, 14, 0, 0},  // n1576 const "debye"
+    {kConst, 7, 0, 0},  // n1577 const "bohr"
+    {kRef, 157, 0, 0},  // n1579 $ref #/$defs/Matrix6x6
+    {kRef, 157, 0, 0},  // n1580 $ref #/$defs/Matrix6x6
+    {kType, 16, 0, 0},  // n1581 type
+    {kType, 16, 0, 0},  // n1582 type
+    {kType, 16, 0, 0},  // n1583 type
+    {kType, 16, 0, 0},  // n1584 type
+    {kEnum, 702, 3, 0},  // n1585 enum
+    {kType, 4, 0, 0},  // n1586 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 1994, 1, 0},  // patternProperties
+    {kProperties, 1996, 5, 0},  // properties: stiffness, bulk_modulus_gpa, shear_modulus_gpa, youngs_modul...
+    {kConst, 21, 0, 0},  // n1588 const "gpa"
+    {kConst, 21, 0, 0},  // n1589 const "gpa"
+    {kConst, 21, 0, 0},  // n1590 const "gpa"
+    {kConst, 21, 0, 0},  // n1591 const "gpa"
+    {kConst, 30, 0, 0},  // n1592 const "dimensionless"
+    {kRef, 155, 0, 0},  // n1594 $ref #/$defs/Matrix3x3
+    {kRef, 155, 0, 0},  // n1595 $ref #/$defs/Matrix3x3
+    {kRef, 155, 0, 0},  // n1596 $ref #/$defs/Matrix3x3
+    {kType, 8, 0, 0},  // n1597 type
+    {kMinItems, 1, 0, 0},  // minItems
+    {kItems, 1598, 0, 0},  // items
+    {kRef, 155, 0, 0},  // n1598 $ref #/$defs/Matrix3x3
+    {kRef, 156, 0, 0},  // n1599 $ref #/$defs/Matrix3x6
+    {kType, 4, 0, 0},  // n1600 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kPatternProperties, 2024, 1, 0},  // patternProperties
+    {kProperties, 2026, 4, 0},  // properties: electronic, ionic, static, born_charges
+    {kConst, 30, 0, 0},  // n1602 const "dimensionless"
+    {kConst, 30, 0, 0},  // n1603 const "dimensionless"
+    {kConst, 30, 0, 0},  // n1604 const "dimensionless"
+    {kConst, 26, 0, 0},  // n1605 const "e"
+    {kConst, 186, 0, 0},  // n1606 const "volume.transition_density"
+    {kType, 32, 0, 0},  // n1607 type
+    {kType, 64, 0, 0},  // n1608 type
+    {kMinimum, 2, 0, 0},  // minimum
+    {kType, 4, 0, 0},  // n1609 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 706, 2, 0},  // required: grid, data
+    {kProperties, 2046, 2, 0},  // properties: grid, data
+    {kRef, 14, 0, 0},  // n1610 $ref #/$defs/JsonMember
+    {kRef, 16, 0, 0},  // n1611 $ref #/$defs/Volume3DBinary
+    {kConst, 187, 0, 0},  // n1612 const "preview"
+    {kType, 4, 0, 0},  // n1613 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 709, 1, 0},  // required: thumbnail
+    {kProperties, 2058, 2, 0},  // properties: thumbnail, image
+    {kRef, 164, 0, 0},  // n1614 $ref #/$defs/PreviewThumbnail
+    {kRef, 165, 0, 0},  // n1615 $ref #/$defs/PreviewImage
+    {kRef, 9, 0, 0},  // n1616 $ref #/$defs/ZipPath
+    {kConst, 44, 0, 0},  // n1617 const "binary"
+    {kRef, 8, 0, 0},  // n1618 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n1619 $ref #/$defs/MemberSize
+    {kEnum, 717, 2, 0},  // n1620 enum
+    {kRef, 9, 0, 0},  // n1621 $ref #/$defs/ZipPath
+    {kConst, 44, 0, 0},  // n1622 const "binary"
+    {kRef, 8, 0, 0},  // n1623 $ref #/$defs/Sha256Hex
+    {kRef, 11, 0, 0},  // n1624 $ref #/$defs/MemberSize
+    {kEnum, 723, 3, 0},  // n1625 enum
+    {kType, 32, 0, 0},  // n1626 type
+    {kPattern, 15, 0, 0},  // pattern ^x_[A-Za-z0-9_]+(\.[A-Za-z0-9_.-]+)?$
+    {kType, 4, 0, 0},  // n1627 type
+    {kAdditionalProperties, 1628, 0, 0},  // additionalProperties
+    {kOneOf, 726, 3, 0},  // n1628 oneOf
+    {kRef, 14, 0, 0},  // n1629 $ref #/$defs/JsonMember
+    {kRef, 13, 0, 0},  // n1630 $ref #/$defs/BinaryMember
+    {kRef, 119, 0, 0},  // n1631 $ref #/$defs/OpaqueBinaryMember
+    {kType, 32, 0, 0},  // n1633 type
+    {kType, 32, 0, 0},  // n1634 type
+    {kType, 32, 0, 0},  // n1635 type
+    {kPattern, 1, 0, 0},  // pattern ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?Z$
+    {kType, 32, 0, 0},  // n1636 type
+    {kPattern, 1, 0, 0},  // pattern ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?Z$
+    {kType, 32, 0, 0},  // n1637 type
+    {kPattern, 16, 0, 0},  // pattern ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
+    {kType, 8, 0, 0},  // n1638 type
+    {kItems, 1639, 0, 0},  // items
+    {kRef, 168, 0, 0},  // n1639 $ref #/$defs/MetadataAuthor
+    {kType, 32, 0, 0},  // n1640 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1641 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 8, 0, 0},  // n1642 type
+    {kItems, 1643, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1643 type
+    {kType, 8, 0, 0},  // n1644 type
+    {kItems, 1645, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1645 type
+    {kType, 8, 0, 0},  // n1646 type
+    {kItems, 1647, 0, 0},  // items
+    {kType, 32, 0, 0},  // n1647 type
+    {kType, 32, 0, 0},  // n1649 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1650 type
+    {kType, 32, 0, 0},  // n1651 type
+    {kType, 32, 0, 0},  // n1652 type
+    {kType, 32, 0, 0},  // n1654 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1655 type
+    {kType, 32, 0, 0},  // n1656 type
+    {kType, 16, 0, 0},  // n1657 type
+    {kType, 16, 0, 0},  // n1658 type
+    {kType, 16, 0, 0},  // n1659 type
+    {kType, 16, 0, 0},  // n1660 type
+    {kType, 16, 0, 0},  // n1661 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 16, 0, 0},  // n1662 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kType, 16, 0, 0},  // n1663 type
+    {kRef, 5, 0, 0},  // n1664 $ref #/$defs/Vec3
+    {kOneOf, 731, 2, 0},  // n1665 oneOf
+    {kType, 32, 0, 0},  // n1666 type
+    {kRef, 5, 0, 0},  // n1667 $ref #/$defs/Vec3
+    {kType, 8, 0, 0},  // n1668 type
+    {kItems, 1669, 0, 0},  // items
+    {kType, 64, 0, 0},  // n1669 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 8, 0, 0},  // n1670 type
+    {kItems, 1671, 0, 0},  // items
+    {kType, 4, 0, 0},  // n1671 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 733, 2, 0},  // required: atoms, target_angstrom
+    {kProperties, 2150, 2, 0},  // properties: atoms, target_angstrom
+    {kType, 8, 0, 0},  // n1672 type
+    {kItems, 1673, 0, 0},  // items
+    {kMinItems, 2, 0, 0},  // minItems
+    {kMaxItems, 2, 0, 0},  // maxItems
+    {kType, 64, 0, 0},  // n1673 type
+    {kMinimum, 0, 0, 0},  // minimum
+    {kType, 16, 0, 0},  // n1674 type
+    {kExclusiveMinimum, 0, 0, 0},  // exclusiveMinimum
+    {kRef, 1, 0, 0},  // n1676 $ref #/$defs/ValueWithUnits
+    {kType, 32, 0, 0},  // n1677 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kRef, 174, 0, 0},  // n1678 $ref #/$defs/EnergyComponents
+    {kType, 8, 0, 0},  // n1679 type
+    {kItems, 1680, 0, 0},  // items
+    {kRef, 175, 0, 0},  // n1680 $ref #/$defs/EnergyByMethod
+    {kType, 32, 0, 0},  // n1681 type
+    {kRef, 1, 0, 0},  // n1682 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1683 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1684 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1685 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1686 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1687 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1688 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1689 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1690 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1691 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1692 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1693 $ref #/$defs/ValueWithUnits
+    {kRef, 1, 0, 0},  // n1694 $ref #/$defs/ValueWithUnits
+    {kType, 32, 0, 0},  // n1696 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kRef, 1, 0, 0},  // n1697 $ref #/$defs/ValueWithUnits
+    {kRef, 174, 0, 0},  // n1698 $ref #/$defs/EnergyComponents
+    {kType, 4, 0, 0},  // n1699 type
+    {kAdditionalProperties, -1, 0, 0},  // additionalProperties
+    {kRequired, 738, 1, 0},  // required: version
+    {kProperties, 2204, 3, 0},  // properties: version, schema_uri, critical
+    {kType, 32, 0, 0},  // n1700 type
+    {kMinLength, 1, 0, 0},  // minLength
+    {kType, 32, 0, 0},  // n1701 type
+    {kType, 2, 0, 0},  // n1702 type
+};
+
+// The $defs entries by name, in schema order.
+inline constexpr Def kDefs[176] = {
+    {"ValueWithUnits", 1},
+    {"UnitName", 2},
+    {"LegacyUnitName", 3},
+    {"ViewerHint", 4},
+    {"Vec3", 5},
+    {"Camera", 6},
+    {"Bookmark", 7},
+    {"Sha256Hex", 8},
+    {"ZipPath", 9},
+    {"NumpyDtype", 10},
+    {"MemberSize", 11},
+    {"MediaType", 12},
+    {"BinaryMember", 13},
+    {"JsonMember", 14},
+    {"Section", 15},
+    {"Volume3DBinary", 16},
+    {"Volume4DBinary", 17},
+    {"Volume4DVectorBinary", 18},
+    {"Volume4DComplexBinary", 19},
+    {"StructureAtom", 20},
+    {"Lattice3x3", 21},
+    {"StructurePayload", 22},
+    {"BiomoleculeResidue", 23},
+    {"BiomoleculeSecondaryStructure", 24},
+    {"SectionStructure", 25},
+    {"SectionVolumeDensity", 26},
+    {"VolumeGridPayload", 27},
+    {"SectionVolumeOrbital", 28},
+    {"SectionVolumeSpin", 29},
+    {"SectionVolumeELF", 30},
+    {"SectionVolumeGeneric", 31},
+    {"SectionVolumeDifference", 32},
+    {"SectionVolumePotential", 33},
+    {"SectionVolumeRDG", 34},
+    {"SectionVolumeLaplacian", 35},
+    {"SectionVolumeVector", 36},
+    {"SectionVolumeComplex", 37},
+    {"SectionVolumeSeries", 38},
+    {"VolumeSeriesAxisPayload", 39},
+    {"AtomChargeBinary", 40},
+    {"AtomVectorBinary", 41},
+    {"AtomPropertyMetaEntry", 42},
+    {"AtomPropertiesMetaPayload", 43},
+    {"SectionAtomProperties", 44},
+    {"TrajectoryCoords", 45},
+    {"TrajectoryFrameVectors", 46},
+    {"TrajectoryFrameScalars", 47},
+    {"TrajectoryLattice", 48},
+    {"SectionTrajectory", 49},
+    {"TrajectoryAtom", 50},
+    {"TrajectoryMetadataCommon", 51},
+    {"TrajectoryMetadataPayload", 52},
+    {"SectionReactionPath", 53},
+    {"ReactionWaypoint", 54},
+    {"ReactionPathMetadataPayload", 55},
+    {"ReactionPathLattice", 56},
+    {"SectionScanSurface", 57},
+    {"ScanSurfaceAxis", 58},
+    {"ScanSurfaceMetadataPayload", 59},
+    {"SectionReactionWaypoints", 60},
+    {"ReactionWaypointsPayload", 61},
+    {"SectionReactionScheme", 62},
+    {"ReactionSchemePayload", 63},
+    {"ReactionStep", 64},
+    {"ReactionParticipant", 65},
+    {"VibrationsDisplacements", 66},
+    {"SectionVibrations", 67},
+    {"VibrationsMetadataPayload", 68},
+    {"SectionSpectraIR", 69},
+    {"SpectrumPayload", 70},
+    {"SpectrumPeak", 71},
+    {"SectionSpectraRaman", 72},
+    {"BandsEigenvalues", 73},
+    {"SectionSpectraUVVis", 74},
+    {"SectionSpectraECD", 75},
+    {"SectionSpectraVCD", 76},
+    {"SectionSpectraNMR", 77},
+    {"NmrSpectrumPayload", 78},
+    {"SectionSpectraEPR", 79},
+    {"EprSpectrumPayload", 80},
+    {"SectionSpectraGeneric", 81},
+    {"MoCoefficientsBinary", 82},
+    {"SectionWavefunctionGTO", 83},
+    {"WavefunctionAoMatrix", 84},
+    {"BasisShell", 85},
+    {"BasisEcpProjector", 86},
+    {"BasisEcpCentre", 87},
+    {"BasisPayload", 88},
+    {"MoSpinChannel", 89},
+    {"MoMetadataPayload", 90},
+    {"SectionWavefunctionBloch", 91},
+    {"BlochMoCoefficients", 92},
+    {"BlochEnergies", 93},
+    {"BlochOccupations", 94},
+    {"BlochKpointsPayload", 95},
+    {"BlochMoMetadataPayload", 96},
+    {"SectionBands", 97},
+    {"BandsProjections", 98},
+    {"BandsOccupations", 99},
+    {"KpathSegment", 100},
+    {"KpathPayload", 101},
+    {"SectionDOSTotal", 102},
+    {"SectionDOSProjected", 103},
+    {"DOSProjectedProjections", 104},
+    {"SectionDOSCOOP", 105},
+    {"SectionDOSCOHP", 106},
+    {"DosChannel", 107},
+    {"DosMetaPayload", 108},
+    {"SectionStructureSymmetry", 109},
+    {"SymmetryPayload", 110},
+    {"SectionBonds", 111},
+    {"BondsPayload", 112},
+    {"SectionBondOrders", 113},
+    {"BondOrdersPayload", 114},
+    {"SectionSCFHistory", 115},
+    {"ScfHistoryPayload", 116},
+    {"CitationsReferences", 117},
+    {"SectionCitations", 118},
+    {"OpaqueBinaryMember", 119},
+    {"SectionRunRecord", 120},
+    {"RunRecordFilesPayload", 121},
+    {"SectionJobSpec", 122},
+    {"JobSpecPayload", 123},
+    {"JobSpecSolvation", 124},
+    {"JobSpecScf", 125},
+    {"JobSpecGeometry", 126},
+    {"JobSpecResources", 127},
+    {"SectionBasisAO", 128},
+    {"SectionEquationOfState", 129},
+    {"EosFitPayload", 130},
+    {"SectionFermiSurface", 131},
+    {"FermiMeshPayload", 132},
+    {"SectionPhononBands", 133},
+    {"QpathPayload", 134},
+    {"SectionPhononDOS", 135},
+    {"PhononMetaPayload", 136},
+    {"SectionTopologyQTAIM", 137},
+    {"QtaimPayload", 138},
+    {"SectionForces", 139},
+    {"ForcesGradient", 140},
+    {"ForcesStress", 141},
+    {"ForcesMetaPayload", 142},
+    {"DerivativeUnits", 143},
+    {"SectionHessian", 144},
+    {"HessianMatrix", 145},
+    {"HessianMetaPayload", 146},
+    {"SectionExcitedStates", 147},
+    {"SectionPropertiesElectric", 148},
+    {"ExcitedStatesPayload", 149},
+    {"ExcitedState", 150},
+    {"ExcitedStateContribution", 151},
+    {"ExcitedStatesMeta", 152},
+    {"SectionPropertiesElastic", 153},
+    {"SectionPropertiesDielectric", 154},
+    {"Matrix3x3", 155},
+    {"Matrix3x6", 156},
+    {"Matrix6x6", 157},
+    {"Tensor3x3x3", 158},
+    {"ElectricPropertiesPayload", 159},
+    {"ElasticPropertiesPayload", 160},
+    {"DielectricPropertiesPayload", 161},
+    {"SectionVolumeTransitionDensity", 162},
+    {"SectionPreview", 163},
+    {"PreviewThumbnail", 164},
+    {"PreviewImage", 165},
+    {"SectionVendor", 166},
+    {"Metadata", 167},
+    {"MetadataAuthor", 168},
+    {"ProvenanceSoftware", 169},
+    {"Thermochemistry", 170},
+    {"DipoleMoment", 171},
+    {"Constraints", 172},
+    {"Energies", 173},
+    {"EnergyComponents", 174},
+    {"EnergyByMethod", 175},
+    {"Extensions", 176},
+};
+
+// The patterns of the schema (pattern and patternProperties keys) and their
+// compiled programs.
+inline constexpr RxProgram kRxPrograms[18] = {
+    {"^[0-9a-fA-F]{7,64}$", 0, 124},
+    {"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\\.[0-9]+)\077Z$", 124, 49},
+    {"^[a-f0-9]{64}$", 173, 67},
+    {"^[^/][^\\0]*$", 240, 7},
+    {"(^|/)\\.\\.(/|$)", 247, 11},
+    {"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$", 258, 12},
+    {"^[A-Za-z0-9_.-]+$", 270, 7},
+    {"^\\S+$", 277, 7},
+    {"^InChI=\\S+$", 284, 13},
+    {"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", 297, 30},
+    {"^x_", 327, 4},
+    {"^custom\\.[A-Za-z0-9_]+$", 331, 14},
+    {"^custom\\.", 345, 9},
+    {"^attachment\\.[A-Za-z0-9_.-]+$", 354, 18},
+    {"^(input|log|attachment\\.[A-Za-z0-9_.-]+)$", 372, 30},
+    {"^x_[A-Za-z0-9_]+(\\.[A-Za-z0-9_.-]+)\077$", 402, 15},
+    {"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", 417, 39},
+    {"^x_[A-Za-z0-9_]+$", 456, 9},
+};
+inline constexpr RxOp kRxOps[465] = {
+    {kRxLineStart, 0, 0}, {kRxClass, 0, 3}, {kRxClass, 0, 3}, {kRxClass, 0, 3},
+    {kRxClass, 0, 3}, {kRxClass, 0, 3}, {kRxClass, 0, 3}, {kRxClass, 0, 3}, {kRxSplit, 9, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 11, 122}, {kRxClass, 0, 3}, {kRxSplit, 13, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 15, 122}, {kRxClass, 0, 3}, {kRxSplit, 17, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 19, 122}, {kRxClass, 0, 3}, {kRxSplit, 21, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 23, 122}, {kRxClass, 0, 3}, {kRxSplit, 25, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 27, 122}, {kRxClass, 0, 3}, {kRxSplit, 29, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 31, 122}, {kRxClass, 0, 3}, {kRxSplit, 33, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 35, 122}, {kRxClass, 0, 3}, {kRxSplit, 37, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 39, 122}, {kRxClass, 0, 3}, {kRxSplit, 41, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 43, 122}, {kRxClass, 0, 3}, {kRxSplit, 45, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 47, 122}, {kRxClass, 0, 3}, {kRxSplit, 49, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 51, 122}, {kRxClass, 0, 3}, {kRxSplit, 53, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 55, 122}, {kRxClass, 0, 3}, {kRxSplit, 57, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 59, 122}, {kRxClass, 0, 3}, {kRxSplit, 61, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 63, 122}, {kRxClass, 0, 3}, {kRxSplit, 65, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 67, 122}, {kRxClass, 0, 3}, {kRxSplit, 69, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 71, 122}, {kRxClass, 0, 3}, {kRxSplit, 73, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 75, 122}, {kRxClass, 0, 3}, {kRxSplit, 77, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 79, 122}, {kRxClass, 0, 3}, {kRxSplit, 81, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 83, 122}, {kRxClass, 0, 3}, {kRxSplit, 85, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 87, 122}, {kRxClass, 0, 3}, {kRxSplit, 89, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 91, 122}, {kRxClass, 0, 3}, {kRxSplit, 93, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 95, 122}, {kRxClass, 0, 3}, {kRxSplit, 97, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 99, 122}, {kRxClass, 0, 3}, {kRxSplit, 101, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 103, 122}, {kRxClass, 0, 3}, {kRxSplit, 105, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 107, 122}, {kRxClass, 0, 3}, {kRxSplit, 109, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 111, 122}, {kRxClass, 0, 3}, {kRxSplit, 113, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 115, 122}, {kRxClass, 0, 3}, {kRxSplit, 117, 122},
+    {kRxClass, 0, 3}, {kRxSplit, 119, 122}, {kRxClass, 0, 3}, {kRxSplit, 121, 122},
+    {kRxClass, 0, 3}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0},
+    {kRxClass, 3, 1}, {kRxClass, 3, 1}, {kRxClass, 3, 1}, {kRxClass, 3, 1}, {kRxClass, 4, 1},
+    {kRxSplit, 7, 10}, {kRxClass, 5, 1}, {kRxClass, 6, 1}, {kRxJump, 12, 0}, {kRxClass, 7, 1},
+    {kRxClass, 8, 1}, {kRxClass, 4, 1}, {kRxSplit, 14, 17}, {kRxClass, 5, 1}, {kRxClass, 6, 1},
+    {kRxJump, 23, 0}, {kRxSplit, 18, 21}, {kRxClass, 9, 1}, {kRxClass, 3, 1}, {kRxJump, 23, 0},
+    {kRxClass, 10, 1}, {kRxClass, 11, 1}, {kRxClass, 12, 1}, {kRxSplit, 25, 28},
+    {kRxClass, 11, 1}, {kRxClass, 3, 1}, {kRxJump, 30, 0}, {kRxClass, 13, 1},
+    {kRxClass, 14, 1}, {kRxClass, 15, 1}, {kRxClass, 16, 1}, {kRxClass, 3, 1},
+    {kRxClass, 15, 1}, {kRxSplit, 35, 38}, {kRxClass, 16, 1}, {kRxClass, 3, 1},
+    {kRxJump, 40, 0}, {kRxClass, 17, 1}, {kRxClass, 5, 1}, {kRxSplit, 41, 46},
+    {kRxClass, 18, 1}, {kRxClass, 3, 1}, {kRxSplit, 44, 46}, {kRxClass, 3, 1},
+    {kRxJump, 43, 0}, {kRxClass, 19, 1}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0},
+    {kRxLineStart, 0, 0}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0},
+    {kRxNotClass, 22, 1}, {kRxSplit, 3, 5}, {kRxNotClass, 23, 1}, {kRxJump, 2, 0},
+    {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxSplit, 1, 3}, {kRxLineStart, 0, 0},
+    {kRxJump, 4, 0}, {kRxClass, 22, 1}, {kRxClass, 18, 1}, {kRxClass, 18, 1}, {kRxSplit, 7, 9},
+    {kRxClass, 22, 1}, {kRxJump, 10, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0},
+    {kRxLineStart, 0, 0}, {kRxClass, 24, 3}, {kRxSplit, 3, 5}, {kRxClass, 27, 9},
+    {kRxJump, 2, 0}, {kRxClass, 22, 1}, {kRxClass, 24, 3}, {kRxSplit, 8, 10},
+    {kRxClass, 27, 9}, {kRxJump, 7, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0},
+    {kRxLineStart, 0, 0}, {kRxClass, 36, 5}, {kRxSplit, 3, 5}, {kRxClass, 36, 5},
+    {kRxJump, 2, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0},
+    {kRxNotClass, 41, 10}, {kRxSplit, 3, 5}, {kRxNotClass, 41, 10}, {kRxJump, 2, 0},
+    {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxClass, 51, 1},
+    {kRxClass, 52, 1}, {kRxClass, 53, 1}, {kRxClass, 54, 1}, {kRxClass, 51, 1},
+    {kRxClass, 55, 1}, {kRxNotClass, 41, 10}, {kRxSplit, 9, 11}, {kRxNotClass, 41, 10},
+    {kRxJump, 8, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 4, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1}, {kRxClass, 56, 1},
+    {kRxClass, 56, 1}, {kRxClass, 4, 1}, {kRxClass, 56, 1}, {kRxLineEnd, 0, 0},
+    {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxClass, 57, 1}, {kRxClass, 58, 1},
+    {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxClass, 59, 1}, {kRxClass, 60, 1},
+    {kRxClass, 61, 1}, {kRxClass, 62, 1}, {kRxClass, 63, 1}, {kRxClass, 64, 1},
+    {kRxClass, 18, 1}, {kRxClass, 65, 4}, {kRxSplit, 10, 12}, {kRxClass, 65, 4},
+    {kRxJump, 9, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0},
+    {kRxClass, 59, 1}, {kRxClass, 60, 1}, {kRxClass, 61, 1}, {kRxClass, 62, 1},
+    {kRxClass, 63, 1}, {kRxClass, 64, 1}, {kRxClass, 18, 1}, {kRxMatch, 0, 0},
+    {kRxLineStart, 0, 0}, {kRxClass, 69, 1}, {kRxClass, 62, 1}, {kRxClass, 62, 1},
+    {kRxClass, 69, 1}, {kRxClass, 59, 1}, {kRxClass, 54, 1}, {kRxClass, 64, 1},
+    {kRxClass, 70, 1}, {kRxClass, 52, 1}, {kRxClass, 62, 1}, {kRxClass, 18, 1},
+    {kRxClass, 36, 5}, {kRxSplit, 14, 16}, {kRxClass, 36, 5}, {kRxJump, 13, 0},
+    {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxSplit, 2, 8},
+    {kRxClass, 71, 1}, {kRxClass, 52, 1}, {kRxClass, 72, 1}, {kRxClass, 60, 1},
+    {kRxClass, 62, 1}, {kRxJump, 28, 0}, {kRxSplit, 9, 13}, {kRxClass, 73, 1},
+    {kRxClass, 63, 1}, {kRxClass, 74, 1}, {kRxJump, 28, 0}, {kRxClass, 69, 1},
+    {kRxClass, 62, 1}, {kRxClass, 62, 1}, {kRxClass, 69, 1}, {kRxClass, 59, 1},
+    {kRxClass, 54, 1}, {kRxClass, 64, 1}, {kRxClass, 70, 1}, {kRxClass, 52, 1},
+    {kRxClass, 62, 1}, {kRxClass, 18, 1}, {kRxClass, 36, 5}, {kRxSplit, 26, 28},
+    {kRxClass, 36, 5}, {kRxJump, 25, 0}, {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0},
+    {kRxLineStart, 0, 0}, {kRxClass, 57, 1}, {kRxClass, 58, 1}, {kRxClass, 65, 4},
+    {kRxSplit, 5, 7}, {kRxClass, 65, 4}, {kRxJump, 4, 0}, {kRxSplit, 8, 13}, {kRxClass, 18, 1},
+    {kRxClass, 36, 5}, {kRxSplit, 11, 13}, {kRxClass, 36, 5}, {kRxJump, 10, 0},
+    {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 4, 1},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 4, 1}, {kRxClass, 75, 1}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 4, 1}, {kRxClass, 76, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 4, 1}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2},
+    {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxClass, 20, 2}, {kRxLineEnd, 0, 0},
+    {kRxMatch, 0, 0}, {kRxLineStart, 0, 0}, {kRxClass, 57, 1}, {kRxClass, 58, 1},
+    {kRxClass, 65, 4}, {kRxSplit, 5, 7}, {kRxClass, 65, 4}, {kRxJump, 4, 0},
+    {kRxLineEnd, 0, 0}, {kRxMatch, 0, 0},
+};
+inline constexpr std::uint32_t kRxRanges[156] = {
+    0x30, 0x39, 0x41, 0x46, 0x61, 0x66, 0x30, 0x39, 0x2D, 0x2D, 0x30, 0x30, 0x31, 0x39, 0x31,
+    0x31, 0x30, 0x32, 0x31, 0x32, 0x33, 0x33, 0x30, 0x31, 0x54, 0x54, 0x32, 0x32, 0x30, 0x33,
+    0x3A, 0x3A, 0x30, 0x35, 0x36, 0x36, 0x2E, 0x2E, 0x5A, 0x5A, 0x30, 0x39, 0x61, 0x66, 0x2F,
+    0x2F, 0x0, 0x0, 0x30, 0x39, 0x41, 0x5A, 0x61, 0x7A, 0x21, 0x21, 0x23, 0x24, 0x26, 0x26,
+    0x2B, 0x2B, 0x2D, 0x2E, 0x30, 0x39, 0x41, 0x5A, 0x5E, 0x5F, 0x61, 0x7A, 0x2D, 0x2E, 0x30,
+    0x39, 0x41, 0x5A, 0x5F, 0x5F, 0x61, 0x7A, 0x9, 0xD, 0x20, 0x20, 0xA0, 0xA0, 0x1680, 0x1680,
+    0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x202F, 0x205F, 0x205F, 0x3000, 0x3000, 0xFEFF,
+    0xFEFF, 0x49, 0x49, 0x6E, 0x6E, 0x43, 0x43, 0x68, 0x68, 0x3D, 0x3D, 0x41, 0x5A, 0x78, 0x78,
+    0x5F, 0x5F, 0x63, 0x63, 0x75, 0x75, 0x73, 0x73, 0x74, 0x74, 0x6F, 0x6F, 0x6D, 0x6D, 0x30,
+    0x39, 0x41, 0x5A, 0x5F, 0x5F, 0x61, 0x7A, 0x61, 0x61, 0x65, 0x65, 0x69, 0x69, 0x70, 0x70,
+    0x6C, 0x6C, 0x67, 0x67, 0x31, 0x38, 0x38, 0x39, 0x61, 0x62,
+};
+
+}  // namespace schema_table
+}  // namespace detail
+}  // namespace qvf
+
+#endif  // QVF_SCHEMA_TABLE_HPP
+
+// ===== src/qvf_schema_check.hpp =====
+
+// qvf_schema_check.hpp — the table-driven JSON Schema checker of the C++
+// validator. Internal, header-only; part of the zero-dependency QVF library.
+//
+// scripts/gen_kinds.py compiles spec/qvf_manifest.schema.json into the
+// instruction table of qvf_schema_table.hpp: one node per schema object, one
+// op per assertion keyword, with shared pools of strings, numbers, JSON
+// literals and compiled patterns. This file interprets that table. It knows
+// nothing about QVF: everything schema-specific is in the table, so a schema
+// change only needs the table regenerated.
+//
+// The errors are the ones the Python reference validator gets from
+// jsonschema's Draft202012Validator.iter_errors(): keywords that apply to
+// children (properties, patternProperties, additionalProperties with a
+// schema, prefixItems, items, allOf, $ref, if/then/else, dependentSchemas)
+// report their children's errors at the children's locations; every other
+// keyword — oneOf, anyOf, not and contains among them — reports one error at
+// the instance it applies to. A finding's location is therefore the same JSON
+// pointer in both validators; the messages are worded independently.
+//
+// Patterns are run by a small Pike VM over Unicode code points (linear time,
+// no recursion, no <regex>), with ECMA-262 semantics: `$` matches only at the
+// end of the string. (Python's re also matches `$` before a final newline,
+// the one known divergence from the Python reference.) License: Apache-2.0.
+#ifndef QVF_SCHEMA_CHECK_HPP
+#define QVF_SCHEMA_CHECK_HPP
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+
+namespace qvf {
+namespace detail {
+namespace schema {
+
+namespace tbl = schema_table;
+
+// One schema error. `pointer` is the RFC 6901 JSON pointer of the failing
+// value inside the checked document ("" for the document itself), `location`
+// the same path unescaped and '/'-joined, as the Python validator prints it.
+struct Error {
+    std::string pointer;
+    std::string location;
+    std::string message;
+};
+
+// --- JSON helpers -------------------------------------------------------------
+
+// The value of the last member named `key`: a parsed object may repeat a key,
+// and Python's json module keeps the last one.
+inline const Json* find_last(const Json& obj, std::string_view key) {
+    const auto& items = obj.items();
+    for (auto it = items.rbegin(); it != items.rend(); ++it)
+        if (it->first == key) return &it->second;
+    return nullptr;
+}
+
+// The members of an object with each key once (first-occurrence order, last
+// value), the view Python has of a parsed object.
+inline std::vector<std::pair<const std::string*, const Json*>> unique_members(const Json& obj) {
+    std::vector<std::pair<const std::string*, const Json*>> out;
+    const auto& items = obj.items();
+    out.reserve(items.size());
+    if (items.size() <= 8) {
+        for (const auto& kv : items) {
+            bool seen = false;
+            for (auto& o : out)
+                if (*o.first == kv.first) { o.second = &kv.second; seen = true; break; }
+            if (!seen) out.emplace_back(&kv.first, &kv.second);
+        }
+        return out;
+    }
+    std::unordered_map<std::string_view, std::size_t> index;
+    index.reserve(items.size());
+    for (const auto& kv : items) {
+        auto it = index.find(kv.first);
+        if (it != index.end()) {
+            out[it->second].second = &kv.second;
+        } else {
+            index.emplace(kv.first, out.size());
+            out.emplace_back(&kv.first, &kv.second);
+        }
+    }
+    return out;
+}
+
+inline bool is_integral(const Json& v) {
+    if (v.type() == Json::Type::Int) return true;
+    if (v.type() != Json::Type::Double) return false;
+    const double d = v.as_double();
+    return std::isfinite(d) && std::floor(d) == d;
+}
+
+// JSON equality as jsonschema decides it: booleans are not numbers, 1 == 1.0,
+// arrays and objects compare by value.
+inline bool json_equal(const Json& a, const Json& b) {
+    if (a.is_bool() || b.is_bool()) return a.is_bool() && b.is_bool() && a.as_bool() == b.as_bool();
+    if (a.is_number() && b.is_number()) {
+        if (a.type() == Json::Type::Int && b.type() == Json::Type::Int)
+            return a.as_int() == b.as_int();
+        return a.as_double() == b.as_double();
+    }
+    if (a.type() != b.type()) return false;
+    switch (a.type()) {
+        case Json::Type::Null: return true;
+        case Json::Type::String: return a.as_string() == b.as_string();
+        case Json::Type::Array: {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (!json_equal(a.at(i), b.at(i))) return false;
+            return true;
+        }
+        case Json::Type::Object: {
+            const auto ua = unique_members(a);
+            const auto ub = unique_members(b);
+            if (ua.size() != ub.size()) return false;
+            for (const auto& kv : ua) {
+                const Json* other = find_last(b, *kv.first);
+                if (!other || !json_equal(*kv.second, *other)) return false;
+            }
+            return true;
+        }
+        default: return false;
+    }
+}
+
+// Number of Unicode code points of a UTF-8 string.
+inline std::size_t code_point_count(const std::string& s) {
+    std::size_t n = 0;
+    for (char c : s)
+        if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+// The code points of a UTF-8 string; a malformed byte stands for itself.
+inline std::vector<std::uint32_t> code_points(const std::string& s) {
+    std::vector<std::uint32_t> out;
+    out.reserve(s.size());
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        std::size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3
+                                       : (c & 0xF8) == 0xF0 ? 4 : 0;
+        std::uint32_t cp = len == 1 ? c : len == 2 ? (c & 0x1Fu) : len == 3 ? (c & 0x0Fu)
+                                                                             : (c & 0x07u);
+        bool ok = len != 0 && i + len <= s.size();
+        for (std::size_t k = 1; ok && k < len; ++k) {
+            const unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xC0) != 0x80) ok = false;
+            else cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (!ok) { out.push_back(c); ++i; continue; }
+        out.push_back(cp);
+        i += len;
+    }
+    return out;
+}
+
+// A compact rendering of a value for messages.
+inline std::string show(const Json& v) {
+    std::string s;
+    try {
+        s = v.dump(0);
+    } catch (const std::exception&) {
+        return "<value>";
+    }
+    if (s.size() > 80) {
+        std::size_t cut = 77;   // never inside a UTF-8 sequence
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+        s = s.substr(0, cut) + "...";
+    }
+    return s;
+}
+
+inline std::string show_number(double x) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.17g", x);
+    return buf;
+}
+
+// The JSON literals of the table (const / enum values), parsed once.
+inline const std::vector<Json>& table_values() {
+    static const std::vector<Json> values = [] {
+        std::vector<Json> out;
+        for (const char* text : tbl::kValues) {
+            try {
+                out.push_back(Json::parse(text));
+            } catch (const std::exception&) {
+                out.push_back(Json());   // the empty-pool placeholder
+            }
+        }
+        return out;
+    }();
+    return values;
+}
+
+// --- patterns -------------------------------------------------------------------
+
+inline bool rx_class_match(const tbl::RxOp& op, std::uint32_t c) {
+    bool in = false;
+    for (std::int32_t k = 0; k < op.y && !in; ++k) {
+        const std::size_t r = 2 * static_cast<std::size_t>(op.x + k);
+        in = c >= tbl::kRxRanges[r] && c <= tbl::kRxRanges[r + 1];
+    }
+    return op.code == tbl::kRxClass ? in : !in;
+}
+
+// True when compiled pattern `rx` matches anywhere in `text` (JSON Schema
+// patterns are unanchored). A Pike VM: every live thread advances in lock
+// step, so the run time is linear in the text and the program.
+inline bool rx_search(std::int32_t rx, const std::string& text) {
+    const tbl::RxProgram& prog = tbl::kRxPrograms[rx];
+    const tbl::RxOp* ops = tbl::kRxOps + prog.first;
+    const std::vector<std::uint32_t> cps = code_points(text);
+    const std::size_t none = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> mark(static_cast<std::size_t>(prog.count), none);
+    std::vector<std::int32_t> cur, next, stack;
+    std::size_t step = 0;
+    bool matched = false;
+    // Add the epsilon closure of `pc` at text position `pos` to `list`.
+    auto add = [&](std::vector<std::int32_t>& list, std::int32_t start, std::size_t pos) {
+        stack.push_back(start);
+        while (!stack.empty()) {
+            const std::int32_t pc = stack.back();
+            stack.pop_back();
+            std::size_t& seen = mark[static_cast<std::size_t>(pc)];
+            if (seen == step) continue;
+            seen = step;
+            const tbl::RxOp& op = ops[pc];
+            switch (op.code) {
+                case tbl::kRxJump: stack.push_back(op.x); break;
+                case tbl::kRxSplit:
+                    stack.push_back(op.y);
+                    stack.push_back(op.x);
+                    break;
+                case tbl::kRxLineStart:
+                    if (pos == 0) stack.push_back(pc + 1);
+                    break;
+                case tbl::kRxLineEnd:
+                    if (pos == cps.size()) stack.push_back(pc + 1);
+                    break;
+                case tbl::kRxMatch: matched = true; break;
+                default: list.push_back(pc); break;   // Class / NotClass
+            }
+        }
+    };
+    add(cur, 0, 0);
+    for (std::size_t pos = 0; pos < cps.size() && !matched; ++pos) {
+        ++step;
+        next.clear();
+        for (std::int32_t pc : cur)
+            if (rx_class_match(ops[pc], cps[pos])) add(next, pc + 1, pos + 1);
+        add(next, 0, pos + 1);   // a match may start at any position
+        std::swap(cur, next);
+    }
+    return matched;
+}
+
+// --- the interpreter --------------------------------------------------------------
+
+inline std::string type_names(std::int32_t mask) {
+    static const struct {
+        std::int32_t bit;
+        const char* name;
+    } kNames[] = {{tbl::kTypeNull, "null"},     {tbl::kTypeBoolean, "boolean"},
+                  {tbl::kTypeObject, "object"}, {tbl::kTypeArray, "array"},
+                  {tbl::kTypeNumber, "number"}, {tbl::kTypeString, "string"},
+                  {tbl::kTypeInteger, "integer"}};
+    std::string out;
+    for (const auto& n : kNames)
+        if (mask & n.bit) out += (out.empty() ? "'" : ", '") + std::string(n.name) + "'";
+    return out;
+}
+
+inline bool type_matches(std::int32_t mask, const Json& v) {
+    switch (v.type()) {
+        case Json::Type::Null: return (mask & tbl::kTypeNull) != 0;
+        case Json::Type::Bool: return (mask & tbl::kTypeBoolean) != 0;
+        case Json::Type::Object: return (mask & tbl::kTypeObject) != 0;
+        case Json::Type::Array: return (mask & tbl::kTypeArray) != 0;
+        case Json::Type::String: return (mask & tbl::kTypeString) != 0;
+        case Json::Type::Int: return (mask & (tbl::kTypeNumber | tbl::kTypeInteger)) != 0;
+        case Json::Type::Double:
+            return (mask & tbl::kTypeNumber) != 0 ||
+                   ((mask & tbl::kTypeInteger) != 0 && is_integral(v));
+        default: return false;
+    }
+}
+
+class Evaluator {
+public:
+    // Collects errors into `out`; with nullptr it only decides validity and
+    // stops at the first failure.
+    explicit Evaluator(std::vector<Error>* out) : out_(out) {}
+
+    bool eval(std::int32_t node, const Json& v) {
+        const tbl::Node& n = tbl::kNodes[node];
+        bool ok = true;
+        for (std::int32_t i = 0; i < n.count; ++i) {
+            if (!apply(tbl::kOps[n.first + i], n, v)) {
+                ok = false;
+                if (!out_) return false;
+            }
+        }
+        return ok;
+    }
+
+private:
+    std::vector<Error>* out_;
+    std::vector<std::string> path_;
+
+    static bool valid(std::int32_t node, const Json& v) {
+        Evaluator e(nullptr);
+        return e.eval(node, v);
+    }
+
+    bool fail(std::string message) {
+        if (out_) {
+            Error e;
+            for (std::size_t i = 0; i < path_.size(); ++i) {
+                e.pointer.push_back('/');
+                for (char c : path_[i]) {
+                    if (c == '~') e.pointer += "~0";
+                    else if (c == '/') e.pointer += "~1";
+                    else e.pointer.push_back(c);
+                }
+                if (i) e.location.push_back('/');
+                e.location += path_[i];
+            }
+            e.message = std::move(message);
+            out_->push_back(std::move(e));
+        }
+        return false;
+    }
+
+    // Evaluate a child value under `node`, one path segment deeper.
+    bool descend(std::int32_t node, const Json& v, std::string segment) {
+        if (!out_) return eval(node, v);
+        path_.push_back(std::move(segment));
+        const bool ok = eval(node, v);
+        path_.pop_back();
+        return ok;
+    }
+
+    static const char* str(std::int32_t i) { return tbl::kStrings[i]; }
+    static std::int32_t list(std::int32_t i) { return tbl::kLists[i]; }
+
+    // The non-additional keys of a node: its Properties names and the
+    // patterns of its PatternProperties.
+    static bool declared(const tbl::Node& n, const std::string& key) {
+        for (std::int32_t i = 0; i < n.count; ++i) {
+            const tbl::Op& o = tbl::kOps[n.first + i];
+            if (o.code == tbl::kProperties) {
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (key == str(tbl::kPairs[o.a + 2 * k])) return true;
+            } else if (o.code == tbl::kPatternProperties) {
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (rx_search(tbl::kPairs[o.a + 2 * k], key)) return true;
+            }
+        }
+        return false;
+    }
+
+    bool apply(const tbl::Op& o, const tbl::Node& n, const Json& v) {
+        switch (o.code) {
+            case tbl::kFalse:
+                return fail("False schema does not allow " + show(v));
+            case tbl::kType:
+                if (type_matches(o.a, v)) return true;
+                return fail(show(v) + " is not of type " + type_names(o.a));
+            case tbl::kConst:
+                if (json_equal(v, table_values()[static_cast<std::size_t>(o.a)])) return true;
+                return fail(std::string(tbl::kValues[o.a]) + " was expected");
+            case tbl::kEnum: {
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (json_equal(v, table_values()[static_cast<std::size_t>(list(o.a + k))]))
+                        return true;
+                if (!out_) return false;
+                std::string names;
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    names += (k ? ", " : "") + std::string(tbl::kValues[list(o.a + k)]);
+                return fail(show(v) + " is not one of [" + names + "]");
+            }
+            case tbl::kRef:
+                return eval(o.a, v);
+            case tbl::kAllOf: {
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (!eval(list(o.a + k), v)) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                return ok;
+            }
+            case tbl::kAnyOf:
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (valid(list(o.a + k), v)) return true;
+                return fail(show(v) + " is not valid under any of the given schemas");
+            case tbl::kOneOf: {
+                std::int32_t matches = 0;
+                for (std::int32_t k = 0; k < o.b && matches < 2; ++k)
+                    if (valid(list(o.a + k), v)) ++matches;
+                if (matches == 1) return true;
+                return fail(show(v) + (matches == 0
+                                           ? " is not valid under any of the given schemas"
+                                           : " is valid under more than one of the given schemas"));
+            }
+            case tbl::kNot:
+                if (!valid(o.a, v)) return true;
+                return fail(show(v) + " should not be valid under the given schema");
+            case tbl::kIf:
+                if (valid(o.a, v)) return o.b < 0 || eval(o.b, v);
+                return o.c < 0 || eval(o.c, v);
+            case tbl::kProperties: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b; ++k) {
+                    const char* name = str(tbl::kPairs[o.a + 2 * k]);
+                    if (const Json* m = find_last(v, name))
+                        if (!descend(tbl::kPairs[o.a + 2 * k + 1], *m, name)) {
+                            ok = false;
+                            if (!out_) return false;
+                        }
+                }
+                return ok;
+            }
+            case tbl::kPatternProperties: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                const auto members = unique_members(v);
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    for (const auto& kv : members)
+                        if (rx_search(tbl::kPairs[o.a + 2 * k], *kv.first) &&
+                            !descend(tbl::kPairs[o.a + 2 * k + 1], *kv.second, *kv.first)) {
+                            ok = false;
+                            if (!out_) return false;
+                        }
+                return ok;
+            }
+            case tbl::kAdditionalProperties: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                std::string extras;
+                for (const auto& kv : unique_members(v)) {
+                    if (declared(n, *kv.first)) continue;
+                    if (o.a < 0) {
+                        extras += (extras.empty() ? "'" : ", '") + *kv.first + "'";
+                        if (!out_) return false;
+                    } else if (!descend(o.a, *kv.second, *kv.first)) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                }
+                if (!extras.empty())
+                    return fail("additional properties are not allowed (" + extras +
+                                " unexpected)");
+                return ok;
+            }
+            case tbl::kRequired: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b; ++k) {
+                    const char* name = str(list(o.a + k));
+                    if (!find_last(v, name)) {
+                        ok = fail("'" + std::string(name) + "' is a required property");
+                        if (!out_) return false;
+                    }
+                }
+                return ok;
+            }
+            case tbl::kDependentRequired: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b; ++k) {
+                    const std::int32_t* t = tbl::kTriples + o.a + 3 * k;
+                    if (!find_last(v, str(t[0]))) continue;
+                    for (std::int32_t d = 0; d < t[2]; ++d) {
+                        const char* dep = str(list(t[1] + d));
+                        if (!find_last(v, dep)) {
+                            ok = fail("'" + std::string(dep) + "' is a dependency of '" +
+                                      str(t[0]) + "'");
+                            if (!out_) return false;
+                        }
+                    }
+                }
+                return ok;
+            }
+            case tbl::kDependentSchemas: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b; ++k)
+                    if (find_last(v, str(tbl::kPairs[o.a + 2 * k])) &&
+                        !eval(tbl::kPairs[o.a + 2 * k + 1], v)) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                return ok;
+            }
+            case tbl::kPropertyNames: {
+                if (!v.is_object()) return true;
+                bool ok = true;
+                for (const auto& kv : unique_members(v))
+                    if (!eval(o.a, Json(*kv.first))) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                return ok;
+            }
+            case tbl::kMinProperties:
+                if (!v.is_object() || unique_members(v).size() >= static_cast<std::size_t>(o.a))
+                    return true;
+                return fail(show(v) + " does not have enough properties");
+            case tbl::kMaxProperties:
+                if (!v.is_object() || unique_members(v).size() <= static_cast<std::size_t>(o.a))
+                    return true;
+                return fail(show(v) + " has too many properties");
+            case tbl::kPrefixItems: {
+                if (!v.is_array()) return true;
+                bool ok = true;
+                for (std::int32_t k = 0; k < o.b && static_cast<std::size_t>(k) < v.size(); ++k)
+                    if (!descend(list(o.a + k), v.at(static_cast<std::size_t>(k)),
+                                 std::to_string(k))) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                return ok;
+            }
+            case tbl::kItems: {
+                if (!v.is_array() || v.size() <= static_cast<std::size_t>(o.b)) return true;
+                if (o.a < 0)
+                    return fail("expected at most " + std::to_string(o.b) + " items, found " +
+                                std::to_string(v.size()));
+                bool ok = true;
+                for (std::size_t i = static_cast<std::size_t>(o.b); i < v.size(); ++i)
+                    if (!descend(o.a, v.at(i), std::to_string(i))) {
+                        ok = false;
+                        if (!out_) return false;
+                    }
+                return ok;
+            }
+            case tbl::kContains: {
+                if (!v.is_array()) return true;
+                std::int32_t matches = 0;
+                for (const Json& item : v.elements()) {
+                    if (!valid(o.a, item)) continue;
+                    if (++matches > o.c && o.c >= 0)
+                        return fail("too many items match the given schema (expected at most " +
+                                    std::to_string(o.c) + ")");
+                }
+                if (matches >= o.b) return true;
+                return fail(matches == 0
+                                ? show(v) + " does not contain items matching the given schema"
+                                : "too few items match the given schema (expected at least " +
+                                      std::to_string(o.b) + ", " + std::to_string(matches) +
+                                      " matched)");
+            }
+            case tbl::kMinItems:
+                if (!v.is_array() || v.size() >= static_cast<std::size_t>(o.a)) return true;
+                return fail(show(v) + " is too short (at least " + std::to_string(o.a) +
+                            " items)");
+            case tbl::kMaxItems:
+                if (!v.is_array() || v.size() <= static_cast<std::size_t>(o.a)) return true;
+                return fail(show(v) + " is too long (at most " + std::to_string(o.a) + " items)");
+            case tbl::kUniqueItems: {
+                if (!v.is_array()) return true;
+                for (std::size_t i = 0; i < v.size(); ++i)
+                    for (std::size_t j = i + 1; j < v.size(); ++j)
+                        if (json_equal(v.at(i), v.at(j)))
+                            return fail(show(v) + " has non-unique elements");
+                return true;
+            }
+            case tbl::kMinimum:
+            case tbl::kMaximum:
+            case tbl::kExclusiveMinimum:
+            case tbl::kExclusiveMaximum: {
+                if (!v.is_number()) return true;
+                const double x = v.as_double(), lim = tbl::kNumbers[o.a];
+                const bool bad = o.code == tbl::kMinimum            ? x < lim
+                                 : o.code == tbl::kMaximum          ? x > lim
+                                 : o.code == tbl::kExclusiveMinimum ? x <= lim
+                                                                    : x >= lim;
+                if (!bad) return true;
+                const char* what = o.code == tbl::kMinimum            ? " is less than the minimum of "
+                                   : o.code == tbl::kMaximum          ? " is greater than the maximum of "
+                                   : o.code == tbl::kExclusiveMinimum ? " is less than or equal to the minimum of "
+                                                                      : " is greater than or equal to the maximum of ";
+                return fail(show(v) + what + show_number(lim));
+            }
+            case tbl::kMultipleOf: {
+                if (!v.is_number()) return true;
+                const double x = v.as_double(), d = tbl::kNumbers[o.a];
+                bool bad;
+                if (v.type() == Json::Type::Int && std::floor(d) == d) {
+                    bad = std::fmod(x, d) != 0.0;
+                } else {
+                    const double q = x / d;
+                    bad = !std::isfinite(q) || std::trunc(q) != q;
+                }
+                if (!bad) return true;
+                return fail(show(v) + " is not a multiple of " + show_number(d));
+            }
+            case tbl::kMinLength:
+                if (!v.is_string() || code_point_count(v.as_string()) >= static_cast<std::size_t>(o.a))
+                    return true;
+                return fail(show(v) + (o.a == 1 ? " should be non-empty"
+                                                : " is too short (at least " +
+                                                      std::to_string(o.a) + " characters)"));
+            case tbl::kMaxLength:
+                if (!v.is_string() || code_point_count(v.as_string()) <= static_cast<std::size_t>(o.a))
+                    return true;
+                return fail(show(v) + " is too long (at most " + std::to_string(o.a) +
+                            " characters)");
+            case tbl::kPattern:
+                if (!v.is_string() || rx_search(o.a, v.as_string())) return true;
+                return fail(show(v) + " does not match '" + tbl::kRxPrograms[o.a].source + "'");
+            default:
+                return fail("unknown schema opcode " + std::to_string(o.code));
+        }
+    }
+};
+
+// The node of a $defs entry, or -1.
+inline std::int32_t definition_node(std::string_view name) {
+    for (const tbl::Def& d : tbl::kDefs)
+        if (name == d.name) return d.node;
+    return -1;
+}
+
+// Every schema error of `doc` against the node.
+inline std::vector<Error> check_node(std::int32_t node, const Json& doc) {
+    std::vector<Error> out;
+    Evaluator(&out).eval(node, doc);
+    return out;
+}
+
+// Every schema error of a manifest.json document against the root schema.
+inline std::vector<Error> check_manifest(const Json& manifest) {
+    return check_node(tbl::kRoot, manifest);
+}
+
+// Every schema error of a payload against the $defs entry `def` (nothing for
+// an unknown entry).
+inline std::vector<Error> check_definition(std::string_view def, const Json& doc) {
+    const std::int32_t node = definition_node(def);
+    if (node < 0) return {};
+    return check_node(node, doc);
+}
+
+}  // namespace schema
+}  // namespace detail
+}  // namespace qvf
+
+#endif  // QVF_SCHEMA_CHECK_HPP
+
+// ===== src/qvf_container.cpp =====
+
+// qvf_container.cpp — the ZIP container layer (qvf/container.hpp): ZIP64,
+// streamed entries, data descriptors, append, and capped reads.
+// License: Apache-2.0.
+
+#include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+
+
+namespace qvf {
+namespace container {
+
+namespace zipfmt {
+
+const uint32_t kSigLocal = 0x04034b50u;
+const uint32_t kSigCentral = 0x02014b50u;
+const uint32_t kSigEnd = 0x06054b50u;
+const uint32_t kSigEnd64 = 0x06064b50u;
+const uint32_t kSigLocator64 = 0x07064b50u;
+const uint32_t kSigDescriptor = 0x08074b50u;
+const uint64_t kMax32 = 0xFFFFFFFFull;
+const uint32_t kMax16 = 0xFFFFu;
+const uint16_t kFlagEncrypted = 0x0001;
+const uint16_t kFlagDescriptor = 0x0008;
+const uint16_t kFlagStrongEncryption = 0x0040;
+const uint16_t kFlagUtf8 = 0x0800;
+const size_t kChunk = size_t(1) << 20;
+
+inline void put16(std::vector<uint8_t>& o, uint32_t v) {
+    o.push_back(static_cast<uint8_t>(v & 0xFF));
+    o.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+inline void put32(std::vector<uint8_t>& o, uint32_t v) {
+    for (int i = 0; i < 4; ++i) o.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+inline void put64(std::vector<uint8_t>& o, uint64_t v) {
+    for (int i = 0; i < 8; ++i) o.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+inline uint16_t get16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+inline uint32_t get32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+inline uint64_t get64(const uint8_t* p) {
+    return static_cast<uint64_t>(get32(p)) | (static_cast<uint64_t>(get32(p + 4)) << 32);
+}
+inline uint32_t lo32(uint64_t v) { return static_cast<uint32_t>(v & 0xFFFFFFFFull); }
+
+[[noreturn]] inline void fail(const std::string& message) {
+    throw std::runtime_error("zip: " + message);
+}
+
+inline std::string qname(const std::string& name) { return "'" + name + "'"; }
+
+// General-purpose bit 11 marks a UTF-8 name; an ASCII name needs no flag.
+inline uint16_t name_flags(const std::string& name) {
+    for (unsigned char c : name)
+        if (c >= 0x80) return kFlagUtf8;
+    return 0;
+}
+
+// Find the ZIP64 extra field (0x0001) in `extra`; returns its body or null.
+inline const uint8_t* find_zip64_extra(const uint8_t* extra, size_t n, size_t& body_len) {
+    size_t q = 0;
+    while (q + 4 <= n) {
+        const uint16_t id = get16(extra + q);
+        const uint16_t len = get16(extra + q + 2);
+        if (q + 4 + len > n) return nullptr;
+        if (id == 0x0001) {
+            body_len = len;
+            return extra + q + 4;
+        }
+        q += 4u + len;
+    }
+    return nullptr;
+}
+
+// A local file header. With `zip64` it carries the ZIP64 extra field with
+// both sizes (APPNOTE 4.5.3); with `descriptor` the CRC and sizes are zero
+// and follow the data instead.
+inline std::vector<uint8_t> local_header(const std::string& name, uint16_t flags,
+                                         uint16_t method, uint32_t crc, uint64_t csize,
+                                         uint64_t usize, bool zip64, bool descriptor) {
+    std::vector<uint8_t> h;
+    h.reserve(30 + name.size() + (zip64 ? 20 : 0));
+    put32(h, kSigLocal);
+    put16(h, zip64 ? 45 : 20);      // version needed
+    put16(h, flags);
+    put16(h, method);
+    put16(h, 0);                    // mod time (fixed / zeroed)
+    put16(h, 0);                    // mod date
+    put32(h, descriptor ? 0 : crc);
+    if (zip64) {
+        // As Python's zipfile: zero with a descriptor, else saturated.
+        put32(h, descriptor ? 0 : lo32(kMax32));
+        put32(h, descriptor ? 0 : lo32(kMax32));
+    } else {
+        put32(h, descriptor ? 0 : lo32(csize));
+        put32(h, descriptor ? 0 : lo32(usize));
+    }
+    put16(h, static_cast<uint32_t>(name.size()));
+    put16(h, zip64 ? 20 : 0);       // extra length
+    h.insert(h.end(), name.begin(), name.end());
+    if (zip64) {
+        put16(h, 0x0001);
+        put16(h, 16);
+        put64(h, descriptor ? 0 : usize);
+        put64(h, descriptor ? 0 : csize);
+    }
+    return h;
+}
+
+}  // namespace zipfmt
+
+using namespace zipfmt;
+
+// ---------------------------------------------------------------------------
+// Sinks
+// ---------------------------------------------------------------------------
+
+void Sink::write_at(uint64_t, const uint8_t*, size_t) {
+    throw std::logic_error("zip: this sink cannot overwrite earlier bytes");
+}
+
+void MemorySink::write(const uint8_t* data, size_t n) {
+    if (n) bytes_.insert(bytes_.end(), data, data + n);
+}
+
+void MemorySink::write_at(uint64_t offset, const uint8_t* data, size_t n) {
+    if (offset > bytes_.size() || n > bytes_.size() - offset)
+        throw std::logic_error("zip: write_at past the end of the memory sink");
+    if (n) std::memcpy(bytes_.data() + offset, data, n);
+}
+
+struct FileSink::Impl {
+    std::fstream f;
+};
+
+FileSink::FileSink(const std::string& path) : impl_(new Impl), path_(path) {
+    impl_->f.open(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!impl_->f) throw std::runtime_error("cannot open for writing: " + path);
+}
+
+std::unique_ptr<FileSink> FileSink::open_at(const std::string& path, uint64_t offset) {
+    std::unique_ptr<FileSink> s(new FileSink());
+    s->impl_.reset(new Impl);
+    s->path_ = path;
+    s->impl_->f.open(path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!s->impl_->f) throw std::runtime_error("cannot open for update: " + path);
+    s->impl_->f.seekp(static_cast<std::streamoff>(offset));
+    if (!s->impl_->f) throw std::runtime_error("cannot seek in: " + path);
+    s->pos_ = offset;
+    s->truncate_on_close_ = true;
+    return s;
+}
+
+FileSink::~FileSink() {
+    if (impl_ && impl_->f.is_open()) impl_->f.close();
+}
+
+void FileSink::write(const uint8_t* data, size_t n) {
+    if (!impl_ || !impl_->f.is_open()) throw std::logic_error("zip: write to a closed file sink");
+    if (n == 0) return;
+    impl_->f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    if (!impl_->f) throw std::runtime_error("write failed: " + path_);
+    pos_ += n;
+}
+
+void FileSink::write_at(uint64_t offset, const uint8_t* data, size_t n) {
+    if (!impl_ || !impl_->f.is_open()) throw std::logic_error("zip: write to a closed file sink");
+    if (offset > pos_ || n > pos_ - offset)
+        throw std::logic_error("zip: write_at past the end of the file sink");
+    impl_->f.seekp(static_cast<std::streamoff>(offset));
+    impl_->f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    impl_->f.seekp(static_cast<std::streamoff>(pos_));
+    if (!impl_->f) throw std::runtime_error("write failed: " + path_);
+}
+
+void FileSink::close() {
+    if (!impl_ || !impl_->f.is_open()) return;
+    impl_->f.flush();
+    const bool ok = static_cast<bool>(impl_->f);
+    impl_->f.close();
+    if (!ok) throw std::runtime_error("write failed: " + path_);
+    if (truncate_on_close_) std::filesystem::resize_file(path_, pos_);
+}
+
+void CallbackSink::write(const uint8_t* data, size_t n) {
+    if (n == 0) return;
+    fn_(data, n);
+    pos_ += n;
+}
+
+// ---------------------------------------------------------------------------
+// ZipWriter
+// ---------------------------------------------------------------------------
+
+namespace impl {   // internal; named, not anonymous: the amalgamation is a header
+
+struct WriterEntry {
+    EntryInfo info;
+    bool forced = false;                 // forced ZIP64: every central field saturated
+    std::vector<uint8_t> raw_central;    // a record kept verbatim by append()
+};
+
+}  // namespace impl
+using impl::WriterEntry;
+
+struct ZipWriter::State {
+    std::unique_ptr<Sink> sink;
+    bool force_zip64 = false;
+    bool allow_duplicates = false;       // detail::ZipWriter builds malformed test archives
+    std::set<std::string> repeatable;    // names allow_repeated_name() lets repeat
+    std::vector<WriterEntry> entries;
+    std::map<std::string, size_t> index; // name -> last entry of that name
+    bool entry_open = false;
+    bool finished = false;
+    bool failed = false;
+
+    void reindex() {
+        index.clear();
+        for (size_t i = 0; i < entries.size(); ++i) index[entries[i].info.name] = i;
+    }
+    void check_writable() const {
+        if (finished) throw std::logic_error("zip: the archive is already finished");
+        if (failed) throw std::runtime_error("zip: an earlier write failed; the archive is unusable");
+        if (entry_open) throw std::logic_error("zip: an entry is still being streamed");
+    }
+    void check_name(const std::string& name) const {
+        if (name.empty()) throw std::invalid_argument("zip: empty entry name");
+        if (name.size() > 0xFFFF) throw std::invalid_argument("zip: entry name too long");
+        if (!allow_duplicates && !repeatable.count(name) && index.count(name))
+            throw std::invalid_argument("zip: duplicate entry name " + qname(name));
+    }
+    void emit(const uint8_t* data, size_t n) {
+        try {
+            sink->write(data, n);
+        } catch (...) {
+            failed = true;
+            throw;
+        }
+    }
+    void emit(const std::vector<uint8_t>& v) { emit(v.data(), v.size()); }
+    void patch(uint64_t offset, const std::vector<uint8_t>& v) {
+        try {
+            sink->write_at(offset, v.data(), v.size());
+        } catch (...) {
+            failed = true;
+            throw;
+        }
+    }
+    void add(WriterEntry e) {
+        index[e.info.name] = entries.size();
+        entries.push_back(std::move(e));
+    }
+};
+
+struct EntrySink::State {
+    // Shared, so an EntrySink never outlives the writer state it streams into.
+    std::shared_ptr<ZipWriter::State> w;
+    EntryInfo info;
+    bool forced = false;
+    bool descriptor = false;
+    bool open = true;
+    detail::Deflater deflater{detail::Deflater::Framing::Blocks};
+    detail::Crc32 crc;
+    detail::Sha256 sha;
+    std::vector<uint8_t> scratch;
+};
+
+ZipWriter::ZipWriter(std::unique_ptr<Sink> out, bool force_zip64) {
+    if (!out) throw std::invalid_argument("zip: null sink");
+    std::shared_ptr<State> st = std::make_shared<State>();
+    st->sink = std::move(out);
+    st->force_zip64 = force_zip64;
+    s_ = std::move(st);
+}
+
+ZipWriter::ZipWriter(ZipWriter&&) noexcept = default;
+ZipWriter& ZipWriter::operator=(ZipWriter&&) noexcept = default;
+ZipWriter::~ZipWriter() = default;
+
+void ZipWriter::allow_duplicate_names() { s_->allow_duplicates = true; }
+
+void ZipWriter::allow_repeated_name(const std::string& name) { s_->repeatable.insert(name); }
+
+EntrySink ZipWriter::begin(const std::string& name, Method method, bool force_zip64) {
+    State& s = *s_;
+    s.check_writable();
+    s.check_name(name);
+    if (method != Method::Store && method != Method::Deflate)
+        throw std::invalid_argument("zip: unsupported method");
+    std::unique_ptr<EntrySink::State> st(new EntrySink::State);
+    st->w = s_;
+    st->forced = force_zip64 || s.force_zip64;
+    st->descriptor = !s.sink->seekable();
+    st->info.name = name;
+    st->info.method = method;
+    st->info.flags = static_cast<uint16_t>(name_flags(name) |
+                                           (st->descriptor ? kFlagDescriptor : 0));
+    st->info.zip64 = st->forced;
+    st->info.local_offset = s.sink->position();
+    s.emit(local_header(name, st->info.flags, static_cast<uint16_t>(method), 0, 0, 0,
+                        st->info.zip64, st->descriptor));
+    s.entry_open = true;
+    return EntrySink(std::move(st));
+}
+
+EntryInfo ZipWriter::write(const std::string& name, const uint8_t* data, size_t n,
+                           Method method, bool force_zip64) {
+    State& s = *s_;
+    s.check_writable();
+    s.check_name(name);
+    WriterEntry e;
+    EntryInfo& i = e.info;
+    i.name = name;
+    i.flags = name_flags(name);
+    i.crc32 = detail::crc32_of(data, n);
+    i.size = n;
+    i.local_offset = s.sink->position();
+    // DEFLATE when that is smaller than the raw bytes, else STORE.
+    std::vector<uint8_t> deflated;
+    const uint8_t* body = data;
+    uint64_t csize = n;
+    i.method = Method::Store;
+    if (method == Method::Deflate && n > 0) {
+        deflated = detail::deflate(data, n);
+        if (deflated.size() < n) {
+            i.method = Method::Deflate;
+            body = deflated.data();
+            csize = deflated.size();
+        }
+    }
+    i.compressed_size = csize;
+    e.forced = force_zip64 || s.force_zip64;
+    i.zip64 = e.forced || i.size >= kMax32 || csize >= kMax32;
+    s.emit(local_header(name, i.flags, static_cast<uint16_t>(i.method), i.crc32, csize,
+                        i.size, i.zip64, false));
+    s.emit(body, static_cast<size_t>(csize));
+    s.add(e);
+    return i;
+}
+
+EntryInfo ZipWriter::write(const std::string& name, const std::vector<uint8_t>& bytes,
+                           Method method, bool force_zip64) {
+    return write(name, bytes.data(), bytes.size(), method, force_zip64);
+}
+
+EntryInfo ZipWriter::write(const std::string& name, const std::string& bytes,
+                           Method method, bool force_zip64) {
+    return write(name, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), method,
+                 force_zip64);
+}
+
+bool ZipWriter::contains(const std::string& name) const { return s_->index.count(name) != 0; }
+
+bool ZipWriter::drop(const std::string& name) {
+    State& s = *s_;
+    if (s.finished) throw std::logic_error("zip: the archive is already finished");
+    auto it = s.index.find(name);
+    if (it == s.index.end()) return false;
+    s.entries.erase(s.entries.begin() + static_cast<std::ptrdiff_t>(it->second));
+    s.reindex();
+    return true;
+}
+
+std::vector<EntryInfo> ZipWriter::entries() const {
+    std::vector<EntryInfo> out;
+    out.reserve(s_->entries.size());
+    for (const auto& e : s_->entries) out.push_back(e.info);
+    return out;
+}
+
+void ZipWriter::set_force_zip64(bool force) { s_->force_zip64 = force; }
+
+bool ZipWriter::finished() const { return s_->finished; }
+
+Sink& ZipWriter::sink() { return *s_->sink; }
+
+// One central-directory record. Saturated fields (forced, or past the 32-bit
+// limits) move into a ZIP64 extra field, in APPNOTE order.
+static void put_central(std::vector<uint8_t>& o, const WriterEntry& e) {
+    if (!e.raw_central.empty()) {
+        o.insert(o.end(), e.raw_central.begin(), e.raw_central.end());
+        return;
+    }
+    const EntryInfo& i = e.info;
+    const bool sat_u = e.forced || i.size >= kMax32;
+    const bool sat_c = e.forced || i.compressed_size >= kMax32;
+    const bool sat_o = e.forced || i.local_offset >= kMax32;
+    std::vector<uint8_t> extra;
+    if (sat_u || sat_c || sat_o) {
+        put16(extra, 0x0001);
+        put16(extra, static_cast<uint32_t>(8 * (int(sat_u) + int(sat_c) + int(sat_o))));
+        if (sat_u) put64(extra, i.size);
+        if (sat_c) put64(extra, i.compressed_size);
+        if (sat_o) put64(extra, i.local_offset);
+    }
+    const uint32_t version = (i.zip64 || !extra.empty()) ? 45 : 20;
+    put32(o, kSigCentral);
+    put16(o, version);              // version made by
+    put16(o, version);              // version needed
+    put16(o, i.flags);
+    put16(o, static_cast<uint16_t>(i.method));
+    put16(o, 0);                    // time
+    put16(o, 0);                    // date
+    put32(o, i.crc32);
+    put32(o, sat_c ? lo32(kMax32) : lo32(i.compressed_size));
+    put32(o, sat_u ? lo32(kMax32) : lo32(i.size));
+    put16(o, static_cast<uint32_t>(i.name.size()));
+    put16(o, static_cast<uint32_t>(extra.size()));
+    put16(o, 0);                    // comment
+    put16(o, 0);                    // disk number
+    put16(o, 0);                    // internal attrs
+    put32(o, 0);                    // external attrs
+    put32(o, sat_o ? lo32(kMax32) : lo32(i.local_offset));
+    o.insert(o.end(), i.name.begin(), i.name.end());
+    o.insert(o.end(), extra.begin(), extra.end());
+}
+
+void ZipWriter::finish() {
+    State& s = *s_;
+    s.check_writable();
+    const uint64_t cd_offset = s.sink->position();
+    std::vector<uint8_t> buf;
+    uint64_t cd_size = 0;
+    for (const auto& e : s.entries) {
+        put_central(buf, e);
+        if (buf.size() >= kChunk) {
+            cd_size += buf.size();
+            s.emit(buf);
+            buf.clear();
+        }
+    }
+    cd_size += buf.size();
+    const uint64_t count = s.entries.size();
+    const bool force = s.force_zip64;
+    const bool need64 = force || count >= kMax16 || cd_offset >= kMax32 || cd_size >= kMax32;
+    if (need64) {
+        const uint64_t end64_offset = cd_offset + cd_size;
+        put32(buf, kSigEnd64);
+        put64(buf, 44);             // size of the rest of the record
+        put16(buf, 45);             // version made by
+        put16(buf, 45);             // version needed
+        put32(buf, 0);              // this disk
+        put32(buf, 0);              // disk with the central directory
+        put64(buf, count);
+        put64(buf, count);
+        put64(buf, cd_size);
+        put64(buf, cd_offset);
+        put32(buf, kSigLocator64);
+        put32(buf, 0);              // disk with the ZIP64 end record
+        put64(buf, end64_offset);
+        put32(buf, 1);              // total disks
+    }
+    const uint32_t count16 = (force || count >= kMax16) ? kMax16 : static_cast<uint32_t>(count);
+    put32(buf, kSigEnd);
+    put16(buf, 0);                  // disk numbers
+    put16(buf, 0);
+    put16(buf, count16);
+    put16(buf, count16);
+    put32(buf, (force || cd_size >= kMax32) ? lo32(kMax32) : lo32(cd_size));
+    put32(buf, (force || cd_offset >= kMax32) ? lo32(kMax32) : lo32(cd_offset));
+    put16(buf, 0);                  // comment length
+    s.emit(buf);
+    s.finished = true;
+    try {
+        s.sink->close();
+    } catch (...) {
+        s.failed = true;
+        throw;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EntrySink
+// ---------------------------------------------------------------------------
+
+EntrySink::EntrySink(std::unique_ptr<State> state) : s_(std::move(state)) {}
+EntrySink::EntrySink(EntrySink&&) noexcept = default;
+EntrySink& EntrySink::operator=(EntrySink&& other) noexcept {
+    if (this != &other) {
+        abandon();
+        s_ = std::move(other.s_);
+    }
+    return *this;
+}
+EntrySink::~EntrySink() { abandon(); }
+
+void EntrySink::abandon() noexcept {
+    if (s_ && s_->open) {
+        s_->open = false;
+        s_->w->entry_open = false;
+    }
+}
+
+bool EntrySink::is_open() const { return s_ && s_->open; }
+uint64_t EntrySink::size() const { return s_ ? s_->info.size : 0; }
+
+void EntrySink::write(const std::string& bytes) {
+    write(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+}
+
+void EntrySink::write(const uint8_t* data, size_t n) {
+    if (!is_open()) throw std::logic_error("zip: write to a closed entry");
+    State& st = *s_;
+    ZipWriter::State& w = *st.w;
+    if (w.failed) throw std::runtime_error("zip: an earlier write failed; the archive is unusable");
+    while (n > 0) {
+        const size_t take = n < kChunk ? n : kChunk;
+        st.crc.update(data, take);
+        st.sha.update(data, take);
+        st.info.size += take;
+        if (st.info.method == Method::Store) {
+            w.emit(data, take);
+            st.info.compressed_size += take;
+        } else {
+            st.scratch.clear();
+            st.deflater.write(data, take, st.scratch);
+            if (!st.scratch.empty()) {
+                w.emit(st.scratch);
+                st.info.compressed_size += st.scratch.size();
+            }
+        }
+        data += take;
+        n -= take;
+    }
+}
+
+EntryInfo EntrySink::close() {
+    if (!is_open()) throw std::logic_error("zip: entry already closed");
+    State& st = *s_;
+    ZipWriter::State& w = *st.w;
+    st.open = false;
+    w.entry_open = false;
+    if (w.failed) throw std::runtime_error("zip: an earlier write failed; the archive is unusable");
+    EntryInfo& i = st.info;
+    if (i.method == Method::Deflate) {
+        st.scratch.clear();
+        st.deflater.finish(st.scratch);
+        w.emit(st.scratch);
+        i.compressed_size += st.scratch.size();
+    }
+    i.crc32 = st.crc.value();
+    if (!i.zip64 && (i.size >= kMax32 || i.compressed_size >= kMax32)) {
+        w.failed = true;
+        throw std::runtime_error("zip: entry " + qname(i.name) +
+                                 " passed 4 GiB but was begun without force_zip64");
+    }
+    std::vector<uint8_t> fix;
+    if (st.descriptor) {
+        put32(fix, kSigDescriptor);
+        put32(fix, i.crc32);
+        if (i.zip64) {
+            put64(fix, i.compressed_size);
+            put64(fix, i.size);
+        } else {
+            put32(fix, lo32(i.compressed_size));
+            put32(fix, lo32(i.size));
+        }
+        w.emit(fix);
+    } else {
+        put32(fix, i.crc32);
+        w.patch(i.local_offset + 14, fix);
+        fix.clear();
+        if (i.zip64) {
+            put64(fix, i.size);
+            put64(fix, i.compressed_size);
+            w.patch(i.local_offset + 30 + i.name.size() + 4, fix);
+        } else {
+            put32(fix, lo32(i.compressed_size));
+            put32(fix, lo32(i.size));
+            w.patch(i.local_offset + 18, fix);
+        }
+    }
+    i.sha256 = st.sha.hex();
+    WriterEntry e;
+    e.info = i;
+    e.forced = st.forced;
+    w.add(std::move(e));
+    return i;
+}
+
+// ---------------------------------------------------------------------------
+// ZipReader
+// ---------------------------------------------------------------------------
+
+namespace impl {
+
+class Source {
+public:
+    virtual ~Source() = default;
+    virtual uint64_t size() const = 0;
+    // Copy `n` bytes at `offset`; throws when the range is past the end.
+    virtual void read(uint64_t offset, uint8_t* dst, size_t n) const = 0;
+    // The whole archive, when it is in memory.
+    virtual const uint8_t* contiguous() const { return nullptr; }
+};
+
+class MemorySource : public Source {
+public:
+    explicit MemorySource(std::vector<uint8_t> b) : bytes(std::move(b)) {}
+    uint64_t size() const override { return bytes.size(); }
+    void read(uint64_t offset, uint8_t* dst, size_t n) const override {
+        if (offset > bytes.size() || n > bytes.size() - offset) fail("read past the end");
+        if (n) std::memcpy(dst, bytes.data() + offset, n);
+    }
+    const uint8_t* contiguous() const override { return bytes.data(); }
+    std::vector<uint8_t> bytes;
+};
+
+class FileSource : public Source {
+public:
+    explicit FileSource(const std::string& path) {
+        in_.open(path, std::ios::in | std::ios::binary);
+        if (!in_) throw std::runtime_error("cannot open: " + path);
+        in_.seekg(0, std::ios::end);
+        const std::streamoff end = in_.tellg();
+        if (end < 0) throw std::runtime_error("cannot open: " + path);
+        size_ = static_cast<uint64_t>(end);
+    }
+    uint64_t size() const override { return size_; }
+    void read(uint64_t offset, uint8_t* dst, size_t n) const override {
+        if (offset > size_ || n > size_ - offset) fail("read past the end");
+        if (n == 0) return;
+        std::lock_guard<std::mutex> lock(mu_);
+        in_.clear();
+        in_.seekg(static_cast<std::streamoff>(offset));
+        in_.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(n));
+        if (static_cast<size_t>(in_.gcount()) != n) fail("unexpected end of file");
+    }
+
+private:
+    mutable std::ifstream in_;
+    mutable std::mutex mu_;
+    uint64_t size_ = 0;
+};
+
+}  // namespace impl
+using impl::Source;
+using impl::MemorySource;
+using impl::FileSource;
+
+struct ZipReader::Impl {
+    std::unique_ptr<Source> src;
+    std::vector<ZipEntry> entries;
+    std::vector<std::vector<uint8_t>> raw_central;   // each record, verbatim
+    std::map<std::string, size_t> index;             // name -> last record
+    std::vector<std::string> duplicates;
+    uint64_t cd_offset = 0;
+    uint64_t total = 0;
+
+    std::vector<uint8_t>& memory() {
+        MemorySource* m = dynamic_cast<MemorySource*>(src.get());
+        if (!m) throw std::logic_error("zip: not an in-memory archive");
+        return m->bytes;
+    }
+
+    std::vector<uint8_t> bytes_at(uint64_t offset, size_t n) const {
+        std::vector<uint8_t> out(n);
+        src->read(offset, out.data(), n);
+        return out;
+    }
+
+    void parse();
+};
+
+void ZipReader::Impl::parse() {
+    const uint64_t size = src->size();
+    if (size < 22) fail("too small");
+    // The end record is in the last 22 + 65535 bytes (comment), and a ZIP64
+    // locator, when present, is the 20 bytes before it.
+    const uint64_t tail_len = std::min<uint64_t>(size, 22 + 65535 + 20);
+    const uint64_t tail_off = size - tail_len;
+    const std::vector<uint8_t> tail = bytes_at(tail_off, static_cast<size_t>(tail_len));
+    size_t eocd = 0;
+    bool found = false;
+    const size_t lowest = tail.size() > 22 + 65535 ? tail.size() - 22 - 65535 : 0;
+    for (size_t p = tail.size() - 22;; --p) {
+        if (get32(&tail[p]) == kSigEnd && p + 22 + get16(&tail[p + 20]) <= tail.size()) {
+            eocd = p;
+            found = true;
+            break;
+        }
+        if (p == lowest) break;
+    }
+    if (!found) fail("no end-of-central-directory");
+    const uint8_t* e = &tail[eocd];
+    uint64_t count = get16(e + 10);
+    uint64_t cd_size = get32(e + 12);
+    uint64_t cd_off = get32(e + 16);
+    const bool saturated = count == kMax16 || cd_size == kMax32 || cd_off == kMax32;
+    if (saturated && eocd >= 20 && get32(&tail[eocd - 20]) == kSigLocator64) {
+        const uint8_t* loc = &tail[eocd - 20];
+        if (get32(loc + 4) != 0 || get32(loc + 16) != 1)
+            fail("multi-volume archives are not supported");
+        const uint64_t end64 = get64(loc + 8);
+        if (end64 > size || size - end64 < 56) fail("ZIP64 end record out of range");
+        const std::vector<uint8_t> rec = bytes_at(end64, 56);
+        if (get32(rec.data()) != kSigEnd64) fail("bad ZIP64 end record signature");
+        if (get32(rec.data() + 16) != 0 || get32(rec.data() + 20) != 0)
+            fail("multi-volume archives are not supported");
+        if (count == kMax16) count = get64(rec.data() + 32);
+        if (cd_size == kMax32) cd_size = get64(rec.data() + 40);
+        if (cd_off == kMax32) cd_off = get64(rec.data() + 48);
+    } else if (get16(e + 4) != 0 || get16(e + 6) != 0) {
+        fail("multi-volume archives are not supported");
+    }
+    if (cd_off > size || cd_size > size - cd_off) fail("central directory out of range");
+    if (count > cd_size / 46) fail("central directory too small for its entry count");
+    cd_offset = cd_off;
+
+    const std::vector<uint8_t> cd = bytes_at(cd_off, static_cast<size_t>(cd_size));
+    entries.reserve(static_cast<size_t>(count));
+    raw_central.reserve(static_cast<size_t>(count));
+    size_t p = 0;
+    for (uint64_t k = 0; k < count; ++k) {
+        if (p + 46 > cd.size() || get32(&cd[p]) != kSigCentral)
+            fail("bad central directory entry");
+        const uint8_t* r = &cd[p];
+        ZipEntry ent;
+        ent.flags = get16(r + 8);
+        ent.method = get16(r + 10);
+        ent.crc32 = get32(r + 16);
+        ent.csize = get32(r + 20);
+        ent.usize = get32(r + 24);
+        const uint16_t namelen = get16(r + 28);
+        const uint16_t extralen = get16(r + 30);
+        const uint16_t commentlen = get16(r + 32);
+        ent.local_offset = get32(r + 42);
+        const size_t next = p + 46u + namelen + extralen + commentlen;
+        if (next > cd.size()) fail("truncated central directory entry");
+        ent.name.assign(reinterpret_cast<const char*>(r + 46), namelen);
+        size_t z64_len = 0;
+        const uint8_t* z64 = find_zip64_extra(r + 46 + namelen, extralen, z64_len);
+        ent.zip64 = z64 != nullptr;
+        const bool sat_u = ent.usize == kMax32;
+        const bool sat_c = ent.csize == kMax32;
+        const bool sat_o = ent.local_offset == kMax32;
+        if (sat_u || sat_c || sat_o) {
+            // The ZIP64 extra field holds exactly the saturated fields, in
+            // the order uncompressed size, compressed size, offset.
+            if (!z64)
+                fail("entry " + qname(ent.name) +
+                     ": a size or offset is saturated but there is no ZIP64 extra field");
+            size_t o = 0;
+            auto take = [&](uint64_t& field) {
+                if (o + 8 > z64_len)
+                    fail("entry " + qname(ent.name) + ": truncated ZIP64 extra field");
+                field = get64(z64 + o);
+                o += 8;
+            };
+            if (sat_u) take(ent.usize);
+            if (sat_c) take(ent.csize);
+            if (sat_o) take(ent.local_offset);
+        }
+        auto it = index.find(ent.name);
+        if (it != index.end()) {
+            if (std::find(duplicates.begin(), duplicates.end(), ent.name) == duplicates.end())
+                duplicates.push_back(ent.name);
+            it->second = entries.size();       // last one wins
+        } else {
+            index[ent.name] = entries.size();
+        }
+        total = ent.usize > UINT64_MAX - total ? UINT64_MAX : total + ent.usize;
+        raw_central.emplace_back(cd.begin() + static_cast<std::ptrdiff_t>(p),
+                                 cd.begin() + static_cast<std::ptrdiff_t>(next));
+        entries.push_back(std::move(ent));
+        p = next;
+    }
+}
+
+ZipReader ZipReader::open(const std::string& path) {
+    ZipReader r;
+    r.impl_.reset(new Impl);
+    r.impl_->src.reset(new FileSource(path));
+    r.impl_->parse();
+    return r;
+}
+
+ZipReader ZipReader::from_bytes(std::vector<uint8_t> archive) {
+    return ZipReader(std::move(archive));
+}
+
+ZipReader::ZipReader(std::vector<uint8_t> archive) : impl_(new Impl) {
+    impl_->src.reset(new MemorySource(std::move(archive)));
+    impl_->parse();
+}
+
+ZipReader::ZipReader(ZipReader&&) noexcept = default;
+ZipReader& ZipReader::operator=(ZipReader&&) noexcept = default;
+ZipReader::~ZipReader() = default;
+
+const std::vector<ZipReader::Entry>& ZipReader::entries() const { return impl_->entries; }
+
+std::vector<std::string> ZipReader::names() const {
+    std::vector<std::string> out;
+    out.reserve(impl_->index.size());
+    std::map<std::string, bool> seen;
+    for (const auto& e : impl_->entries)
+        if (!seen[e.name]) {
+            seen[e.name] = true;
+            out.push_back(e.name);
+        }
+    return out;
+}
+
+const std::vector<std::string>& ZipReader::duplicates() const { return impl_->duplicates; }
+
+bool ZipReader::has(const std::string& name) const {
+    return impl_->index.find(name) != impl_->index.end();
+}
+
+const ZipReader::Entry* ZipReader::find(const std::string& name) const {
+    auto it = impl_->index.find(name);
+    return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
+}
+
+uint64_t ZipReader::archive_size() const { return impl_->src->size(); }
+uint64_t ZipReader::central_directory_offset() const { return impl_->cd_offset; }
+uint64_t ZipReader::total_size() const { return impl_->total; }
+
+LocalHeader ZipReader::local_header(const Entry& e) const {
+    const Source& src = *impl_->src;
+    const uint64_t size = src.size();
+    if (e.local_offset > size || size - e.local_offset < 30) fail("truncated local header");
+    uint8_t h[30];
+    src.read(e.local_offset, h, 30);
+    if (get32(h) != kSigLocal) fail("bad local header signature");
+    const uint16_t namelen = get16(h + 26);
+    const uint16_t extralen = get16(h + 28);
+    const uint64_t var_off = e.local_offset + 30;
+    if (size - var_off < static_cast<uint64_t>(namelen) + extralen)
+        fail("truncated local header");
+    const std::vector<uint8_t> var =
+        impl_->bytes_at(var_off, static_cast<size_t>(namelen) + extralen);
+    if (namelen != e.name.size() || std::memcmp(var.data(), e.name.data(), namelen) != 0)
+        fail("entry " + qname(e.name) + ": local header name differs from the central directory");
+    LocalHeader lh;
+    lh.data_offset = var_off + namelen + extralen;
+    lh.flags = get16(h + 6);
+    lh.crc32 = get32(h + 14);
+    lh.csize = get32(h + 18);
+    lh.usize = get32(h + 22);
+    size_t z64_len = 0;
+    const uint8_t* z64 = find_zip64_extra(var.data() + namelen, extralen, z64_len);
+    if (z64) {
+        lh.zip64 = true;
+        // The local ZIP64 field carries both sizes (APPNOTE 4.5.3).
+        if (z64_len >= 16) {
+            if (lh.usize == kMax32) lh.usize = get64(z64);
+            if (lh.csize == kMax32) lh.csize = get64(z64 + 8);
+        }
+    }
+    return lh;
+}
+
+void ZipReader::check_limits(const Entry& e, const Limits& lim) const {
+    if (e.usize > lim.max_member_bytes)
+        fail("entry " + qname(e.name) + " declares " + std::to_string(e.usize) +
+             " bytes, over the " + std::to_string(lim.max_member_bytes) +
+             "-byte member cap");
+    if (impl_->total > lim.max_total_bytes)
+        fail("the archive declares " + std::to_string(impl_->total) +
+             " bytes in total, over the " + std::to_string(lim.max_total_bytes) +
+             "-byte total cap");
+    if (lim.max_ratio > 0 && e.method != 0 && e.usize >= lim.ratio_exempt_bytes &&
+        (e.csize == 0 ||
+         static_cast<double>(e.usize) > lim.max_ratio * static_cast<double>(e.csize)))
+        fail("entry " + qname(e.name) + " expands " + std::to_string(e.usize) +
+             " bytes from " + std::to_string(e.csize) + ", over the compression-ratio cap");
+}
+
+// Decode one entry: to `fn` in chunks, or into `*collect`. `lim` (optional)
+// re-checks the ratio cap as bytes are produced.
+void ZipReader::stream_entry(const Entry& e, const ChunkFn& fn, const Limits* lim,
+                             std::vector<uint8_t>* collect) const {
+    if (e.flags & (kFlagEncrypted | kFlagStrongEncryption))
+        fail("entry " + qname(e.name) + " is encrypted");
+    if (e.method != 0 && e.method != 8)
+        fail("entry " + qname(e.name) + ": unsupported compression method " +
+             std::to_string(e.method));
+    const Source& src = *impl_->src;
+    const LocalHeader lh = local_header(e);
+    const uint64_t size = src.size();
+    if (lh.data_offset > size || e.csize > size - lh.data_offset)
+        fail("truncated member data");
+    detail::Crc32 crc;
+    uint64_t produced = 0;
+    auto over_ratio = [&]() {
+        return lim && lim->max_ratio > 0 && e.method != 0 && produced >= lim->ratio_exempt_bytes &&
+               static_cast<double>(produced) > lim->max_ratio * static_cast<double>(e.csize);
+    };
+    auto deliver = [&](const uint8_t* p, size_t n) {
+        crc.update(p, n);
+        produced += n;
+        if (over_ratio())
+            fail("entry " + qname(e.name) + " expands past the compression-ratio cap");
+        if (collect)
+            collect->insert(collect->end(), p, p + n);
+        else
+            fn(p, n);
+    };
+    const uint8_t* mem = src.contiguous();
+
+    if (e.method == 0) {
+        if (e.csize != e.usize) fail("stored member size mismatch: " + e.name);
+        if (collect && e.usize <= static_cast<uint64_t>(SIZE_MAX))
+            collect->reserve(static_cast<size_t>(e.usize));
+        std::vector<uint8_t> chunk;
+        uint64_t off = lh.data_offset;
+        for (uint64_t left = e.csize; left > 0;) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(left, kChunk));
+            if (mem) {
+                deliver(mem + off, n);
+            } else {
+                chunk.resize(n);
+                src.read(off, chunk.data(), n);
+                deliver(chunk.data(), n);
+            }
+            off += n;
+            left -= n;
+        }
+    } else {
+        // Input: the entry's compressed bytes, from memory or in chunks.
+        std::vector<uint8_t> in_chunk;
+        uint64_t in_off = lh.data_offset;
+        uint64_t in_left = e.csize;
+        detail::InflateBitReader::Refill refill;
+        const uint8_t* first = nullptr;
+        size_t first_n = 0;
+        if (mem) {
+            first = mem + lh.data_offset;
+            first_n = static_cast<size_t>(e.csize);
+        } else {
+            refill = [&](const uint8_t*& q) -> size_t {
+                if (in_left == 0) return 0;
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(in_left, kChunk));
+                in_chunk.resize(n);
+                src.read(in_off, in_chunk.data(), n);
+                in_off += n;
+                in_left -= n;
+                q = in_chunk.data();
+                return n;
+            };
+        }
+        detail::InflateBitReader br(first, first_n, refill);
+        if (collect) {
+            // Into one buffer; reserve no more than DEFLATE can expand to.
+            const uint64_t bound = e.csize > (UINT64_MAX - 64) / 1032 ? UINT64_MAX
+                                                                      : e.csize * 1032 + 64;
+            const uint64_t reserve = std::min<uint64_t>(std::min<uint64_t>(e.usize, bound),
+                                                        static_cast<uint64_t>(SIZE_MAX));
+            detail::InflateWindow out(e.usize, detail::InflateWindow::Sink(),
+                                      static_cast<size_t>(reserve));
+            detail::inflate_stream(br, out);
+            if (out.total() != e.usize)
+                fail("member " + qname(e.name) + " inflates to a size other than declared");
+            std::vector<uint8_t> bytes = out.take();
+            crc.update(bytes.data(), bytes.size());
+            produced = bytes.size();
+            if (over_ratio())
+                fail("entry " + qname(e.name) + " expands past the compression-ratio cap");
+            *collect = std::move(bytes);
+        } else {
+            detail::InflateWindow out(e.usize, deliver);
+            detail::inflate_stream(br, out);
+            if (out.total() != e.usize)
+                fail("member " + qname(e.name) + " inflates to a size other than declared");
+        }
+    }
+    if (crc.value() != e.crc32) fail("entry " + qname(e.name) + ": CRC-32 mismatch");
+}
+
+std::vector<uint8_t> ZipReader::read(const std::string& name, uint64_t max_bytes) const {
+    const Entry* e = find(name);
+    if (!e) fail("member not found: " + name);
+    if (e->usize > max_bytes)
+        fail("member " + qname(name) + " declares " + std::to_string(e->usize) +
+             " bytes, over the size cap");
+    std::vector<uint8_t> out;
+    stream_entry(*e, ChunkFn(), nullptr, &out);
+    return out;
+}
+
+std::vector<uint8_t> ZipReader::read(const std::string& name, const Limits& limits) const {
+    const Entry* e = find(name);
+    if (!e) fail("member not found: " + name);
+    check_limits(*e, limits);
+    std::vector<uint8_t> out;
+    stream_entry(*e, ChunkFn(), &limits, &out);
+    return out;
+}
+
+void ZipReader::read_into(const std::string& name, const ChunkFn& fn,
+                          const Limits& limits) const {
+    const Entry* e = find(name);
+    if (!e) fail("member not found: " + name);
+    if (!fn) throw std::invalid_argument("zip: read_into needs a callback");
+    check_limits(*e, limits);
+    stream_entry(*e, fn, &limits, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// ZipWriter::append (after ZipReader::Impl, whose records it adopts)
+// ---------------------------------------------------------------------------
+
+ZipWriter ZipWriter::append(const std::string& path) {
+    std::unique_ptr<ZipWriter> w;
+    {
+        ZipReader r = ZipReader::open(path);
+        w.reset(new ZipWriter(FileSink::open_at(path, r.central_directory_offset())));
+        keep_entries(*w, r);
+    }  // the reader's file handle is closed here
+    return std::move(*w);
+}
+
+ZipWriter ZipWriter::append(std::vector<uint8_t> archive) {
+    ZipReader r(std::move(archive));
+    std::vector<uint8_t> prefix = std::move(r.impl_->memory());
+    prefix.resize(static_cast<size_t>(r.central_directory_offset()));
+    ZipWriter w(std::unique_ptr<Sink>(new MemorySink(std::move(prefix))));
+    keep_entries(w, r);
+    return w;
+}
+
+// Adopt the entries of an archive opened for appending, central records
+// verbatim (their offsets stay valid: new entries go after them). A repeated
+// name is kept as it is; whether to accept it is the caller's decision.
+void ZipWriter::keep_entries(ZipWriter& w, const ZipReader& r) {
+    const uint64_t cd_offset = r.central_directory_offset();
+    const std::vector<ZipEntry>& es = r.entries();
+    State& s = *w.s_;
+    s.entries.reserve(es.size());
+    for (size_t k = 0; k < es.size(); ++k) {
+        const ZipEntry& z = es[k];
+        if (z.local_offset >= cd_offset)
+            throw std::runtime_error("zip: refusing to append: entry " + qname(z.name) +
+                                     " lies after the central directory");
+        WriterEntry e;
+        e.info.name = z.name;
+        e.info.method = static_cast<Method>(z.method);
+        e.info.flags = z.flags;
+        e.info.crc32 = z.crc32;
+        e.info.compressed_size = z.csize;
+        e.info.size = z.usize;
+        e.info.local_offset = z.local_offset;
+        e.info.zip64 = z.zip64;
+        e.raw_central = r.impl_->raw_central[k];
+        s.entries.push_back(std::move(e));
+    }
+    s.reindex();
+}
+
+}  // namespace container
+}  // namespace qvf
+
 // ===== src/qvf.cpp =====
 
 // qvf.cpp — implementation of the QVF writer library. License: Apache-2.0.
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <random>
 #include <stdexcept>
 
 
@@ -1735,12 +9709,69 @@ Tensor tensor_i64(const std::vector<int64_t>& v, std::vector<int64_t> shape) {
     return t;
 }
 
+namespace detail {
+// Portable pi. The POSIX math-constant macros are not standard C++ (MSVC only
+// defines them when _USE_MATH_DEFINES is set before <cmath>) and C++17 has no
+// std::numbers, so keep our own constant.
+constexpr double kPi = 3.14159265358979323846;
+}  // namespace detail
+
 double primitive_norm(double alpha, int l) {
-    double radial = std::pow(2.0 * alpha / M_PI, 0.75);
+    double radial = std::pow(2.0 * alpha / detail::kPi, 0.75);
     double angular = std::pow(4.0 * alpha, l / 2.0);
     double df = 1.0;
     for (int k = 1; k < 2 * l; k += 2) df *= k;  // (2l-1)!!
     return radial * angular / std::sqrt(df);
+}
+
+// ---------------------------------------------------------------------------
+// Lattice (spec § 4.3, "Lattice conventions")
+// ---------------------------------------------------------------------------
+
+static void require_finite(const Lattice::Mat3& m, const char* what) {
+    for (const auto& row : m)
+        for (double x : row)
+            if (!std::isfinite(x))
+                throw std::runtime_error(std::string("Lattice ") + what +
+                                         " must be finite (no NaN or inf)");
+}
+
+Lattice Lattice::from_rows_angstrom(const Mat3& rows) {
+    require_finite(rows, "rows_angstrom");
+    return Lattice(rows);
+}
+
+Lattice Lattice::from_columns_bohr(const Mat3& columns) {
+    require_finite(columns, "columns_bohr");
+    Mat3 rows{};
+    for (size_t i = 0; i < 3; ++i)
+        for (size_t j = 0; j < 3; ++j)
+            rows[i][j] = columns[j][i] / kBohrPerAngstrom;   // R = L^T / f
+    return Lattice(rows);
+}
+
+Lattice::Mat3 Lattice::rows_angstrom() const { return rows_; }
+
+Lattice::Mat3 Lattice::columns_bohr() const {
+    Mat3 cols{};
+    for (size_t i = 0; i < 3; ++i)
+        for (size_t j = 0; j < 3; ++j)
+            cols[i][j] = rows_[j][i] * kBohrPerAngstrom;     // L = f * R^T
+    return cols;
+}
+
+double Lattice::volume_angstrom3() const {
+    const auto& a = rows_[0];
+    const auto& b = rows_[1];
+    const auto& c = rows_[2];
+    const double triple = a[0] * (b[1] * c[2] - b[2] * c[1]) -
+                          a[1] * (b[0] * c[2] - b[2] * c[0]) +
+                          a[2] * (b[0] * c[1] - b[1] * c[0]);
+    return std::fabs(triple);
+}
+
+double Lattice::volume_bohr3() const {
+    return volume_angstrom3() * kBohrPerAngstrom * kBohrPerAngstrom * kBohrPerAngstrom;
 }
 
 // Minimal Z -> symbol table (0..118).
@@ -1768,38 +9799,280 @@ static bool is_valid_id(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Declared units (QVF spec § 4.3, "Declared units"): every declared unit is a
+// unit name, and a key whose unit the spec fixes can only restate it. The
+// writers declare and never convert.
+// ---------------------------------------------------------------------------
+
+struct FixedUnit {
+    const char* key;
+    Unit unit;
+};
+
+static void check_unit_name(const std::string& what, const Json& value) {
+    if (!(value.is_string() && parse_unit(value.as_string())))
+        throw std::runtime_error(what + ": " + value.dump(0) +
+                                 " is not a QVF unit name (spec § 4.3)");
+}
+
+static void check_units_object(const std::string& what, const Json& units,
+                               std::initializer_list<FixedUnit> fixed) {
+    if (!units.is_object())
+        throw std::runtime_error(what + ": units must be an object of unit names");
+    for (const auto& kv : units.items()) {
+        check_unit_name(what + ": declared unit for '" + kv.first + "'", kv.second);
+        const Unit u = *parse_unit(kv.second.as_string());
+        for (const FixedUnit& f : fixed)
+            if (kv.first == f.key && u != f.unit)
+                throw std::runtime_error(
+                    what + ": units['" + kv.first + "'] must be '" +
+                    std::string(unit_name(f.unit)) +
+                    "'; spec § 4.3 fixes that unit and a declaration only restates it");
+    }
+}
+
+// The declared units of a JSON payload: its `units` object and, for a
+// one-dimensional spectrum, x_units, y_units and broadening.units. A
+// Json::raw fragment is parsed for the check; one that does not parse is left
+// alone (it is written verbatim, as before).
+static void check_payload_units(const std::string& what, const Json& payload,
+                                std::initializer_list<FixedUnit> fixed,
+                                bool spectrum_1d = false) {
+    Json parsed;
+    const Json* doc = &payload;
+    if (payload.type() == Json::Type::Raw) {
+        try {
+            parsed = Json::parse(payload.as_string());
+        } catch (const std::exception&) {
+            return;
+        }
+        doc = &parsed;
+    }
+    if (!doc->is_object()) return;
+    if (doc->contains("units")) check_units_object(what, doc->at("units"), fixed);
+    if (!spectrum_1d) return;
+    for (const char* key : {"x_units", "y_units"})
+        if (doc->contains(key)) check_unit_name(what + ": " + key, doc->at(key));
+    if (doc->contains("broadening") && doc->at("broadening").is_object() &&
+        doc->at("broadening").contains("units"))
+        check_unit_name(what + ": broadening units", doc->at("broadening").at("units"));
+}
+
+static bool is_spectrum_1d(const std::string& kind) {
+    return kind == "spectra.ir" || kind == "spectra.raman" || kind == "spectra.uvvis" ||
+           kind == "spectra.ecd" || kind == "spectra.vcd" || kind == "spectra.generic";
+}
+
+// Automatic root metadata (QVF spec § 3.5)
+// ---------------------------------------------------------------------------
+
+// `value` in decimal, left-padded with zeros to `width` digits (value >= 0).
+static std::string metadata_zero_pad(int64_t value, size_t width) {
+    std::string s = std::to_string(value);
+    return s.size() < width ? std::string(width - s.size(), '0') + s : s;
+}
+
+// The current time as "YYYY-MM-DDThh:mm:ssZ" (UTC). The civil date is computed
+// from the day count since 1970-01-01 (proleptic Gregorian calendar), which
+// avoids the non-portable thread-safe variants of gmtime.
+static std::string metadata_utc_now() {
+    using namespace std::chrono;
+    const int64_t secs =
+        duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+    int64_t days = secs / 86400, rem = secs % 86400;
+    if (rem < 0) { rem += 86400; --days; }
+    days += 719468;                                   // shift the epoch to 0000-03-01
+    const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+    const int64_t doe = days - era * 146097;          // [0, 146096]
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    const int64_t day = doy - (153 * mp + 2) / 5 + 1;
+    const int64_t month = mp < 10 ? mp + 3 : mp - 9;
+    const int64_t year = yoe + era * 400 + (month <= 2 ? 1 : 0);
+    return metadata_zero_pad(year, 4) + "-" + metadata_zero_pad(month, 2) + "-" +
+           metadata_zero_pad(day, 2) + "T" + metadata_zero_pad(rem / 3600, 2) + ":" +
+           metadata_zero_pad(rem % 3600 / 60, 2) + ":" + metadata_zero_pad(rem % 60, 2) +
+           "Z";
+}
+
+// A random (version 4, RFC 4122 variant) UUID in lowercase 8-4-4-4-12 form.
+static std::string metadata_random_uuid() {
+    std::random_device device;
+    const auto tick = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    std::seed_seq seed{device(), device(), device(), device(),
+                       static_cast<unsigned>(tick & 0xFFFFFFFFu),
+                       static_cast<unsigned>(tick >> 32)};
+    std::mt19937_64 engine(seed);
+    uint8_t bytes[16];
+    for (int half = 0; half < 2; ++half) {
+        const uint64_t word = engine();
+        for (int i = 0; i < 8; ++i)
+            bytes[half * 8 + i] = static_cast<uint8_t>(word >> (8 * i));
+    }
+    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);   // version 4
+    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);   // variant 10
+    static const char* const kHex = "0123456789abcdef";
+    std::string out;
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out += '-';
+        out += kHex[bytes[i] >> 4];
+        out += kHex[bytes[i] & 0x0F];
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // QvfWriter
 // ---------------------------------------------------------------------------
+
+namespace detail {
+
+// The archive file a streaming or updating writer is bound to.
+struct WriterOutput {
+    std::string path;
+    bool update = false;                         // the file holds an archive: append
+    std::unique_ptr<container::ZipWriter> zip;   // open while members stream into it
+    Json preserved_root = Json::object();        // update: root keys kept verbatim
+    Json source;                                 // update: the archive's source object
+    bool has_source = false;
+    // Entry names the archive held before this update: none may be reused
+    // except manifest.json (spec § 2.3).
+    std::set<std::string> archived;
+    // metadata.modified_utc as the archive has it, and the time stamp this
+    // update writes instead (made once, so to_bytes() previews what write()
+    // writes).
+    Json loaded_modified;
+    std::string stamp;
+};
+
+}  // namespace detail
+
+struct MemberSink::State {
+    QvfWriter* writer = nullptr;
+    std::string section_id, role, path;
+    DType dtype = DType::Float64;
+    std::vector<int64_t> shape;
+    uint64_t expected = 0;
+    uint64_t written = 0;
+    std::unique_ptr<container::EntrySink> entry;   // bound writer: into the archive
+    std::vector<uint8_t> buffer;                    // buffered writer
+    detail::Sha256 sha;                             // buffered writer
+    bool open = true;
+};
 
 QvfWriter::QvfWriter(Source source) : source_(std::move(source)) {
     if (source_.program.empty() || source_.version.empty())
         throw std::runtime_error("source.program and source.version are required");
 }
 
-std::string QvfWriter::reserve_id(const std::string& id) {
+void QvfWriter::check_new_id(const std::string& id) const {
     if (!is_valid_id(id))
         throw std::runtime_error("invalid section id: " + id);
+    if (id == "auto_open" || id == "bookmarks" || id == "camera" ||
+        id == "crossfade")   // viewer_defaults keys (§ 3.1, § 3.4)
+        throw std::runtime_error("reserved section id: " + id);
     if (ids_.count(id)) throw std::runtime_error("duplicate section id: " + id);
+}
+
+std::string QvfWriter::reserve_id(const std::string& id) {
+    check_new_id(id);
     ids_.insert(id);
     return id;
 }
 
-void QvfWriter::add_file(const std::string& path, std::vector<uint8_t> bytes) {
-    if (paths_.count(path)) throw std::runtime_error("duplicate member path: " + path);
-    if (path.empty() || path.front() == '/' ||
-        path.find("/../") != std::string::npos || path.rfind("../", 0) == 0)
+// Spec § 2.1: relative, '/'-separated, no '..' segment, no drive letter.
+static void check_member_path(const std::string& path) {
+    const bool drive = path.size() >= 2 && path[1] == ':' &&
+                       std::isalpha(static_cast<unsigned char>(path[0]));
+    if (path.empty() || path.front() == '/' || drive ||
+        path.find('\\') != std::string::npos || path.find('\0') != std::string::npos ||
+        path == ".." || path.find("/../") != std::string::npos ||
+        path.rfind("../", 0) == 0 ||
+        (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0))
         throw std::runtime_error("illegal member path: " + path);
-    paths_.insert(path);
-    files_.emplace_back(path, std::move(bytes));
+}
+
+// A member file written in this session that has not become part of the
+// archive yet: buffered, or streamed into a bound archive not yet finished.
+bool QvfWriter::pending_file(const std::string& path) const {
+    for (const auto& f : files_)
+        if (f.first == path) return true;
+    return out_ && out_->zip && !out_->archived.count(path) && out_->zip->contains(path);
+}
+
+// Spec § 2.3: an update never rewrites an entry the archive holds. A member
+// whose default path is taken by the archive being updated (or named by its
+// manifest) gets a fresh one, "<stem>.<n><suffix>" with n = 2, 3, ..., the
+// stem ending at the first '.' of the last path segment (as the Python
+// writer's _add_file names it). A path a member of this session already
+// uses is an error, as in a new archive.
+std::string QvfWriter::entry_name(const std::string& path) const {
+    check_member_path(path);
+    const auto taken = [this](const std::string& p) {
+        return paths_.count(p) != 0 || (out_ && out_->archived.count(p) != 0);
+    };
+    if (!taken(path)) return path;
+    if (!out_ || pending_file(path))
+        throw std::runtime_error("duplicate member path: " + path);
+    const size_t slash = path.rfind('/');
+    const std::string head = slash == std::string::npos ? "" : path.substr(0, slash + 1);
+    const std::string tail = slash == std::string::npos ? path : path.substr(slash + 1);
+    const size_t dot = tail.find('.');
+    const std::string stem = tail.substr(0, dot);
+    const std::string suffix = dot == std::string::npos ? "" : tail.substr(dot);
+    for (unsigned long long n = 2;; ++n) {
+        const std::string fresh = head + stem + "." + std::to_string(n) + suffix;
+        if (!taken(fresh)) return fresh;
+    }
+}
+
+std::string QvfWriter::add_file(const std::string& path, std::vector<uint8_t> bytes,
+                                bool store) {
+    if (member_open_)
+        throw std::runtime_error("a member sink is open; close it before adding members");
+    const std::string name = entry_name(path);
+    const container::Method method = store ? container::Method::Store
+                                           : container::Method::Deflate;
+    if (out_ && out_->zip) {
+        // Streaming: straight into the archive. A path the writer dropped and
+        // re-adds in this same session supersedes the entry it wrote.
+        out_->zip->drop(name);
+        out_->zip->write(name, bytes, method, force_zip64);
+    } else {
+        files_.emplace_back(name, std::move(bytes));
+    }
+    paths_.insert(name);
+    if (store) stored_.insert(name);
+    return name;
+}
+
+// Forget a member file of this session: a buffered file is discarded, and an
+// entry already streamed into the bound archive is dropped from its directory
+// (its bytes stay as unreferenced space). An entry the archive held before
+// this session, or a path its manifest names, is never touched (spec § 2.3):
+// it stays taken.
+void QvfWriter::drop_file(const std::string& path) {
+    if (!pending_file(path)) return;
+    paths_.erase(path);
+    stored_.erase(path);
+    files_.erase(std::remove_if(files_.begin(), files_.end(),
+                                [&path](const std::pair<std::string, std::vector<uint8_t>>& f) {
+                                    return f.first == path;
+                                }),
+                 files_.end());
+    if (out_ && out_->zip) out_->zip->drop(path);
 }
 
 Json QvfWriter::json_member(const std::string& path, const Json& obj) {
     std::string dumped = obj.dump(2);
     std::vector<uint8_t> bytes(dumped.begin(), dumped.end());
     std::string sha = detail::Sha256::hex_of(bytes);
-    add_file(path, std::move(bytes));
+    const long long size = static_cast<long long>(bytes.size());
+    const std::string name = add_file(path, std::move(bytes));
     Json m = Json::object();
-    m.set("path", path).set("format", "json").set("sha256", sha);
+    m.set("path", name).set("format", "json").set("sha256", sha).set("size", size);
     return m;
 }
 
@@ -1813,9 +10086,9 @@ Json QvfWriter::binary_member(const std::string& path, const Tensor& t,
                                  + path);
     std::string sha = detail::Sha256::hex_of(t.bytes);
     std::vector<uint8_t> bytes = t.bytes;
-    add_file(path, std::move(bytes));
+    const std::string name = add_file(path, std::move(bytes));
     Json m = Json::object();
-    m.set("path", path).set("format", "binary");
+    m.set("path", name).set("format", "binary");
     if (with_shape) {
         m.set("dtype", std::string(dtype_name(t.dtype)));
         Json shape = Json::array();
@@ -1823,17 +10096,375 @@ Json QvfWriter::binary_member(const std::string& path, const Tensor& t,
         m.set("shape", shape);
     }
     m.set("sha256", sha);
+    m.set("size", static_cast<long long>(t.bytes.size()));
     return m;
 }
 
+// "type/subtype" without parameters (RFC 6838): the pattern of the schema's
+// $defs/MediaType, ^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][...]*$.
+static bool is_media_type(const std::string& s) {
+    const auto token = [&s](size_t from, size_t to) {
+        if (from >= to || !std::isalnum(static_cast<unsigned char>(s[from]))) return false;
+        for (size_t i = from; i < to; ++i) {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if (!(std::isalnum(c) || (c != 0 && std::strchr("!#$&^_.+-", c)))) return false;
+        }
+        return true;
+    };
+    const size_t slash = s.find('/');
+    return slash != std::string::npos && token(0, slash) && token(slash + 1, s.size());
+}
+
+// An opaque binary member (no dtype or shape, spec § 4.2) of `bytes`, with
+// its media_type when not empty (checked before anything is written).
+Json QvfWriter::opaque_member(const std::string& path, std::vector<uint8_t> bytes,
+                              const std::string& media_type, bool store) {
+    if (!media_type.empty() && !is_media_type(media_type))
+        throw std::runtime_error("member " + path + ": media type '" + media_type +
+                                 "' is not type/subtype (QVF spec § 4.2)");
+    const std::string sha = detail::Sha256::hex_of(bytes);
+    const long long size = static_cast<long long>(bytes.size());
+    const std::string name = add_file(path, std::move(bytes), store);
+    Json m = Json::object();
+    m.set("path", name).set("format", "binary").set("sha256", sha).set("size", size);
+    if (!media_type.empty()) m.set("media_type", media_type);
+    return m;
+}
+
+// -- typed provenance and job.spec fields (spec § 3.2, § 5.9) ------------------
+
+namespace {
+
+[[noreturn]] void field_error(const std::string& what, const std::string& rule) {
+    throw std::runtime_error(what + " " + rule);
+}
+
+// A pre-serialized fragment nested in a built object (the C ABI path) is
+// parsed so that it can be checked; anything else is returned as it is.
+Json resolved(const Json& v, const std::string& what) {
+    if (v.type() != Json::Type::Raw) return v;
+    try {
+        return Json::parse(v.as_string());
+    } catch (const std::exception& e) {
+        throw std::runtime_error(what + " is not valid JSON: " + e.what());
+    }
+}
+
+bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// 7 to 64 hexadecimal characters (provenance.git_commit).
+bool is_git_commit(const std::string& s) {
+    if (s.size() < 7 || s.size() > 64) return false;
+    for (char c : s)
+        if (!(is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    return true;
+}
+
+// ISO 8601 UTC, YYYY-MM-DDThh:mm:ssZ with an optional fractional second: the
+// pattern of $defs/Metadata created_utc (spec § 3.5).
+bool is_utc_timestamp(const std::string& s) {
+    static const size_t kDigits[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+    if (s.size() < 20) return false;
+    for (size_t i : kDigits)
+        if (!is_digit(s[i])) return false;
+    if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':')
+        return false;
+    auto two = [&s](size_t i) { return (s[i] - '0') * 10 + (s[i + 1] - '0'); };
+    if (two(5) < 1 || two(5) > 12 || two(8) < 1 || two(8) > 31) return false;
+    if (two(11) > 23 || two(14) > 59 || two(17) > 60) return false;
+    size_t pos = 19;
+    if (s[pos] == '.') {
+        const size_t start = ++pos;
+        while (pos < s.size() && is_digit(s[pos])) ++pos;
+        if (pos == start) return false;
+    }
+    return pos + 1 == s.size() && s[pos] == 'Z';
+}
+
+bool is_vendor_key(const std::string& key) { return key.rfind("x_", 0) == 0; }
+
+const std::string& checked_text(const Json& v, const std::string& what) {
+    if (!v.is_string() || v.as_string().empty())
+        field_error(what, "must be a non-empty string");
+    return v.as_string();
+}
+
+int64_t checked_int(const Json& v, const std::string& what, int64_t minimum) {
+    if (v.type() != Json::Type::Int || v.as_int() < minimum)
+        field_error(what, "must be an integer >= " + std::to_string(minimum));
+    return v.as_int();
+}
+
+double checked_number(const Json& v, const std::string& what, bool positive) {
+    if (!v.is_number() || !std::isfinite(v.as_double()))
+        field_error(what, "must be a finite number");
+    if (positive && !(v.as_double() > 0.0)) field_error(what, "must be a number > 0");
+    return v.as_double();
+}
+
+void check_software(const Json& list) {
+    if (!list.is_array())
+        throw std::runtime_error(
+            "provenance software must be an array of {name, version?, url?} "
+            "objects (QVF spec § 3.2)");
+    size_t index = 0;
+    for (const Json& raw : list.elements()) {
+        const std::string what = "provenance software[" + std::to_string(index++) + "]";
+        const Json entry = resolved(raw, what);
+        if (!entry.is_object())
+            field_error(what, "must be an object with a 'name'");
+        for (const auto& kv : entry.items())
+            if (kv.first != "name" && kv.first != "version" && kv.first != "url" &&
+                !is_vendor_key(kv.first))
+                throw std::runtime_error(
+                    what + ": key '" + kv.first +
+                    "' is not one of name, url, version; vendor keys must begin "
+                    "with 'x_' (QVF spec § 3.2)");
+        if (!entry.has("name")) field_error(what, "needs a 'name'");
+        checked_text(entry.at("name"), what + " name");
+        for (const char* key : {"version", "url"})
+            if (entry.has(key) && !entry.at(key).is_string())
+                field_error(what + " " + key, "must be a string");
+    }
+}
+
+// The typed fields of the root provenance block (spec § 3.2). The block is
+// open: every other key passes unchecked.
+void check_provenance_fields(const Json& block) {
+    for (const auto& kv : block.items()) {
+        const std::string& key = kv.first;
+        const std::string what = "provenance " + key;
+        if (key == "software") {
+            check_software(resolved(kv.second, what));
+        } else if (key == "git_commit") {
+            const Json v = resolved(kv.second, what);
+            if (!v.is_string() || !is_git_commit(v.as_string()))
+                field_error(what, "must be a git commit hash of 7 to 64 "
+                                  "hexadecimal characters (QVF spec § 3.2)");
+        } else if (key == "n_threads" || key == "n_mpi_ranks") {
+            checked_int(resolved(kv.second, what), what, 1);
+        } else if (key == "n_gpus") {
+            checked_int(resolved(kv.second, what), what, 0);
+        } else if (key == "started_utc" || key == "finished_utc") {
+            const Json v = resolved(kv.second, what);
+            if (!v.is_string() || !is_utc_timestamp(v.as_string()))
+                field_error(what, "must be an ISO 8601 UTC time stamp "
+                                  "'YYYY-MM-DDThh:mm:ssZ' (QVF spec § 3.2)");
+        }
+    }
+}
+
+enum class Rule { Text, Number, PositiveNumber, Count, Coordinates };
+
+struct FieldRule {
+    const char* name;
+    Rule rule;
+};
+
+// One typed block of a job.spec payload (spec § 5.9): every key is one of
+// `rules` or begins with x_, and `required` is present.
+void check_block(const std::string& block, const Json& value,
+                 std::initializer_list<FieldRule> rules, const char* required) {
+    const std::string whole = "job.spec " + block;
+    const Json v = resolved(value, whole);
+    if (!v.is_object())
+        field_error(whole, "must be an object (QVF spec § 5.9)");
+    std::string names;
+    for (const FieldRule& r : rules) names += (names.empty() ? "" : ", ") + std::string(r.name);
+    for (const auto& kv : v.items()) {
+        if (is_vendor_key(kv.first)) continue;
+        const FieldRule* found = nullptr;
+        for (const FieldRule& r : rules)
+            if (kv.first == r.name) found = &r;
+        if (!found)
+            throw std::runtime_error(
+                whole + ": key '" + kv.first + "' is not one of " + names +
+                "; vendor keys must begin with 'x_' and engine keywords go under "
+                "options (QVF spec § 5.9)");
+        const std::string what = whole + "." + kv.first;
+        switch (found->rule) {
+            case Rule::Text: checked_text(kv.second, what); break;
+            case Rule::Number: checked_number(kv.second, what, false); break;
+            case Rule::PositiveNumber: checked_number(kv.second, what, true); break;
+            case Rule::Count: checked_int(kv.second, what, 1); break;
+            case Rule::Coordinates: {
+                const std::string& c = checked_text(kv.second, what);
+                if (c != "cartesian" && c != "internal" && c != "redundant")
+                    field_error(what, "must be one of cartesian, internal, redundant");
+                break;
+            }
+        }
+    }
+    if (required && !v.has(required))
+        field_error(whole, std::string("requires '") + required + "' (QVF spec § 5.9)");
+}
+
+}  // namespace
+
 // -- root metadata ----------------------------------------------------------
 
-void QvfWriter::set_provenance(Json v) { root_.set("provenance", std::move(v)); }
+void QvfWriter::set_provenance(Json v) { set_provenance(std::move(v), false); }
+void QvfWriter::set_provenance(Json v, bool allow_hostname) {
+    // A pre-serialized fragment (the C ABI path) is parsed to check the typed
+    // fields and to look for `hostname`; without a key to drop, the caller's
+    // text stays verbatim.
+    if (v.type() == Json::Type::Raw) {
+        Json parsed;
+        try {
+            parsed = Json::parse(v.as_string());
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("provenance is not valid JSON: ") +
+                                     e.what());
+        }
+        if (!parsed.is_object())
+            throw std::runtime_error(
+                "provenance must be a JSON object (QVF spec § 3.2)");
+        check_provenance_fields(parsed);
+        // `hostname` is deprecated (spec § 3.2) and dropped unless allowed.
+        if (!allow_hostname && parsed.erase("hostname")) v = std::move(parsed);
+    } else {
+        if (!v.is_object())
+            throw std::runtime_error(
+                "provenance must be a JSON object (QVF spec § 3.2)");
+        check_provenance_fields(v);
+        if (!allow_hostname) v.erase("hostname");
+    }
+    root_.set("provenance", std::move(v));
+}
 void QvfWriter::set_thermochemistry(Json v) { root_.set("thermochemistry", std::move(v)); }
 void QvfWriter::set_dipole_moment(Json v) { root_.set("dipole_moment", std::move(v)); }
 void QvfWriter::set_constraints(Json v) { root_.set("constraints", std::move(v)); }
+void QvfWriter::set_energies(Json v) {
+    // Root energies block (spec § 3.6). A Json::raw fragment (the C ABI path)
+    // is emitted verbatim; a built object must carry `total`.
+    if (v.type() == Json::Type::Object) {
+        if (!v.has("total"))
+            throw std::runtime_error("energies requires a total {value, units}");
+    } else if (v.type() != Json::Type::Raw) {
+        throw std::runtime_error("energies must be a JSON object");
+    }
+    root_.set("energies", std::move(v));
+}
 void QvfWriter::set_extensions(Json v) { root_.set("extensions", std::move(v)); }
 void QvfWriter::set_viewer_defaults(Json v) { root_.set("viewer_defaults", std::move(v)); }
+
+void QvfWriter::set_metadata(Json v) {
+    if (v.type() == Json::Type::Raw) {
+        // A pre-serialized fragment (the C ABI path) is parsed, so that the
+        // automatic created_utc / uuid can be merged into it.
+        try {
+            v = Json::parse(v.as_string());
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("metadata is not valid JSON: ") +
+                                     e.what());
+        }
+    }
+    if (!v.is_object())
+        throw std::runtime_error("metadata must be a JSON object (QVF spec § 3.5)");
+    root_.set("metadata", std::move(v));
+}
+
+// -- section references and grouping (spec § 4.1) ---------------------------
+
+size_t QvfWriter::section_index(const std::string& id) const {
+    const std::vector<Json>& sections = sections_.elements();
+    for (size_t i = 0; i < sections.size(); ++i)
+        if (sections[i].at("id").as_string() == id) return i;
+    throw std::runtime_error("no section with id '" + id + "'");
+}
+
+void QvfWriter::check_section_ref(const std::string& key, const Json& value) const {
+    const char* target = key == "structure_ref" ? "structure"
+                         : key == "run_ref"     ? "run.record"
+                                                : nullptr;
+    if (!target) return;
+    if (!value.is_string())
+        throw std::runtime_error(key + " must be a string naming a '" + target +
+                                 "' section");
+    const std::string& ref = value.as_string();
+    const std::vector<Json>& sections = sections_.elements();
+    for (const Json& s : sections)
+        if (s.at("id").as_string() == ref) {
+            if (s.at("kind").as_string() != target)
+                throw std::runtime_error(key + " '" + ref + "' names a '" +
+                                         s.at("kind").as_string() +
+                                         "' section, not a '" + target +
+                                         "' section (QVF spec § 4.1)");
+            return;
+        }
+    throw std::runtime_error(key + " '" + ref + "' names no section");
+}
+
+void QvfWriter::set_section_field(const std::string& id, const std::string& key,
+                                  Json value) {
+    if (key.empty() || key == "id" || key == "kind" || key == "members")
+        throw std::runtime_error("set_section_field: field '" + key +
+                                 "' cannot be set");
+    const size_t index = section_index(id);
+    check_section_ref(key, value);
+    // Json has no mutable element access: rebuild the array with the section
+    // replaced.
+    const std::vector<Json>& sections = sections_.elements();
+    Json updated = sections[index];
+    updated.set(key, std::move(value));
+    Json rebuilt = Json::array();
+    for (size_t i = 0; i < sections.size(); ++i)
+        rebuilt.push_back(i == index ? updated : sections[i]);
+    sections_ = std::move(rebuilt);
+}
+
+std::string QvfWriter::annotate_section(const std::string& id,
+                                        const std::string& structure_ref,
+                                        const std::string& run_ref,
+                                        const std::string& group) {
+    section_index(id);   // an unknown id throws before anything is checked
+    // Check both references first, so a failure changes nothing.
+    if (!structure_ref.empty()) check_section_ref("structure_ref", structure_ref);
+    if (!run_ref.empty()) check_section_ref("run_ref", run_ref);
+    if (!structure_ref.empty()) set_section_field(id, "structure_ref", structure_ref);
+    if (!run_ref.empty()) set_section_field(id, "run_ref", run_ref);
+    if (!group.empty()) set_section_field(id, "group", group);
+    return id;
+}
+
+void QvfWriter::require_section_kind(const std::string& what, const std::string& ref,
+                                     const char* kind) const {
+    for (const Json& s : sections_.elements())
+        if (s.at("id").as_string() == ref) {
+            if (s.at("kind").as_string() != kind)
+                throw std::runtime_error(what + " '" + ref + "' must name an existing '" +
+                                         kind + "' section, found a '" +
+                                         s.at("kind").as_string() + "' section");
+            return;
+        }
+    throw std::runtime_error(what + " '" + ref + "' must name an existing '" + kind +
+                             "' section, found no such section");
+}
+
+// -- removing and replacing sections (spec § 2.3) ---------------------------
+
+Json QvfWriter::remove_section(const std::string& id) {
+    if (member_open_)
+        throw std::runtime_error("a member sink is open; close it before removing a section");
+    const size_t index = section_index(id);
+    const std::vector<Json>& sections = sections_.elements();
+    Json removed = sections[index];
+    Json rebuilt = Json::array();
+    for (size_t i = 0; i < sections.size(); ++i)
+        if (i != index) rebuilt.push_back(sections[i]);
+    sections_ = std::move(rebuilt);
+    ids_.erase(id);
+    structure_sum_z_.erase(id);
+    // Members not yet part of the archive are dropped; drop_file() leaves an
+    // entry the archive already holds, which becomes a superseded entry.
+    if (removed.has("members") && removed.at("members").is_object())
+        for (const auto& kv : removed.at("members").items())
+            if (kv.second.is_object() && kv.second.has("path") &&
+                kv.second.at("path").is_string())
+                drop_file(kv.second.at("path").as_string());
+    return removed;
+}
 
 // -- structure --------------------------------------------------------------
 
@@ -1842,6 +10473,7 @@ std::string QvfWriter::add_structure(const std::vector<Atom>& atoms,
                                      const std::vector<std::array<double, 3>>& lattice,
                                      const std::vector<Bond>& bonds,
                                      const std::string& section_id) {
+    check_new_id(section_id);
     const bool periodic = pbc[0] || pbc[1] || pbc[2];
     if (periodic && lattice.empty()) {
         throw std::runtime_error(
@@ -1895,11 +10527,172 @@ std::string QvfWriter::add_structure(const std::vector<Atom>& atoms,
     section.set("id", reserve_id(section_id)).set("kind", "structure")
            .set("members", members);
     sections_.push_back(section);
+    // Σ Z for set_structure_identity's electron count (spec § 5.1).
+    int64_t sum_z = 0;
+    bool known = true;
+    for (const auto& a : atoms) {
+        known = known && a.atomic_number >= 0;
+        sum_z += a.atomic_number;
+    }
+    if (known) structure_sum_z_[section_id] = sum_z;
     return section_id;
 }
 
+std::string QvfWriter::add_structure(const std::vector<Atom>& atoms,
+                                     const std::array<bool, 3>& pbc,
+                                     const Lattice& lattice,
+                                     const std::vector<Bond>& bonds,
+                                     const std::string& section_id) {
+    const Lattice::Mat3 rows = lattice.rows_angstrom();
+    return add_structure(
+        atoms, pbc,
+        std::vector<std::array<double, 3>>(rows.begin(), rows.end()), bonds,
+        section_id);
+}
+
+// -- chemical identity (spec § 5.1) ------------------------------------------
+
+namespace {
+
+// ECMAScript \s (the JSON Schema pattern dialect): a SMILES or InChI holds
+// none of these code points. Bytes that are not UTF-8 count as non-space.
+bool has_pattern_space(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        uint32_t cp = c;
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; len = 4; }
+        else if (c >= 0x80) { ++i; continue; }   // not a lead byte
+        if (len > s.size() - i) return false;
+        for (size_t k = 1; k < len; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3Fu);
+        i += len;
+        if ((cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0xA0 || cp == 0x1680 ||
+            (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
+            cp == 0x202F || cp == 0x205F || cp == 0x3000 || cp == 0xFEFF)
+            return true;
+    }
+    return false;
+}
+
+// An InChIKey: 14 uppercase letters, '-', 10 uppercase letters, '-', one.
+bool is_inchikey(const std::string& s) {
+    if (s.size() != 27 || s[14] != '-' || s[25] != '-') return false;
+    for (size_t i = 0; i < s.size(); ++i)
+        if (i != 14 && i != 25 && !(s[i] >= 'A' && s[i] <= 'Z')) return false;
+    return true;
+}
+
+// Why `charge` and `multiplicity` (has_mult) are impossible for atoms whose
+// atomic numbers sum to `sum_z` >= 0 (spec § 5.1), or "": the electron count
+// N = sum_z - charge is not negative, and multiplicity - 1 neither exceeds N
+// nor differs from it in parity. Exact for every int64 value.
+std::string charge_multiplicity_problem(int64_t sum_z, int64_t charge, bool has_mult,
+                                        int64_t mult) {
+    if (charge > sum_z)
+        return "charge " + std::to_string(charge) + " leaves " +
+               std::to_string(sum_z - charge) +
+               " electrons for atoms with atomic numbers summing to " + std::to_string(sum_z);
+    if (!has_mult) return "";
+    const uint64_t electrons = static_cast<uint64_t>(sum_z) - static_cast<uint64_t>(charge);
+    const uint64_t unpaired = static_cast<uint64_t>(mult - 1);
+    if (unpaired > electrons || ((electrons ^ unpaired) & 1u))
+        return "multiplicity " + std::to_string(mult) + " is impossible with " +
+               std::to_string(electrons) + " electrons (charge " + std::to_string(charge) +
+               "): the unpaired electrons must not exceed the electron count and must "
+               "have its parity";
+    return "";
+}
+
+// Σ Z of a structure payload, when every atom has a non-negative integer
+// atomic_number (the validator's rule, spec § 5.1).
+bool payload_sum_z(const Json& payload, int64_t& out) {
+    if (!payload.is_object() || !payload.has("atoms") || !payload.at("atoms").is_array())
+        return false;
+    int64_t sum = 0;
+    for (const Json& a : payload.at("atoms").elements()) {
+        if (!a.is_object() || !a.has("atomic_number") ||
+            a.at("atomic_number").type() != Json::Type::Int)
+            return false;
+        const int64_t z = a.at("atomic_number").as_int();
+        if (z < 0 || sum > INT64_MAX - z) return false;
+        sum += z;
+    }
+    out = sum;
+    return true;
+}
+
+}  // namespace
+
+std::string QvfWriter::set_structure_identity(const std::string& id, const Json& identity_in) {
+    const size_t index = section_index(id);
+    Json section = sections_.elements()[index];
+    if (!section.has("kind") || !section.at("kind").is_string() ||
+        section.at("kind").as_string() != "structure")
+        throw std::runtime_error("set_structure_identity: section '" + id +
+                                 "' is not a structure section");
+    const Json identity = resolved(identity_in, "structure identity");
+    if (!identity.is_object())
+        throw std::runtime_error("structure identity must be a JSON object (QVF spec § 5.1)");
+    static const char* const kKeys[] = {"charge", "multiplicity", "name",
+                                        "smiles", "inchi",        "inchikey"};
+    for (const auto& kv : identity.items())
+        if (std::find_if(std::begin(kKeys), std::end(kKeys),
+                         [&kv](const char* k) { return kv.first == k; }) == std::end(kKeys))
+            throw std::runtime_error("structure identity: key '" + kv.first +
+                                     "' is not one of charge, multiplicity, name, smiles, "
+                                     "inchi, inchikey (QVF spec § 5.1)");
+    for (const char* key : kKeys) {
+        if (!identity.has(key)) continue;
+        const Json& v = identity.at(key);
+        const std::string what = std::string("structure ") + key;
+        if (v.is_null()) {
+            section.erase(key);
+            continue;
+        }
+        if (std::strcmp(key, "charge") == 0) {
+            if (v.type() != Json::Type::Int) field_error(what, "must be an integer");
+        } else if (std::strcmp(key, "multiplicity") == 0) {
+            checked_int(v, what, 1);
+        } else {
+            const std::string& text = checked_text(v, what);
+            const bool ok = std::strcmp(key, "name") == 0 ||
+                            (std::strcmp(key, "smiles") == 0 && !has_pattern_space(text)) ||
+                            (std::strcmp(key, "inchi") == 0 && text.size() > 6 &&
+                             text.compare(0, 6, "InChI=") == 0 && !has_pattern_space(text)) ||
+                            (std::strcmp(key, "inchikey") == 0 && is_inchikey(text));
+            if (!ok)
+                throw std::runtime_error(what + " '" + text +
+                                         "' is not of the form QVF spec § 5.1 gives");
+        }
+        section.set(key, v);
+    }
+    // The charge and multiplicity the section will have, against its atoms.
+    const auto sum_z = structure_sum_z_.find(id);
+    if (sum_z != structure_sum_z_.end() && section.has("charge") &&
+        section.at("charge").type() == Json::Type::Int) {
+        const bool has_mult = section.has("multiplicity") &&
+                              section.at("multiplicity").type() == Json::Type::Int &&
+                              section.at("multiplicity").as_int() >= 1;
+        const std::string problem = charge_multiplicity_problem(
+            sum_z->second, section.at("charge").as_int(), has_mult,
+            has_mult ? section.at("multiplicity").as_int() : 0);
+        if (!problem.empty())
+            throw std::runtime_error("structure '" + id + "': " + problem +
+                                     " (QVF spec § 5.1)");
+    }
+    replace_section(index, std::move(section));
+    return id;
+}
+
 std::string QvfWriter::add_bonds(const std::vector<Bond>& pairs,
-                                 const std::string& section_id) {
+                                 const std::string& section_id,
+                                 const std::string& structure_ref) {
+    // Check the reference and the id first, so a failure adds nothing.
+    if (!structure_ref.empty()) check_section_ref("structure_ref", structure_ref);
+    check_new_id(section_id);
     Json pj = Json::array();
     for (const auto& b : pairs) {
         Json p = Json::object();
@@ -1911,14 +10704,16 @@ std::string QvfWriter::add_bonds(const std::vector<Bond>& pairs,
     Json members = Json::object();
     members.set("bonds", json_member(section_id + "/connectivity.json", payload));
     Json section = Json::object();
-    section.set("id", reserve_id(section_id)).set("kind", "bonds")
-           .set("members", members);
+    section.set("id", reserve_id(section_id)).set("kind", "bonds");
+    if (!structure_ref.empty()) section.set("structure_ref", structure_ref);
+    section.set("members", members);
     sections_.push_back(section);
     return section_id;
 }
 
 std::string QvfWriter::add_bond_orders(const std::string& method, const Json& pairs,
                                        const std::string& section_id) {
+    check_new_id(section_id);
     Json payload = Json::object();
     payload.set("method", method).set("pairs", pairs);
     Json members = Json::object();
@@ -1938,16 +10733,164 @@ static Tensor matrix_to_tensor(const Matrix& m) {
     return tensor_f64(m.data, {m.rows, m.cols});
 }
 
-std::string QvfWriter::add_wavefunction_gto(const WavefunctionGTO& wf) {
+static bool matrix_empty(const Matrix& m) {
+    return m.rows == 0 && m.cols == 0 && m.data.empty();
+}
+
+// One MO coefficient matrix (QVF spec § 5.3): [rows, cols] when real, or
+// [rows, cols, 2] from (re, im)-interleaved data when complex; cols must be
+// the AO extent (n_ao, or 2 n_ao for a generalized wavefunction).
+static Tensor coefficient_tensor(const Matrix& m, bool complex_coefficients,
+                                 int64_t ao_extent, const std::string& what) {
+    if (m.rows < 0 || m.cols < 0)
+        throw std::runtime_error(what + ": rows and cols must be >= 0");
+    const size_t want = static_cast<size_t>(m.rows) * static_cast<size_t>(m.cols) *
+                        (complex_coefficients ? 2u : 1u);
+    if (m.data.size() != want)
+        throw std::runtime_error(what + ": data has " + std::to_string(m.data.size()) +
+                                 " doubles but rows * cols" +
+                                 (complex_coefficients ? " * 2" : "") + " is " +
+                                 std::to_string(want));
+    if (m.cols != ao_extent)
+        throw std::runtime_error(what + " has " + std::to_string(m.cols) +
+                                 " AO columns but the basis gives " +
+                                 std::to_string(ao_extent));
+    if (complex_coefficients) return tensor_f64(m.data, {m.rows, m.cols, 2});
+    return tensor_f64(m.data, {m.rows, m.cols});
+}
+
+// An overlap or density matrix: real [n_ao, n_ao].
+static Tensor ao_matrix_tensor(const Matrix& m, int64_t n_ao, const std::string& what) {
+    if (m.rows != n_ao || m.cols != n_ao)
+        throw std::runtime_error(what + " must be [n_ao, n_ao] = [" + std::to_string(n_ao) +
+                                 ", " + std::to_string(n_ao) + "], got [" +
+                                 std::to_string(m.rows) + ", " + std::to_string(m.cols) +
+                                 "]");
+    return matrix_to_tensor(m);
+}
+
+static bool is_finite_number(const Json& j) {
+    return (j.type() == Json::Type::Int || j.type() == Json::Type::Double) &&
+           std::isfinite(j.as_double());
+}
+
+// The `ecp` entries of a basis payload (QVF spec § 5.3), checked and parsed:
+// at most one per atom; parallel projector arrays of finite numbers, exponents
+// above 0 and integer powers; at most one local part per centre, with the
+// centre's highest l. Keys outside the definitions must begin with x_.
+static Json checked_ecp(const Json& ecp_in) {
+    Json ecp = ecp_in;
+    if (ecp.type() == Json::Type::Raw) {
+        try {
+            ecp = Json::parse(ecp.as_string());
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("ecp is not valid JSON: ") + e.what());
+        }
+    }
+    if (!ecp.is_array())
+        throw std::runtime_error(
+            "ecp must be a JSON array of {center, n_core_electrons, label?, projectors?}");
+    auto is_x = [](const std::string& key) { return key.compare(0, 2, "x_") == 0; };
+    auto non_negative_int = [](const Json& o, const char* key) {
+        return o.has(key) && o.at(key).type() == Json::Type::Int && o.at(key).as_int() >= 0;
+    };
+    std::set<int64_t> centres;
+    size_t k = 0;
+    for (const Json& entry : ecp.elements()) {
+        const std::string what = "ecp[" + std::to_string(k++) + "]";
+        if (!entry.is_object()) throw std::runtime_error(what + " must be an object");
+        for (const auto& kv : entry.items())
+            if (kv.first != "center" && kv.first != "n_core_electrons" &&
+                kv.first != "label" && kv.first != "projectors" && !is_x(kv.first))
+                throw std::runtime_error(what + ": unknown key '" + kv.first + "'");
+        if (!non_negative_int(entry, "center"))
+            throw std::runtime_error(what + ": center must be an integer >= 0");
+        if (!non_negative_int(entry, "n_core_electrons"))
+            throw std::runtime_error(what + ": n_core_electrons must be an integer >= 0");
+        if (!centres.insert(entry.at("center").as_int()).second)
+            throw std::runtime_error(what + ": atom " +
+                                     std::to_string(entry.at("center").as_int()) +
+                                     " already has an ecp entry; there is at most one per atom");
+        if (entry.has("label") && !entry.at("label").is_string())
+            throw std::runtime_error(what + ": label must be a string");
+        if (!entry.has("projectors")) continue;
+        const Json& projectors = entry.at("projectors");
+        if (!projectors.is_array())
+            throw std::runtime_error(what + ": projectors must be an array");
+        int n_local = 0;
+        int64_t local_l = -1, max_semi_l = -1;
+        size_t j = 0;
+        for (const Json& p : projectors.elements()) {
+            const std::string pw = what + ".projectors[" + std::to_string(j++) + "]";
+            if (!p.is_object()) throw std::runtime_error(pw + " must be an object");
+            for (const auto& kv : p.items())
+                if (kv.first != "l" && kv.first != "exponents" && kv.first != "coefficients" &&
+                    kv.first != "powers" && kv.first != "local" && !is_x(kv.first))
+                    throw std::runtime_error(pw + ": unknown key '" + kv.first + "'");
+            if (!non_negative_int(p, "l"))
+                throw std::runtime_error(pw + ": l must be an integer >= 0");
+            size_t n = 0;
+            for (const char* key : {"exponents", "coefficients", "powers"}) {
+                if (!p.has(key) || !p.at(key).is_array() || p.at(key).size() == 0)
+                    throw std::runtime_error(pw + ": " + key + " must be a non-empty array");
+                for (const Json& x : p.at(key).elements()) {
+                    const bool ok = std::string(key) == "powers"
+                                        ? x.type() == Json::Type::Int
+                                        : is_finite_number(x) &&
+                                              (std::string(key) != "exponents" ||
+                                               x.as_double() > 0);
+                    if (!ok)
+                        throw std::runtime_error(
+                            pw + ": " + key +
+                            (std::string(key) == "powers"
+                                 ? " must hold integers"
+                                 : std::string(key) == "exponents"
+                                       ? " must hold finite numbers above 0"
+                                       : " must hold finite numbers"));
+                }
+                if (n && p.at(key).size() != n)
+                    throw std::runtime_error(
+                        pw + ": exponents, coefficients and powers must have the same length");
+                n = p.at(key).size();
+            }
+            bool local = false;
+            if (p.has("local")) {
+                if (!p.at("local").is_bool())
+                    throw std::runtime_error(pw + ": local must be a boolean");
+                local = p.at("local").as_bool();
+            }
+            const int64_t l = p.at("l").as_int();
+            if (local) {
+                ++n_local;
+                local_l = l;
+            } else if (l > max_semi_l) {
+                max_semi_l = l;
+            }
+        }
+        if (n_local > 1) throw std::runtime_error(what + ": more than one local projector");
+        if (n_local == 1 && max_semi_l >= local_l)
+            throw std::runtime_error(what + ": the local projector's l (" +
+                                     std::to_string(local_l) +
+                                     ") must exceed the l of every semi-local channel");
+    }
+    return ecp;
+}
+
+// The `shells` array of a basis payload (spec § 5.3, Appendix A) and its AO
+// count; with `libint_normalized` every contraction coefficient is divided by
+// the primitive norm N_i. Shared by add_wavefunction_gto and
+// add_wavefunction_bloch.
+static Json basis_shells_json(const std::vector<Shell>& shells, bool libint_normalized,
+                              int64_t& n_ao) {
     Json shells_json = Json::array();
-    int64_t n_ao = 0;
-    for (const auto& sh : wf.shells) {
+    n_ao = 0;
+    for (const auto& sh : shells) {
         if (sh.exponents.size() != sh.coefficients.size())
             throw std::runtime_error("shell exponents/coefficients length mismatch");
         Json exps = Json::array(), coeffs = Json::array();
         for (size_t i = 0; i < sh.exponents.size(); ++i) {
             double c = sh.coefficients[i];
-            if (wf.coeffs_are_libint_normalized)
+            if (libint_normalized)
                 c /= primitive_norm(sh.exponents[i], sh.l);
             exps.push_back(Json(sh.exponents[i]));
             coeffs.push_back(Json(c));
@@ -1959,71 +10902,350 @@ std::string QvfWriter::add_wavefunction_gto(const WavefunctionGTO& wf) {
         shells_json.push_back(sj);
         n_ao += sh.pure ? (2 * sh.l + 1) : ((sh.l + 1) * (sh.l + 2) / 2);
     }
+    return shells_json;
+}
+
+std::string QvfWriter::add_wavefunction_gto(const WavefunctionGTO& wf) {
+    check_new_id(wf.section_id);
+    int64_t n_ao = 0;
+    Json shells_json = basis_shells_json(wf.shells, wf.coeffs_are_libint_normalized, n_ao);
+    // Natural transition orbitals (spec § 5.3): checked before anything is
+    // written.
+    if (!wf.nto_role.empty() &&
+        (wf.orbital_kind != "nto" || (wf.nto_role != "hole" && wf.nto_role != "particle")))
+        throw std::runtime_error(
+            "wavefunction.gto nto_role is 'hole' or 'particle', for orbital_kind 'nto' "
+            "(QVF spec § 5.3)");
+    if (wf.state_index < 0)
+        throw std::runtime_error("wavefunction.gto state_index must be >= 1 (0 omits it)");
+    if (wf.state_index > 0 && wf.state_ref.empty())
+        throw std::runtime_error("wavefunction.gto state_index needs state_ref (QVF spec § 5.3)");
+    auto add_state_fields = [&wf](Json& meta) {
+        if (!wf.state_ref.empty()) meta.set("state_ref", wf.state_ref);
+        if (wf.state_index > 0) meta.set("state_index", wf.state_index);
+        if (!wf.nto_role.empty()) meta.set("nto_role", wf.nto_role);
+        if (wf.orbital_kind == "nto") meta.set("occupation_semantics", "transition_weight");
+    };
+
+    // spin (QVF spec § 5.3)
+    const std::string spin =
+        !wf.spin.empty() ? wf.spin : (wf.unrestricted ? "unrestricted" : "restricted");
+    if (spin != "restricted" && spin != "unrestricted" && spin != "restricted_open" &&
+        spin != "generalized")
+        throw std::runtime_error("spin '" + spin +
+                                 "' is not restricted, unrestricted, restricted_open or "
+                                 "generalized");
+    const bool unrestricted = spin == "unrestricted";
+    if (wf.orbital_kind == "nto" && unrestricted) {
+        if (wf.state_ref.empty() || wf.state_index <= 0 || wf.nto_role.empty())
+            throw std::runtime_error("unrestricted NTOs require state_ref, state_index and nto_role");
+        auto check_nto = [](const Matrix& c, const std::vector<double>& e,
+                            const std::vector<double>& o) {
+            if (c.rows < 0 || static_cast<int64_t>(o.size()) != c.rows ||
+                (!e.empty() && static_cast<int64_t>(e.size()) != c.rows))
+                throw std::runtime_error("NTOs need one weight and energy per coefficient row");
+            for (size_t i = 0; i < o.size(); ++i)
+                if (!std::isfinite(o[i]) || o[i] < 0 || (i && o[i - 1] < o[i]))
+                    throw std::runtime_error("NTO weights must be finite, nonnegative and non-increasing");
+        };
+        check_nto(wf.mo_coefficients_alpha, wf.energies_alpha, wf.occupations_alpha);
+        check_nto(wf.mo_coefficients_beta, wf.energies_beta, wf.occupations_beta);
+    }
+    if (wf.unrestricted && !unrestricted)
+        throw std::runtime_error("unrestricted = true disagrees with spin '" + spin + "'");
+    if (spin == "generalized" && !wf.complex_coefficients)
+        throw std::runtime_error(
+            "a generalized wavefunction needs complex_coefficients (QVF spec § 5.3)");
+    const int64_t ao_extent = spin == "generalized" ? 2 * n_ao : n_ao;
+
+    auto padded = [](const std::vector<double>& v, int64_t n) {
+        std::vector<double> out(static_cast<size_t>(n), 0.0);
+        for (size_t i = 0; i < out.size() && i < v.size(); ++i) out[i] = v[i];
+        return out;
+    };
+    auto labels = [](const std::vector<std::string>& l, int64_t n, const std::string& what) {
+        if (static_cast<int64_t>(l.size()) != n)
+            throw std::runtime_error(what + " has " + std::to_string(l.size()) +
+                                     " entries but there are " + std::to_string(n) +
+                                     " MOs; there is one label per MO");
+        return Json::from_strings(l);
+    };
+
+    if (wf.localization_reference_basis && wf.localization_reference_basis->empty())
+        throw std::runtime_error("localization_reference_basis must be a non-empty string");
+    Json mo_meta = Json::object();
+    if (wf.localization_reference_basis)
+        mo_meta.set("localization_reference_basis", *wf.localization_reference_basis);
+    std::vector<std::pair<std::string, Tensor>> coefficients;
+    double occupation_sum = 0.0;
+    if (!unrestricted) {
+        if (!wf.symmetry_labels_alpha.empty() || !wf.symmetry_labels_beta.empty())
+            throw std::runtime_error(
+                "symmetry_labels_alpha / _beta belong to an unrestricted wavefunction");
+        Tensor C = coefficient_tensor(wf.mo_coefficients, wf.complex_coefficients,
+                                      ao_extent, "mo_coefficients");
+        const int64_t n_mo = wf.mo_coefficients.rows;
+        const std::vector<double> occ = padded(wf.occupations, n_mo);
+        mo_meta.set("n_mo", static_cast<long long>(n_mo))
+               .set("n_ao", static_cast<long long>(n_ao))
+               .set("spin", spin).set("orbital_kind", wf.orbital_kind)
+               .set("energies", Json::from_doubles(padded(wf.energies, n_mo)))
+               .set("occupations", Json::from_doubles(occ));
+        if (!wf.symmetry_labels.empty())
+            mo_meta.set("symmetry_labels", labels(wf.symmetry_labels, n_mo, "symmetry_labels"));
+        for (double x : occ) occupation_sum += x;
+        coefficients.emplace_back("mo_coefficients", std::move(C));
+    } else {
+        if (!wf.symmetry_labels.empty())
+            throw std::runtime_error("an unrestricted wavefunction takes symmetry_labels_alpha "
+                                     "and symmetry_labels_beta");
+        Tensor Ca = coefficient_tensor(wf.mo_coefficients_alpha, wf.complex_coefficients,
+                                       ao_extent, "mo_coefficients_alpha");
+        Tensor Cb = coefficient_tensor(wf.mo_coefficients_beta, wf.complex_coefficients,
+                                       ao_extent, "mo_coefficients_beta");
+        auto channel = [&](int64_t n, const std::vector<double>& e,
+                           const std::vector<double>& o, const std::vector<std::string>& l,
+                           const char* what) {
+            const std::vector<double> occ = padded(o, n);
+            for (double x : occ) occupation_sum += x;
+            Json c = Json::object();
+            c.set("n_mo", static_cast<long long>(n))
+             .set("energies", Json::from_doubles(padded(e, n)))
+             .set("occupations", Json::from_doubles(occ));
+            if (!l.empty()) c.set("symmetry_labels", labels(l, n, what));
+            return c;
+        };
+        Json alpha = channel(wf.mo_coefficients_alpha.rows, wf.energies_alpha,
+                             wf.occupations_alpha, wf.symmetry_labels_alpha,
+                             "symmetry_labels_alpha");
+        Json beta = channel(wf.mo_coefficients_beta.rows, wf.energies_beta,
+                            wf.occupations_beta, wf.symmetry_labels_beta,
+                            "symmetry_labels_beta");
+        mo_meta.set("n_ao", static_cast<long long>(n_ao))
+               .set("spin", "unrestricted").set("orbital_kind", wf.orbital_kind)
+               .set("alpha", alpha).set("beta", beta);
+        coefficients.emplace_back("mo_coefficients_alpha", std::move(Ca));
+        coefficients.emplace_back("mo_coefficients_beta", std::move(Cb));
+    }
+    if (wf.has_kpoint) {
+        Json k = Json::array();
+        for (double x : wf.kpoint) k.push_back(Json(x));
+        mo_meta.set("k_point", k);
+    }
+    if (wf.complex_coefficients) mo_meta.set("complex", true);
+    add_state_fields(mo_meta);
 
     Json basis = Json::object();
     basis.set("structure_ref", wf.structure_ref).set("pure", wf.pure)
          .set("n_ao", static_cast<long long>(n_ao)).set("shells", shells_json);
-
-    Json members = Json::object();
-    members.set("basis", json_member(wf.section_id + "/basis.json", basis));
-
-    auto energies_or_zeros = [](const std::vector<double>& e, int64_t n) {
-        Json a = Json::array();
-        for (int64_t i = 0; i < n; ++i)
-            a.push_back(Json(i < static_cast<int64_t>(e.size()) ? e[i] : 0.0));
-        return a;
-    };
-
-    Json mo_meta = Json::object();
-    if (!wf.unrestricted) {
-        Tensor C = matrix_to_tensor(wf.mo_coefficients);
-        int64_t n_mo = wf.mo_coefficients.rows;
-        mo_meta.set("n_mo", static_cast<long long>(n_mo))
-               .set("n_ao", static_cast<long long>(n_ao))
-               .set("spin", "restricted").set("orbital_kind", wf.orbital_kind)
-               .set("energies", energies_or_zeros(wf.energies, n_mo))
-               .set("occupations", energies_or_zeros(wf.occupations, n_mo));
-        if (wf.has_kpoint) {
-            Json k = Json::array();
-            for (double x : wf.kpoint) k.push_back(Json(x));
-            mo_meta.set("k_point", k);
-        }
-        members.set("mo_metadata",
-                    json_member(wf.section_id + "/mo_metadata.json", mo_meta));
-        members.set("mo_coefficients",
-                    binary_member(wf.section_id + "/mo_coefficients.dat", C));
-    } else {
-        Tensor Ca = matrix_to_tensor(wf.mo_coefficients_alpha);
-        Tensor Cb = matrix_to_tensor(wf.mo_coefficients_beta);
-        int64_t na = wf.mo_coefficients_alpha.rows, nb = wf.mo_coefficients_beta.rows;
-        Json alpha = Json::object(), beta = Json::object();
-        alpha.set("n_mo", static_cast<long long>(na))
-             .set("energies", energies_or_zeros(wf.energies_alpha, na))
-             .set("occupations", energies_or_zeros(wf.occupations_alpha, na));
-        beta.set("n_mo", static_cast<long long>(nb))
-            .set("energies", energies_or_zeros(wf.energies_beta, nb))
-            .set("occupations", energies_or_zeros(wf.occupations_beta, nb));
-        mo_meta.set("n_ao", static_cast<long long>(n_ao))
-               .set("spin", "unrestricted").set("orbital_kind", wf.orbital_kind)
-               .set("alpha", alpha).set("beta", beta);
-        if (wf.has_kpoint) {
-            Json k = Json::array();
-            for (double x : wf.kpoint) k.push_back(Json(x));
-            mo_meta.set("k_point", k);
-        }
-        members.set("mo_metadata",
-                    json_member(wf.section_id + "/mo_metadata.json", mo_meta));
-        members.set("mo_coefficients_alpha",
-                    binary_member(wf.section_id + "/mo_coefficients_alpha.dat", Ca));
-        members.set("mo_coefficients_beta",
-                    binary_member(wf.section_id + "/mo_coefficients_beta.dat", Cb));
+    if (!wf.ecp.is_null()) basis.set("ecp", checked_ecp(wf.ecp));
+    if (wf.n_electrons >= 0) {
+        if (wf.orbital_kind != "nto" && std::fabs(occupation_sum - wf.n_electrons) > 1e-6)
+            throw std::runtime_error("n_electrons is " + std::to_string(wf.n_electrons) +
+                                     " but the occupations sum to " +
+                                     std::to_string(occupation_sum) +
+                                     "; they must agree (QVF spec § 5.3)");
+        basis.set("n_electrons", wf.n_electrons);
     }
 
+    std::vector<std::pair<std::string, Tensor>> matrices;
+    if (!matrix_empty(wf.overlap))
+        matrices.emplace_back("overlap", ao_matrix_tensor(wf.overlap, n_ao, "overlap"));
+    if (!matrix_empty(wf.density_matrix)) {
+        if (unrestricted)
+            throw std::runtime_error("density_matrix accompanies mo_coefficients; an "
+                                     "unrestricted wavefunction takes density_matrix_alpha "
+                                     "and density_matrix_beta");
+        matrices.emplace_back("density_matrix",
+                              ao_matrix_tensor(wf.density_matrix, n_ao, "density_matrix"));
+    }
+    const bool has_da = !matrix_empty(wf.density_matrix_alpha);
+    const bool has_db = !matrix_empty(wf.density_matrix_beta);
+    if (has_da || has_db) {
+        if (!unrestricted)
+            throw std::runtime_error("density_matrix_alpha and density_matrix_beta accompany "
+                                     "the alpha and beta coefficients");
+        if (!(has_da && has_db))
+            throw std::runtime_error(
+                "density_matrix_alpha and density_matrix_beta come together");
+        matrices.emplace_back("density_matrix_alpha",
+                              ao_matrix_tensor(wf.density_matrix_alpha, n_ao,
+                                               "density_matrix_alpha"));
+        matrices.emplace_back("density_matrix_beta",
+                              ao_matrix_tensor(wf.density_matrix_beta, n_ao,
+                                               "density_matrix_beta"));
+    }
+
+    // Everything is checked: write the section.
+    const std::string sid = reserve_id(wf.section_id);
+    Json members = Json::object();
+    members.set("basis", json_member(sid + "/basis.json", basis));
+    members.set("mo_metadata", json_member(sid + "/mo_metadata.json", mo_meta));
+    for (const auto& c : coefficients)
+        members.set(c.first, binary_member(sid + "/" + c.first + ".dat", c.second));
+    for (const auto& m : matrices)
+        members.set(m.first, binary_member(sid + "/" + m.first + ".dat", m.second));
+
     Json section = Json::object();
-    section.set("id", reserve_id(wf.section_id)).set("kind", "wavefunction.gto")
-           .set("members", members);
+    section.set("id", sid).set("kind", "wavefunction.gto").set("members", members);
     sections_.push_back(section);
-    return wf.section_id;
+    return sid;
+}
+
+size_t QvfWriter::wavefunction_index(const std::string& id) const {
+    const size_t index = section_index(id);
+    if (sections_.elements()[index].at("kind").as_string() != "wavefunction.gto")
+        throw std::runtime_error("section '" + id + "' is not a wavefunction.gto section");
+    return index;
+}
+
+Json QvfWriter::member_json(const Json& member) const {
+    const std::string& path = member.at("path").as_string();
+    for (const auto& f : files_)
+        if (f.first == path) return Json::parse(std::string(f.second.begin(), f.second.end()));
+    throw std::runtime_error("no member file " + path);
+}
+
+void QvfWriter::replace_section(size_t index, Json section) {
+    // Json has no mutable element access: rebuild the array.
+    const std::vector<Json>& sections = sections_.elements();
+    Json rebuilt = Json::array();
+    for (size_t i = 0; i < sections.size(); ++i)
+        rebuilt.push_back(i == index ? section : sections[i]);
+    sections_ = std::move(rebuilt);
+}
+
+std::string QvfWriter::set_wavefunction_overlap(const std::string& section_id,
+                                                const Matrix& overlap) {
+    const size_t index = wavefunction_index(section_id);
+    Json section = sections_.elements()[index];
+    Json members = section.at("members");
+    if (members.has("overlap"))
+        throw std::runtime_error("section '" + section_id + "' already has an overlap member");
+    const int64_t n_ao = member_json(members.at("basis")).at("n_ao").as_int();
+    const Tensor t = ao_matrix_tensor(overlap, n_ao, "overlap");
+    members.set("overlap", binary_member(section_id + "/overlap.dat", t));
+    section.set("members", members);
+    replace_section(index, std::move(section));
+    return section_id;
+}
+
+std::string QvfWriter::set_wavefunction_ecp(const std::string& section_id, const Json& ecp) {
+    const size_t index = wavefunction_index(section_id);
+    const Json checked = checked_ecp(ecp);
+    Json section = sections_.elements()[index];
+    Json members = section.at("members");
+    Json basis = member_json(members.at("basis"));
+    basis.set("ecp", checked);
+    const std::string path = members.at("basis").at("path").as_string();
+    drop_file(path);
+    members.set("basis", json_member(path, basis));
+    section.set("members", members);
+    replace_section(index, std::move(section));
+    return section_id;
+}
+
+std::string QvfWriter::add_wavefunction_bloch(const WavefunctionBloch& wf) {
+    check_new_id(wf.section_id);
+    int64_t n_spin = 0;
+    if (wf.spin == "restricted") n_spin = 1;
+    else if (wf.spin == "unrestricted") n_spin = 2;
+    else throw std::runtime_error("wavefunction.bloch spin must be 'restricted' or "
+                                  "'unrestricted', got '" + wf.spin + "'");
+    const int64_t n_k = static_cast<int64_t>(wf.kpoints.size());
+    if (n_k < 1) throw std::runtime_error("wavefunction.bloch needs at least one k-point");
+    if (wf.n_mo < 0) throw std::runtime_error("wavefunction.bloch n_mo must be >= 0");
+    int64_t n_ao = 0;
+    Json shells_json = basis_shells_json(wf.shells, wf.coeffs_are_libint_normalized, n_ao);
+    const size_t n_orb = static_cast<size_t>(n_k) * static_cast<size_t>(n_spin) *
+                         static_cast<size_t>(wf.n_mo);
+    if (wf.mo_coefficients.size() != n_orb * static_cast<size_t>(n_ao) * 2)
+        throw std::runtime_error("wavefunction.bloch mo_coefficients must hold n_k * n_spin * "
+                                 "n_mo * n_ao * 2 doubles");
+    if (wf.energies.size() != n_orb || wf.occupations.size() != n_orb)
+        throw std::runtime_error("wavefunction.bloch energies and occupations must hold "
+                                 "n_k * n_spin * n_mo doubles");
+    Json kp = Json::object();
+    Json points = Json::array();
+    for (const auto& k : wf.kpoints) {
+        Json v = Json::array();
+        for (double x : k) v.push_back(Json(x));
+        points.push_back(v);
+    }
+    kp.set("kpoints", points);
+    if (!wf.weights.empty()) {
+        double sum = 0.0;
+        bool negative = false;
+        for (double x : wf.weights) {
+            sum += x;
+            negative = negative || !(x >= 0.0);
+        }
+        if (static_cast<int64_t>(wf.weights.size()) != n_k || negative ||
+            !(std::fabs(sum - 1.0) <= 1e-6))
+            throw std::runtime_error("wavefunction.bloch weights must be n_k non-negative "
+                                     "numbers that sum to 1 within 1e-6");
+        kp.set("weights", Json::from_doubles(wf.weights));
+    }
+    if (!wf.labels.empty()) {
+        if (static_cast<int64_t>(wf.labels.size()) != n_k)
+            throw std::runtime_error("wavefunction.bloch labels must have n_k entries");
+        kp.set("labels", Json::from_strings(wf.labels));
+    }
+    if (!wf.mesh.empty()) {
+        if (wf.mesh.size() != 3 || wf.mesh[0] < 1 || wf.mesh[1] < 1 || wf.mesh[2] < 1)
+            throw std::runtime_error("wavefunction.bloch mesh must be three integers >= 1");
+        kp.set("mesh", Json::from_ints(wf.mesh));
+    }
+    if (wf.has_shift) {
+        Json v = Json::array();
+        for (double x : wf.shift) v.push_back(Json(x));
+        kp.set("shift", v);
+    }
+    if (wf.has_time_reversal) kp.set("time_reversal", wf.time_reversal);
+    Json meta = Json::object();
+    meta.set("spin", wf.spin).set("n_spin", static_cast<long long>(n_spin))
+        .set("n_mo", static_cast<long long>(wf.n_mo))
+        .set("n_ao", static_cast<long long>(n_ao))
+        .set("orbital_kind", wf.orbital_kind).set("complex", true)
+        .set("k_point_convention", "fractional");
+    if (!wf.n_mo_per_k.empty()) {
+        if (static_cast<int64_t>(wf.n_mo_per_k.size()) != n_k)
+            throw std::runtime_error("wavefunction.bloch n_mo_per_k must have n_k entries");
+        Json per_k = Json::array();
+        for (int64_t n : wf.n_mo_per_k) {
+            if (n < 0 || n > wf.n_mo)
+                throw std::runtime_error("wavefunction.bloch n_mo_per_k entries must lie "
+                                         "between 0 and n_mo");
+            per_k.push_back(Json(static_cast<long long>(n)));
+        }
+        meta.set("n_mo_per_k", per_k);
+    }
+    if (wf.has_fermi_energy) {
+        Json fermi = Json::object();
+        fermi.set("value", wf.fermi_energy_ev).set("units", "ev");
+        meta.set("fermi_energy", fermi);
+    }
+    Json basis = Json::object();
+    basis.set("structure_ref", wf.structure_ref).set("pure", wf.pure)
+         .set("n_ao", static_cast<long long>(n_ao)).set("shells", shells_json);
+
+    const std::string sid = reserve_id(wf.section_id);
+    Json members = Json::object();
+    members.set("basis", json_member(sid + "/basis.json", basis));
+    members.set("kpoints", json_member(sid + "/kpoints.json", kp));
+    members.set("mo_metadata", json_member(sid + "/mo_metadata.json", meta));
+    members.set("mo_coefficients",
+                binary_member(sid + "/mo_coefficients.bin",
+                              tensor_f64(wf.mo_coefficients, {n_k, n_spin, wf.n_mo, n_ao, 2})));
+    members.set("energies", binary_member(sid + "/energies.bin",
+                                          tensor_f64(wf.energies, {n_k, n_spin, wf.n_mo})));
+    members.set("occupations",
+                binary_member(sid + "/occupations.bin",
+                              tensor_f64(wf.occupations, {n_k, n_spin, wf.n_mo})));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", "wavefunction.bloch").set("members", members);
+    sections_.push_back(section);
+    return sid;
 }
 
 // -- spectra ----------------------------------------------------------------
@@ -2034,17 +11256,49 @@ std::string QvfWriter::add_spectrum(const std::string& kind, const Spectrum& spe
     Json payload = Json::object();
     payload.set("frequencies", Json::from_doubles(spectrum.frequencies));
     payload.set("intensities", Json::from_doubles(spectrum.intensities));
+    if (!spectrum.x_units.empty()) payload.set("x_units", spectrum.x_units);
+    if (!spectrum.y_units.empty()) payload.set("y_units", spectrum.y_units);
     return add_spectrum(kind, payload, label, section_id);
 }
 
 std::string QvfWriter::add_spectrum(const std::string& kind, const Json& payload,
                                     const std::string& label,
                                     const std::string& section_id) {
+    if (is_spectrum_1d(kind)) {
+        check_payload_units(kind, payload, {}, true);
+        // states_ref names an added excited_states section (spec § 5.4). A
+        // Json::raw fragment is parsed for the check; one that does not parse
+        // is left alone (it is written verbatim, as before).
+        Json parsed;
+        const Json* doc = &payload;
+        if (payload.type() == Json::Type::Raw) {
+            try {
+                parsed = Json::parse(payload.as_string());
+            } catch (const std::exception&) {
+                parsed = Json();
+            }
+            doc = &parsed;
+        }
+        if (doc->is_object() && doc->has("states_ref")) {
+            const Json& ref = doc->at("states_ref");
+            bool found = false;
+            if (ref.is_string())
+                for (const Json& s : sections_.elements())
+                    if (s.at("id").as_string() == ref.as_string() &&
+                        s.at("kind").as_string() == "excited_states")
+                        found = true;
+            if (!found)
+                throw std::runtime_error(kind + ": states_ref " + ref.dump(0) +
+                                         " must name an added excited_states section "
+                                         "(QVF spec § 5.4)");
+        }
+    }
     std::string sid = section_id;
     if (sid.empty()) {
         sid = kind;
         for (char& c : sid) if (c == '.') c = '_';
     }
+    check_new_id(sid);
     Json members = Json::object();
     members.set("spectrum", json_member("spectra/" + sid + ".json", payload));
     Json section = Json::object();
@@ -2056,29 +11310,203 @@ std::string QvfWriter::add_spectrum(const std::string& kind, const Json& payload
 
 // -- analysis / provenance --------------------------------------------------
 
+// The atom_properties member roles, in schema order ($defs/SectionAtomProperties,
+// QVF spec § 5.7). The schema, the spec, both reference writers and the C ABI
+// share this one list; the scalar roles are float64 [n_atoms], the two vector
+// roles float64 [n_atoms, 3].
+static const char* const kAtomPropertyRoles[] = {
+    "mulliken_charge", "loewdin_charge", "hirshfeld_charge", "iao_charge",
+    "spin_population",
+    "cm5_charge", "chelpg_charge", "resp_charge", "esp_charge", "nbo_charge",
+    "mbis_charge", "bader_charge", "ddec_charge",
+    "valence", "bonded_valence", "fukui_plus", "fukui_minus", "fukui_zero",
+    "dual_descriptor", "atomic_energy_eh", "atomic_volume_bohr3",
+    "nmr_shielding_iso_ppm",
+    "magnetic_moment", "force_eh_bohr"};
+// The vector roles of the list above.
+static const char* const kAtomVectorRoles[] = {"magnetic_moment", "force_eh_bohr"};
+
+static bool is_atom_vector_role(const std::string& role) {
+    for (const char* r : kAtomVectorRoles)
+        if (role == r) return true;
+    return false;
+}
+
+static bool is_custom_role(const std::string& role) {
+    return role.compare(0, 7, "custom.") == 0;
+}
+
+// custom.<name> with <name> one or more characters of [A-Za-z0-9_].
+static bool is_valid_custom_role(const std::string& role) {
+    if (!is_custom_role(role) || role.size() == 7) return false;
+    for (size_t i = 7; i < role.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(role[i]);
+        if (!(std::isalnum(c) || c == '_')) return false;
+    }
+    return true;
+}
+
+// Throws unless `role` can carry a scalar (vector == false) or a vector member:
+// a listed role of that shape, or a custom.<name> role whose entry in
+// `registry` (set_atom_properties_meta) has that kind.
+static void check_atom_role(const std::string& role, bool vector,
+                            const Json& registry) {
+    const std::string shape = vector ? "vector" : "scalar";
+    if (is_custom_role(role)) {
+        if (!is_valid_custom_role(role))
+            throw std::runtime_error("atom_properties custom role '" + role +
+                                     "' must be custom.<name> with <name> in "
+                                     "[A-Za-z0-9_]+");
+        if (!registry.has(role))
+            throw std::runtime_error(
+                "atom_properties " + role + " has no meta entry; describe it with "
+                "set_atom_properties_meta first (QVF spec § 5.7)");
+        const std::string& kind = registry.at(role).at("kind").as_string();
+        if (kind != shape)
+            throw std::runtime_error("atom_properties " + role + " is described as a " +
+                                     kind + " in its meta entry but is written as a " +
+                                     shape);
+        return;
+    }
+    bool known = false;
+    std::string expected;
+    for (const char* r : kAtomPropertyRoles) {
+        known = known || role == r;
+        expected += expected.empty() ? r : std::string(", ") + r;
+    }
+    if (!known)
+        throw std::runtime_error("unknown atom_properties role '" + role +
+                                 "' (expected one of " + expected +
+                                 ", or custom.<name>)");
+    if (is_atom_vector_role(role) != vector)
+        throw std::runtime_error(
+            "atom_properties role '" + role + "' is a " +
+            (vector ? "scalar role; use add_atom_property" :
+                      "vector role; use add_atom_vector_property"));
+}
+
+static Tensor atom_property_tensor(const std::vector<double>& flat, size_t n_atoms,
+                                   bool vector) {
+    std::vector<int64_t> shape = {static_cast<int64_t>(n_atoms)};
+    if (vector) shape.push_back(3);
+    return tensor_f64(flat, shape);
+}
+
+void QvfWriter::set_atom_properties_meta(const Json& meta) {
+    Json doc = meta;
+    if (doc.type() == Json::Type::Raw) {
+        try {
+            doc = Json::parse(meta.as_string());
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("atom_properties meta is not valid JSON: ") + e.what());
+        }
+    }
+    if (!doc.is_object())
+        throw std::runtime_error(
+            "atom_properties meta must be a JSON object mapping custom.<name> to "
+            "{units, description, kind}");
+    Json merged = atom_properties_meta_;
+    for (const auto& kv : doc.items()) {
+        const std::string& role = kv.first;
+        if (!is_valid_custom_role(role))
+            throw std::runtime_error("atom_properties meta key '" + role +
+                                     "' must be custom.<name> with <name> in "
+                                     "[A-Za-z0-9_]+");
+        const Json& e = kv.second;
+        if (!e.is_object())
+            throw std::runtime_error("atom_properties meta entry '" + role +
+                                     "' must be a JSON object");
+        Json entry = Json::object();
+        for (const char* key : {"units", "description"}) {
+            if (!e.has(key) || !e.at(key).is_string() || e.at(key).as_string().empty())
+                throw std::runtime_error("atom_properties meta entry '" + role +
+                                         "' needs a non-empty string '" + key + "'");
+            entry.set(key, e.at(key));
+        }
+        if (!e.has("kind") || !e.at("kind").is_string() ||
+            (e.at("kind").as_string() != "scalar" && e.at("kind").as_string() != "vector"))
+            throw std::runtime_error("atom_properties meta entry '" + role +
+                                     "' needs 'kind' \"scalar\" or \"vector\"");
+        entry.set("kind", e.at("kind"));
+        for (const auto& field : e.items()) {
+            if (field.first == "units" || field.first == "description" ||
+                field.first == "kind")
+                continue;
+            if (field.first.compare(0, 2, "x_") != 0)
+                throw std::runtime_error("atom_properties meta entry '" + role +
+                                         "' has unknown key '" + field.first +
+                                         "' (allowed: units, description, kind, x_*)");
+            entry.set(field.first, field.second);
+        }
+        merged.set(role, entry);
+    }
+    atom_properties_meta_ = std::move(merged);
+}
+
+Json QvfWriter::atom_properties_meta_payload(
+    const std::vector<std::string>& custom_roles) const {
+    Json payload = Json::object();
+    for (const std::string& role : custom_roles)
+        payload.set(role, atom_properties_meta_.at(role));
+    return payload;
+}
+
 std::string QvfWriter::add_atom_properties(const std::vector<double>& mulliken,
                                            const std::vector<double>& loewdin,
                                            const std::vector<double>& spin,
                                            const std::string& section_id) {
+    std::map<std::string, std::vector<double>> roles;
+    if (!mulliken.empty()) roles["mulliken_charge"] = mulliken;
+    if (!loewdin.empty()) roles["loewdin_charge"] = loewdin;
+    if (!spin.empty()) roles["spin_population"] = spin;
+    return add_atom_properties(roles, section_id);
+}
+
+std::string QvfWriter::add_atom_properties(std::initializer_list<double> mulliken,
+                                           const std::vector<double>& loewdin,
+                                           const std::vector<double>& spin,
+                                           const std::string& section_id) {
+    return add_atom_properties(std::vector<double>(mulliken), loewdin, spin,
+                               section_id);
+}
+
+std::string QvfWriter::add_atom_properties(
+    const std::map<std::string, std::vector<double>>& roles,
+    const std::string& section_id) {
+    check_new_id(section_id);
+    if (roles.empty())
+        throw std::runtime_error("atom_properties needs at least one array");
+    const size_t n_atoms = roles.begin()->second.size();
+    for (const auto& kv : roles) {
+        check_atom_role(kv.first, false, atom_properties_meta_);
+        if (kv.second.empty())
+            throw std::runtime_error("atom_properties " + kv.first + " has no values");
+        if (kv.second.size() != n_atoms)
+            throw std::runtime_error("atom_properties roles differ in length");
+    }
+    // Listed roles in schema order, whatever order the map holds them in, then
+    // the custom roles by name, then the `meta` member that describes them.
     Json members = Json::object();
-    if (!mulliken.empty())
-        members.set("mulliken_charge",
-                    binary_member("atom_properties/mulliken_charge.bin",
-                                  tensor_f64(mulliken,
-                                             {static_cast<int64_t>(mulliken.size())})));
-    if (!loewdin.empty())
-        members.set("loewdin_charge",
-                    binary_member("atom_properties/loewdin_charge.bin",
-                                  tensor_f64(loewdin,
-                                             {static_cast<int64_t>(loewdin.size())})));
-    if (!spin.empty())
-        members.set("spin_population",
-                    binary_member("atom_properties/spin_population.bin",
-                                  tensor_f64(spin,
-                                             {static_cast<int64_t>(spin.size())})));
-    if (members.type() != Json::Type::Object || !members.has("mulliken_charge"))
-        if (mulliken.empty() && loewdin.empty() && spin.empty())
-            throw std::runtime_error("atom_properties needs at least one array");
+    for (const char* role : kAtomPropertyRoles) {
+        const auto it = roles.find(role);
+        if (it != roles.end())
+            members.set(role, binary_member("atom_properties/" + std::string(role) +
+                                                ".bin",
+                                            atom_property_tensor(it->second, n_atoms,
+                                                                 false)));
+    }
+    std::vector<std::string> custom_roles;
+    for (const auto& kv : roles) {
+        if (!is_custom_role(kv.first)) continue;
+        custom_roles.push_back(kv.first);
+        members.set(kv.first, binary_member("atom_properties/" + kv.first + ".bin",
+                                            atom_property_tensor(kv.second, n_atoms,
+                                                                 false)));
+    }
+    if (!custom_roles.empty())
+        members.set("meta", json_member("atom_properties/meta.json",
+                                        atom_properties_meta_payload(custom_roles)));
     Json section = Json::object();
     section.set("id", reserve_id(section_id)).set("kind", "atom_properties")
            .set("members", members);
@@ -2086,8 +11514,103 @@ std::string QvfWriter::add_atom_properties(const std::vector<double>& mulliken,
     return section_id;
 }
 
+std::string QvfWriter::add_atom_property(const std::string& role,
+                                         const std::vector<double>& values,
+                                         const std::string& section_id) {
+    return add_atom_role(role, values, values.size(), false, section_id);
+}
+
+std::string QvfWriter::add_atom_vector_property(
+    const std::string& role, const std::vector<std::array<double, 3>>& values,
+    const std::string& section_id) {
+    std::vector<double> flat;
+    flat.reserve(values.size() * 3);
+    for (const auto& v : values) flat.insert(flat.end(), v.begin(), v.end());
+    return add_atom_role(role, flat, values.size(), true, section_id);
+}
+
+std::string QvfWriter::add_atom_role(const std::string& role,
+                                     const std::vector<double>& flat, size_t n_atoms,
+                                     bool vector, const std::string& section_id) {
+    check_atom_role(role, vector, atom_properties_meta_);
+    if (n_atoms == 0)
+        throw std::runtime_error("atom_properties " + role + " has no values");
+    const bool custom = is_custom_role(role);
+    const std::string path = "atom_properties/" + role + ".bin";
+    const std::vector<Json>& sections = sections_.elements();
+    size_t index = 0;
+    while (index < sections.size() &&
+           sections[index].at("id").as_string() != section_id)
+        ++index;
+
+    if (index == sections.size()) {
+        check_new_id(section_id);
+        Json members = Json::object();
+        members.set(role, binary_member(path, atom_property_tensor(flat, n_atoms, vector)));
+        if (custom)
+            members.set("meta", json_member("atom_properties/meta.json",
+                                            atom_properties_meta_payload({role})));
+        Json section = Json::object();
+        section.set("id", reserve_id(section_id)).set("kind", "atom_properties")
+               .set("members", members);
+        sections_.push_back(section);
+        return section_id;
+    }
+
+    const Json& existing = sections[index];
+    if (existing.at("kind").as_string() != "atom_properties")
+        throw std::runtime_error("section '" + section_id +
+                                 "' is not an atom_properties section");
+    Json members = existing.at("members");
+    if (members.has(role))
+        throw std::runtime_error("atom_properties " + role +
+                                 " is already in section '" + section_id + "'");
+    std::vector<std::string> custom_roles;
+    for (const auto& kv : members.items()) {
+        if (kv.first == "meta") continue;
+        const int64_t have = kv.second.at("shape").at(0).as_int();
+        if (static_cast<int64_t>(n_atoms) != have)
+            throw std::runtime_error(
+                "atom_properties " + role + " has " + std::to_string(n_atoms) +
+                " values but section '" + section_id + "' has " +
+                std::to_string(have) + " atoms");
+        if (is_custom_role(kv.first)) {
+            // The meta entries are the writer's current ones: each must still
+            // describe the role it was written for.
+            check_atom_role(kv.first, kv.second.at("shape").size() == 2,
+                            atom_properties_meta_);
+            custom_roles.push_back(kv.first);
+        }
+    }
+    // Everything is checked: change the section. `meta` stays the last member.
+    const bool had_meta = members.has("meta");
+    Json meta_spec = had_meta ? members.at("meta") : Json();
+    members.erase("meta");
+    members.set(role, binary_member(path, atom_property_tensor(flat, n_atoms, vector)));
+    if (custom) {
+        custom_roles.push_back(role);
+        if (had_meta && meta_spec.has("path") && meta_spec.at("path").is_string())
+            drop_file(meta_spec.at("path").as_string());
+        meta_spec = json_member("atom_properties/meta.json",
+                                atom_properties_meta_payload(custom_roles));
+        members.set("meta", meta_spec);
+    } else if (had_meta) {
+        members.set("meta", meta_spec);
+    }
+    // Json has no mutable element access: rebuild the array with the section
+    // replaced. A handful of roles makes this cheap.
+    Json updated = existing;
+    updated.set("members", members);
+    Json rebuilt = Json::array();
+    for (size_t i = 0; i < sections.size(); ++i)
+        rebuilt.push_back(i == index ? updated : sections[i]);
+    sections_ = std::move(rebuilt);
+    return section_id;
+}
+
 std::string QvfWriter::add_scf_history(const Json& iterations,
                                        const std::string& section_id) {
+    check_new_id(section_id);
     Json payload = Json::object();
     payload.set("iterations", iterations);
     Json members = Json::object();
@@ -2101,14 +11624,11 @@ std::string QvfWriter::add_scf_history(const Json& iterations,
 
 std::string QvfWriter::add_citations(const std::string& bibtex,
                                      const std::string& section_id) {
-    std::vector<uint8_t> bytes(bibtex.begin(), bibtex.end());
-    std::string path = section_id + "/references.bib";
-    std::string sha = detail::Sha256::hex_of(bytes);
-    add_file(path, bytes);
-    Json member = Json::object();
-    member.set("path", path).set("format", "binary").set("sha256", sha);
+    check_new_id(section_id);
     Json members = Json::object();
-    members.set("references", member);
+    members.set("references",
+                opaque_member(section_id + "/references.bib",
+                              std::vector<uint8_t>(bibtex.begin(), bibtex.end())));
     Json section = Json::object();
     section.set("id", reserve_id(section_id)).set("kind", "citations")
            .set("members", members);
@@ -2118,19 +11638,23 @@ std::string QvfWriter::add_citations(const std::string& bibtex,
 
 std::string QvfWriter::add_run_record(const RunRecord& record,
                                       const std::string& section_id) {
+    check_new_id(section_id);
     if (record.program.empty())
         throw std::runtime_error("run.record requires a non-empty program");
     if (record.input_text.empty() && record.log_text.empty())
         throw std::runtime_error(
             "run.record requires input_text and/or log_text");
+    // A job set (spec § 5.8, § 5.9): the job this run executed, and its outcome.
+    if (!record.job_ref.empty())
+        require_section_kind("run.record job_ref", record.job_ref, "job.spec");
+    if (!record.run_status.empty() && record.run_status != "running" &&
+        record.run_status != "converged" && record.run_status != "failed")
+        throw std::runtime_error("run.record run_status must be one of running, converged, "
+                                 "failed, got '" + record.run_status + "'");
     Json members = Json::object();
     auto opaque = [&](const std::string& role, const std::string& path,
                       std::vector<uint8_t> bytes) {
-        std::string sha = detail::Sha256::hex_of(bytes);
-        add_file(path, std::move(bytes));
-        Json member = Json::object();
-        member.set("path", path).set("format", "binary").set("sha256", sha);
-        members.set(role, member);
+        members.set(role, opaque_member(path, std::move(bytes)));
     };
     if (!record.input_text.empty())
         opaque("input", section_id + "/input.txt",
@@ -2158,12 +11682,15 @@ std::string QvfWriter::add_run_record(const RunRecord& record,
     if (!record.finished_utc.empty())
         section.set("finished_utc", record.finished_utc);
     if (record.sequence >= 0) section.set("sequence", record.sequence);
+    if (!record.job_ref.empty()) section.set("job_ref", record.job_ref);
+    if (!record.run_status.empty()) section.set("run_status", record.run_status);
     sections_.push_back(section);
     return section_id;
 }
 
 std::string QvfWriter::add_job_spec(const Json& spec,
                                     const std::string& section_id) {
+    check_new_id(section_id);
     if (spec.type() != Json::Type::Object)
         throw std::runtime_error("job.spec spec must be a JSON object");
     if (!spec.has("job_type") || !spec.at("job_type").is_string())
@@ -2172,11 +11699,64 @@ std::string QvfWriter::add_job_spec(const Json& spec,
     if (jt != "molecular" && jt != "periodic")
         throw std::runtime_error(
             "job.spec job_type must be 'molecular' or 'periodic', got: " + jt);
+    // v0.3: null is explicit "none", absence leaves the choice to the engine.
+    for (const char* key : {"basis", "functional"})
+        if (spec.has(key)) {
+            const Json value = resolved(spec.at(key), std::string("job.spec ") + key);
+            if (!value.is_null() && !value.is_string())
+                throw std::runtime_error(std::string("job.spec ") + key + " must be a string or null");
+        }
+    // The typed fields added by spec § 5.9; everything is checked before the
+    // id is reserved, so a refused spec adds nothing. The root stays open.
+    if (spec.has("structure_ref")) {
+        const std::string what = "job.spec structure_ref";
+        const Json ref_json = resolved(spec.at("structure_ref"), what);
+        const std::string& ref = checked_text(ref_json, what);
+        if (!is_valid_id(ref))
+            throw std::runtime_error(what + " '" + ref +
+                                     "' is not a section id ([A-Za-z0-9_.-]+)");
+        for (const Json& s : sections_.elements())
+            if (s.at("id").as_string() == ref && s.at("kind").as_string() != "structure")
+                throw std::runtime_error(what + " '" + ref + "' names a '" +
+                                         s.at("kind").as_string() +
+                                         "' section, not a 'structure' section "
+                                         "(QVF spec § 5.9)");
+    }
+    for (const char* key : {"dispersion", "relativistic"})
+        if (spec.has(key))
+            checked_text(resolved(spec.at(key), std::string("job.spec ") + key),
+                         std::string("job.spec ") + key);
+    if (spec.has("solvation"))
+        check_block("solvation", spec.at("solvation"),
+                    {{"model", Rule::Text}, {"solvent", Rule::Text},
+                     {"epsilon", Rule::PositiveNumber}},
+                    "model");
+    if (spec.has("scf"))
+        check_block("scf", spec.at("scf"),
+                    {{"convergence", Rule::PositiveNumber},
+                     {"max_iterations", Rule::Count}, {"guess", Rule::Text},
+                     {"damping", Rule::Number}},
+                    nullptr);
+    if (spec.has("geometry"))
+        check_block("geometry", spec.at("geometry"),
+                    {{"convergence", Rule::PositiveNumber},
+                     {"max_steps", Rule::Count}, {"coordinates", Rule::Coordinates}},
+                    nullptr);
+    if (spec.has("resources"))
+        check_block("resources", spec.at("resources"),
+                    {{"n_cores", Rule::Count}, {"memory_mb", Rule::Count},
+                     {"walltime_s", Rule::PositiveNumber}},
+                    nullptr);
     Json members = Json::object();
     members.set("spec", json_member(section_id + "/spec.json", spec));
     Json section = Json::object();
-    section.set("id", reserve_id(section_id)).set("kind", "job.spec")
-           .set("members", members);
+    section.set("id", reserve_id(section_id)).set("kind", "job.spec");
+    // The section-level structure_ref, which a reader finds in the manifest
+    // (spec § 5.9, "Job sets"); the payload's stays as runners read it.
+    if (spec.has("structure_ref"))
+        section.set("structure_ref",
+                    resolved(spec.at("structure_ref"), "job.spec structure_ref"));
+    section.set("members", members);
     sections_.push_back(section);
     return section_id;
 }
@@ -2187,6 +11767,15 @@ std::string QvfWriter::add_vendor_section(const std::string& kind,
                                           const Json& json_members, bool critical,
                                           const std::string& schema_uri,
                                           const std::string& section_id) {
+    return add_vendor_section(kind, json_members, std::vector<OpaqueMember>{}, critical,
+                              schema_uri, section_id);
+}
+
+std::string QvfWriter::add_vendor_section(const std::string& kind,
+                                          const Json& json_members,
+                                          const std::vector<OpaqueMember>& opaque_members,
+                                          bool critical, const std::string& schema_uri,
+                                          const std::string& section_id) {
     if (kind.rfind("x_", 0) != 0)
         throw std::runtime_error("vendor kind must start with x_: " + kind);
     std::string sid = section_id;
@@ -2194,11 +11783,31 @@ std::string QvfWriter::add_vendor_section(const std::string& kind,
         sid = kind;
         for (char& c : sid) if (c == '.') c = '_';
     }
+    check_new_id(sid);
+    // Every role once; the opaque members' media types before anything is
+    // written.
+    std::set<std::string> roles;
+    if (!json_members.is_null())
+        for (const auto& kv : json_members.items()) roles.insert(kv.first);
+    for (const OpaqueMember& om : opaque_members) {
+        if (om.role.empty())
+            throw std::runtime_error("vendor section: an opaque member has no role");
+        if (!roles.insert(om.role).second)
+            throw std::runtime_error("vendor section: member role '" + om.role +
+                                     "' is given twice");
+        if (!om.media_type.empty() && !is_media_type(om.media_type))
+            throw std::runtime_error("vendor section member '" + om.role + "': media type '" +
+                                     om.media_type + "' is not type/subtype (QVF spec § 4.2)");
+    }
     // json_members is an object mapping role -> JSON payload; each becomes a
-    // JSON member under sid/<role>.json.
+    // JSON member under sid/<role>.json, each opaque member sid/<role>.bin.
     Json members = Json::object();
-    for (const auto& kv : json_members.items())
-        members.set(kv.first, json_member(sid + "/" + kv.first + ".json", kv.second));
+    if (!json_members.is_null())
+        for (const auto& kv : json_members.items())
+            members.set(kv.first, json_member(sid + "/" + kv.first + ".json", kv.second));
+    for (const OpaqueMember& om : opaque_members)
+        members.set(om.role,
+                    opaque_member(sid + "/" + om.role + ".bin", om.bytes, om.media_type));
     if (members.size() == 0)
         throw std::runtime_error("vendor section needs at least one member");
     Json section = Json::object();
@@ -2207,6 +11816,160 @@ std::string QvfWriter::add_vendor_section(const std::string& kind,
     if (!schema_uri.empty()) section.set("schema_uri", schema_uri);
     sections_.push_back(section);
     return sid;
+}
+
+std::string QvfWriter::add_opaque_member(const std::string& section_id, const std::string& role,
+                                         const std::vector<uint8_t>& bytes,
+                                         const std::string& media_type) {
+    const size_t index = section_index(section_id);
+    Json section = sections_.elements()[index];
+    const Json& kind = section.at("kind");
+    if (!kind.is_string() || kind.as_string().rfind("x_", 0) != 0)
+        throw std::runtime_error("add_opaque_member: section '" + section_id +
+                                 "' is not a vendor (x_<vendor>) section (QVF spec § 7.3)");
+    if (role.empty()) throw std::runtime_error("add_opaque_member: empty role");
+    Json members = section.at("members");
+    if (members.has(role))
+        throw std::runtime_error("section '" + section_id + "' already has a member '" +
+                                 role + "'");
+    members.set(role, opaque_member(section_id + "/" + role + ".bin", bytes, media_type));
+    section.set("members", members);
+    replace_section(index, std::move(section));
+    return section_id;
+}
+
+// -- preview (spec § 5.15) ----------------------------------------------------
+
+namespace {
+
+const char kPngSignature[] = "\x89PNG\r\n\x1a\n";   // 8 bytes
+const char kJpegSignature[] = "\xff\xd8\xff";       // 3 bytes
+
+bool starts_with_bytes(const std::vector<uint8_t>& data, const char* signature, size_t n) {
+    return data.size() >= n && std::memcmp(data.data(), signature, n) == 0;
+}
+
+bool contains_svg_tag(std::vector<uint8_t>::const_iterator first,
+                      std::vector<uint8_t>::const_iterator last) {
+    static const char kSvg[] = "<svg";
+    return std::search(first, last, kSvg, kSvg + 4) != last;
+}
+
+// Strict UTF-8 (no overlongs, surrogates or code points above U+10FFFF), as
+// the validator checks an image/svg+xml member.
+bool is_strict_utf8(const std::vector<uint8_t>& s) {
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        const uint8_t c = s[i];
+        if (c < 0x80) { ++i; continue; }
+        size_t len;
+        uint32_t cp, min;
+        if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1Fu; min = 0x80; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0Fu; min = 0x800; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07u; min = 0x10000; }
+        else return false;
+        if (len > n - i) return false;
+        for (size_t k = 1; k < len; ++k) {
+            if ((s[i + k] & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (s[i + k] & 0x3Fu);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+        i += len;
+    }
+    return true;
+}
+
+// Why `data` are not what `media_type` says (spec § 5.15), or "".
+std::string preview_bytes_problem(const std::vector<uint8_t>& data,
+                                  const std::string& media_type) {
+    if (media_type == "image/png" && !starts_with_bytes(data, kPngSignature, 8))
+        return "image/png bytes do not begin with the PNG signature";
+    if (media_type == "image/jpeg" && !starts_with_bytes(data, kJpegSignature, 3))
+        return "image/jpeg bytes do not begin with FF D8 FF";
+    if (media_type == "image/svg+xml") {
+        if (!is_strict_utf8(data)) return "image/svg+xml bytes do not decode as UTF-8";
+        if (!contains_svg_tag(data.begin(), data.end()))
+            return "image/svg+xml bytes contain no <svg element";
+    }
+    return "";
+}
+
+// The media type of preview bytes: `given` when not empty, checked against
+// the bytes, else sniffed from them (spec § 5.15).
+std::string preview_media_type(const std::vector<uint8_t>& data,
+                               std::initializer_list<const char*> allowed,
+                               const std::string& what, const std::string& given) {
+    std::string media_type = given;
+    bool svg_allowed = false;
+    std::string names;
+    for (const char* a : allowed) {
+        svg_allowed = svg_allowed || std::strcmp(a, "image/svg+xml") == 0;
+        names += (names.empty() ? "" : ", ") + std::string(a);
+    }
+    if (media_type.empty()) {
+        if (starts_with_bytes(data, kPngSignature, 8))
+            media_type = "image/png";
+        else if (starts_with_bytes(data, kJpegSignature, 3))
+            media_type = "image/jpeg";
+        else if (svg_allowed &&
+                 contains_svg_tag(data.begin(),
+                                  data.begin() + static_cast<std::ptrdiff_t>(
+                                                     std::min<size_t>(data.size(), 4096))))
+            media_type = "image/svg+xml";
+        else
+            throw std::runtime_error(what + ": not PNG or JPEG bytes; pass " + what +
+                                     "_media_type to say what they are");
+    }
+    bool listed = false;
+    for (const char* a : allowed) listed = listed || media_type == a;
+    if (!listed)
+        throw std::runtime_error(what + ": media type '" + media_type + "' is not one of " +
+                                 names + " (QVF spec § 5.15)");
+    const std::string problem = preview_bytes_problem(data, media_type);
+    if (!problem.empty()) throw std::runtime_error(what + ": " + problem);
+    return media_type;
+}
+
+const char* image_extension(const std::string& media_type) {
+    return media_type == "image/png" ? "png" : media_type == "image/jpeg" ? "jpg" : "svg";
+}
+
+}  // namespace
+
+std::string QvfWriter::add_preview(const std::vector<uint8_t>& thumbnail,
+                                   const std::vector<uint8_t>& image, const std::string& label,
+                                   const std::string& section_id,
+                                   const std::string& thumbnail_media_type,
+                                   const std::string& image_media_type) {
+    const std::string thumb_type = preview_media_type(
+        thumbnail, {"image/png", "image/jpeg"}, "thumbnail", thumbnail_media_type);
+    std::string image_type;
+    if (!image.empty())
+        image_type = preview_media_type(image, {"image/svg+xml", "image/png", "image/jpeg"},
+                                        "image", image_media_type);
+    check_new_id(section_id);
+    // Already compressed images gain nothing from DEFLATE: stored as they are.
+    Json members = Json::object();
+    members.set("thumbnail",
+                opaque_member(section_id + "/thumbnail." + image_extension(thumb_type),
+                              thumbnail, thumb_type, /*store=*/true));
+    if (!image.empty()) {
+        try {
+            members.set("image",
+                        opaque_member(section_id + "/image." + image_extension(image_type),
+                                      image, image_type, /*store=*/true));
+        } catch (...) {
+            drop_file(members.at("thumbnail").at("path").as_string());
+            throw;
+        }
+    }
+    Json section = Json::object();
+    section.set("id", reserve_id(section_id)).set("kind", "preview");
+    if (!label.empty()) section.set("label", label);
+    section.set("members", members);
+    sections_.push_back(section);
+    return section_id;
 }
 
 // -- volumes & basis AO -----------------------------------------------------
@@ -2224,6 +11987,21 @@ static Json grid_json(const Grid& g, const std::vector<int64_t>& shape) {
     Json sh = Json::array();
     for (int64_t d : shape) sh.push_back(Json(static_cast<long long>(d)));
     grid.set("origin", origin).set("voxel_vectors", vox).set("shape", sh);
+    if (!g.units.empty()) {
+        Json units = Json::object();
+        for (const auto& kv : g.units) units.set(kv.first, kv.second);
+        check_units_object("grid", units,
+                           {{"origin", Unit::Bohr}, {"voxel_vectors", Unit::Bohr}});
+        grid.set("units", units);
+    }
+    // Periodic grid semantics (spec § 5.2), written only when set.
+    if (g.periodic) {
+        Json flags = Json::array();
+        for (bool p : *g.periodic) flags.push_back(Json(p));
+        grid.set("periodic", flags);
+    }
+    if (g.includes_endpoint) grid.set("includes_endpoint", *g.includes_endpoint);
+    if (!g.structure_ref.empty()) grid.set("structure_ref", g.structure_ref);
     return grid;
 }
 
@@ -2232,26 +12010,135 @@ static void merge_peers(Json& section, const Json& extra) {
     for (const auto& kv : extra.items()) section.set(kv.first, kv.second);
 }
 
+// The extent the trailing data axis of a 4-D volume kind must have (spec
+// § 5.2): 3 for volume.vector, 2 for volume.complex; 0 for any other kind.
+static int64_t volume_trailing_axis(const std::string& kind) {
+    if (kind == "volume.vector") return 3;
+    if (kind == "volume.complex") return 2;
+    return 0;
+}
+
+static void check_volume_dtype(const std::string& kind, const Tensor& data) {
+    if (data.dtype != DType::Float32 && data.dtype != DType::Float64)
+        throw std::runtime_error(kind + ": data must be float32 or float64");
+}
+
 std::string QvfWriter::add_volume(const std::string& kind, const Grid& grid,
                                   const Tensor& data, const std::string& label,
                                   const std::string& component,
                                   const std::string& section_id) {
-    if (data.shape.size() != 3)
+    if (kind == "volume.series")
+        throw std::runtime_error("volume.series: use add_volume_series, which "
+                                 "takes the axis member");
+    const int64_t trailing = volume_trailing_axis(kind);
+    std::vector<int64_t> spatial = data.shape;
+    if (trailing) {
+        if (data.shape.size() != 4 || data.shape[3] != trailing)
+            throw std::runtime_error(kind + ": data must be [nx, ny, nz, " +
+                                     std::to_string(trailing) + "]");
+        spatial.pop_back();
+    } else if (data.shape.size() != 3) {
         throw std::runtime_error(kind + ": data must be 3-D");
+    }
+    check_volume_dtype(kind, data);
+    if (!grid.structure_ref.empty()) check_section_ref("structure_ref", grid.structure_ref);
+    const Json grid_doc = grid_json(grid, spatial);   // checks the units first
     std::string sid = section_id;
     if (sid.empty()) {
         sid = kind;
         for (char& c : sid) if (c == '.') c = '_';
         sid += "_" + std::to_string(sections_.size());
     }
+    check_new_id(sid);
     Json members = Json::object();
-    members.set("grid", json_member("volumes/" + sid + "_grid.json",
-                                    grid_json(grid, data.shape)));
+    members.set("grid", json_member("volumes/" + sid + "_grid.json", grid_doc));
     members.set("data", binary_member("volumes/" + sid + ".dat", data));
     Json section = Json::object();
     section.set("id", reserve_id(sid)).set("kind", kind).set("members", members);
     if (!label.empty()) section.set("label", label);
     if (!component.empty()) section.set("component", component);
+    sections_.push_back(section);
+    return sid;
+}
+
+// A volume.series `axis` payload (spec § 5.2, $defs/VolumeSeriesAxisPayload)
+// checked against the n slabs of the data; `sections` are the sections added so
+// far, for trajectory_ref. A Json::raw fragment is parsed. Throws otherwise.
+static Json checked_series_axis(const Json& axis_in, int64_t n, const Json& sections) {
+    const Json axis = axis_in.type() == Json::Type::Raw
+                          ? Json::parse(axis_in.as_string()) : axis_in;
+    if (!axis.is_object())
+        throw std::runtime_error("volume.series axis must be a JSON object");
+    for (const auto& kv : axis.items())
+        if (kv.first != "kind" && kv.first != "values" && kv.first != "units" &&
+            kv.first != "labels" && kv.first != "trajectory_ref" &&
+            kv.first.rfind("x_", 0) != 0)
+            throw std::runtime_error("volume.series axis: unknown key '" + kv.first + "'");
+    const std::string kind =
+        axis.has("kind") && axis.at("kind").is_string() ? axis.at("kind").as_string() : "";
+    if (kind != "time" && kind != "frame" && kind != "state" && kind != "custom")
+        throw std::runtime_error("volume.series axis kind must be time, frame, state "
+                                 "or custom");
+    if (!axis.has("values") || !axis.at("values").is_array())
+        throw std::runtime_error("volume.series axis: values must be an array");
+    const Json& values = axis.at("values");
+    if (static_cast<int64_t>(values.size()) != n)
+        throw std::runtime_error("volume.series axis has " +
+                                 std::to_string(values.size()) + " values but data has " +
+                                 std::to_string(n) + " slabs");
+    for (const Json& v : values.elements()) {
+        if (!v.is_number())
+            throw std::runtime_error("volume.series axis values must be numbers");
+        if (kind == "frame" && (v.as_double() < 0 || v.as_double() != std::floor(v.as_double())))
+            throw std::runtime_error("volume.series frame axis values must be 0-based "
+                                     "frame indices");
+    }
+    if (axis.has("units")) check_unit_name("volume.series axis units", axis.at("units"));
+    if (axis.has("labels")) {
+        const Json& labels = axis.at("labels");
+        if (!labels.is_array() || static_cast<int64_t>(labels.size()) != n)
+            throw std::runtime_error("volume.series axis labels must be one string per slab");
+        for (const Json& l : labels.elements())
+            if (!l.is_string())
+                throw std::runtime_error("volume.series axis labels must be strings");
+    }
+    if (axis.has("trajectory_ref")) {
+        const Json& ref = axis.at("trajectory_ref");
+        bool found = false;
+        if (ref.is_string())
+            for (const Json& s : sections.elements()) {
+                const std::string& k = s.at("kind").as_string();
+                if (s.at("id").as_string() == ref.as_string() &&
+                    (k == "trajectory" || k == "reaction.path"))
+                    found = true;
+            }
+        if (!found)
+            throw std::runtime_error("volume.series axis trajectory_ref names no "
+                                     "trajectory or reaction.path section added so far");
+    }
+    return axis;
+}
+
+std::string QvfWriter::add_volume_series(const Grid& grid, const Tensor& data,
+                                         const Json& axis, const std::string& label,
+                                         const std::string& section_id) {
+    if (data.shape.size() != 4)
+        throw std::runtime_error("volume.series: data must be [n, nx, ny, nz]");
+    check_volume_dtype("volume.series", data);
+    const Json axis_doc = checked_series_axis(axis, data.shape[0], sections_);
+    if (!grid.structure_ref.empty()) check_section_ref("structure_ref", grid.structure_ref);
+    const Json grid_doc = grid_json(
+        grid, std::vector<int64_t>(data.shape.begin() + 1, data.shape.end()));
+    std::string sid = section_id;
+    if (sid.empty()) sid = "volume_series_" + std::to_string(sections_.size());
+    check_new_id(sid);
+    Json members = Json::object();
+    members.set("grid", json_member("volumes/" + sid + "_grid.json", grid_doc));
+    members.set("data", binary_member("volumes/" + sid + ".dat", data));
+    members.set("axis", json_member("volumes/" + sid + "_axis.json", axis_doc));
+    Json section = Json::object();
+    section.set("id", reserve_id(sid)).set("kind", "volume.series").set("members", members);
+    if (!label.empty()) section.set("label", label);
     sections_.push_back(section);
     return sid;
 }
@@ -2262,6 +12149,7 @@ std::string QvfWriter::add_volume_difference(const Grid& grid, const Tensor& dat
                                              const std::string& description,
                                              const std::string& label,
                                              const std::string& section_id) {
+    check_new_id(section_id);
     if (data.shape.size() != 3)
         throw std::runtime_error("volume.difference: data must be 3-D");
     Json members = Json::object();
@@ -2278,6 +12166,26 @@ std::string QvfWriter::add_volume_difference(const Grid& grid, const Tensor& dat
     return section_id;
 }
 
+std::string QvfWriter::add_volume_transition_density(const Grid& grid, const Tensor& data,
+                                                     const std::string& excited_states_ref,
+                                                     int state_index,
+                                                     const std::string& label,
+                                                     const std::string& section_id) {
+    if (state_index < 0)
+        throw std::runtime_error(
+            "volume.transition_density: state_index must be >= 1 (0 omits it)");
+    if (state_index > 0 && excited_states_ref.empty())
+        throw std::runtime_error(
+            "volume.transition_density: state_index needs excited_states_ref "
+            "(QVF spec § 5.2)");
+    const std::string sid =
+        add_volume("volume.transition_density", grid, data, label, "", section_id);
+    if (!excited_states_ref.empty())
+        set_section_field(sid, "excited_states_ref", excited_states_ref);
+    if (state_index > 0) set_section_field(sid, "state_index", state_index);
+    return sid;
+}
+
 std::string QvfWriter::add_basis_ao(const Json& ao_metadata, const Grid& grid,
                                     const Tensor& data, const std::string& label,
                                     const std::string& section_id) {
@@ -2285,6 +12193,7 @@ std::string QvfWriter::add_basis_ao(const Json& ao_metadata, const Grid& grid,
         throw std::runtime_error("basis.ao: data must be 3-D");
     std::string sid = section_id.empty()
                           ? "ao_" + std::to_string(sections_.size()) : section_id;
+    check_new_id(sid);
     Json members = Json::object();
     members.set("grid", json_member("basis_ao/" + sid + "_grid.json",
                                     grid_json(grid, data.shape)));
@@ -2302,8 +12211,44 @@ std::string QvfWriter::add_basis_ao(const Json& ao_metadata, const Grid& grid,
 std::string QvfWriter::add_bands(const Json& kpath, const Tensor& eigenvalues,
                                  const Tensor* projections,
                                  const std::string& section_id) {
-    if (eigenvalues.shape.size() != 3)
+    return add_bands(kpath, eigenvalues, projections, nullptr, section_id);
+}
+
+std::string QvfWriter::add_bands(const Json& kpath, const Tensor& eigenvalues,
+                                 const Tensor* projections, const Tensor* occupations,
+                                 const std::string& section_id) {
+    check_new_id(section_id);
+    const auto& e = eigenvalues.shape;
+    if (e.size() != 3)
         throw std::runtime_error("bands: eigenvalues must be [n_spin, n_k, n_bands]");
+    if (projections) {
+        const auto& p = projections->shape;
+        if (projections->dtype != DType::Float64)
+            throw std::runtime_error("bands: projections must be float64");
+        if (p.size() == 4) {
+            if (p[0] != e[0] || p[1] != e[1] || p[2] != e[2])
+                throw std::runtime_error(
+                    "bands: projections [n_spin, n_k, n_bands, n_channels] must "
+                    "repeat the shape of eigenvalues");
+        } else if (p.size() == 3) {
+            if (p[0] != e[1] || p[1] != e[2])
+                throw std::runtime_error(
+                    "bands: projections [n_k, n_bands, n_channels] must repeat "
+                    "n_k and n_bands of eigenvalues");
+        } else {
+            throw std::runtime_error(
+                "bands: projections must be [n_spin, n_k, n_bands, n_channels] "
+                "or [n_k, n_bands, n_channels]");
+        }
+    }
+    if (occupations) {
+        if (occupations->dtype != DType::Float64)
+            throw std::runtime_error("bands: occupations must be float64");
+        if (occupations->shape != e)
+            throw std::runtime_error(
+                "bands: occupations must have the shape of eigenvalues "
+                "[n_spin, n_k, n_bands]");
+    }
     Json members = Json::object();
     members.set("kpath", json_member(section_id + "/kpath.json", kpath));
     members.set("eigenvalues",
@@ -2311,6 +12256,9 @@ std::string QvfWriter::add_bands(const Json& kpath, const Tensor& eigenvalues,
     if (projections)
         members.set("projections",
                     binary_member(section_id + "/projections.bin", *projections));
+    if (occupations)
+        members.set("occupations",
+                    binary_member(section_id + "/occupations.bin", *occupations));
     Json section = Json::object();
     section.set("id", reserve_id(section_id)).set("kind", "bands")
            .set("members", members);
@@ -2321,6 +12269,7 @@ std::string QvfWriter::add_bands(const Json& kpath, const Tensor& eigenvalues,
 std::string QvfWriter::add_dos_total(const Tensor& energies, const Tensor& dos,
                                      const Json& section_meta,
                                      const std::string& section_id) {
+    check_new_id(section_id);
     Json members = Json::object();
     members.set("energies",
                 binary_member("dos/" + section_id + "_energies.bin", energies));
@@ -2337,6 +12286,18 @@ std::string QvfWriter::add_dos_projected(const Tensor& energies,
                                          const Tensor& projections,
                                          const Json& section_meta,
                                          const std::string& section_id) {
+    check_new_id(section_id);
+    const auto& p = projections.shape;
+    if (p.size() != 2 && p.size() != 3)
+        throw std::runtime_error(
+            "dos.projected: projections must be [n_spin, n_channels, n_points] "
+            "or [n_channels, n_points]");
+    if (p.size() == 3 && section_meta.is_object() && section_meta.contains("n_spin")) {
+        const Json& ns = section_meta.at("n_spin");
+        if (ns.type() == Json::Type::Int && ns.as_int() != p[0])
+            throw std::runtime_error(
+                "dos.projected: the spin axis of projections must equal n_spin");
+    }
     Json members = Json::object();
     members.set("energies",
                 binary_member("dos/" + section_id + "_energies.bin", energies));
@@ -2359,6 +12320,7 @@ std::string QvfWriter::add_dos_coop_cohp(const std::string& kind,
         throw std::runtime_error("kind must be dos.coop or dos.cohp");
     std::string sid = section_id;
     if (sid.empty()) { sid = kind; for (char& c : sid) if (c == '.') c = '_'; }
+    check_new_id(sid);
     Json members = Json::object();
     members.set("energies", binary_member("dos/" + sid + "_energies.bin", energies));
     members.set("projections",
@@ -2374,52 +12336,267 @@ std::string QvfWriter::add_dos_coop_cohp(const std::string& kind,
 
 // -- trajectories / reactions / scans / vibrations --------------------------
 
+// Throws unless `t` has `dtype` and itemsize * prod(shape) bytes.
+static void require_tensor(const Tensor& t, DType dtype, const std::string& what) {
+    if (t.dtype != dtype)
+        throw std::runtime_error(what + " must be " + dtype_name(dtype));
+    size_t n = 1;
+    for (int64_t d : t.shape) {
+        if (d < 0) throw std::runtime_error(what + " has a negative extent");
+        n *= static_cast<size_t>(d);
+    }
+    if (t.bytes.size() != dtype_itemsize(t.dtype) * n)
+        throw std::runtime_error(what + " byte length != itemsize * prod(shape)");
+}
+
+static std::string shape_str(const std::vector<int64_t>& shape) {
+    std::string s = "[";
+    for (size_t k = 0; k < shape.size(); ++k)
+        s += (k ? ", " : "") + std::to_string(shape[k]);
+    return s + "]";
+}
+
+// The little-endian float64 values of a float64 tensor.
+static std::vector<double> f64_values(const Tensor& t) {
+    std::vector<double> out(t.bytes.size() / 8);
+    for (size_t k = 0; k < out.size(); ++k) {
+        uint64_t bits = 0;
+        for (int b = 7; b >= 0; --b) bits = (bits << 8) | t.bytes[8 * k + b];
+        std::memcpy(&out[k], &bits, 8);
+    }
+    return out;
+}
+
+// Largest difference, in hartree, between a binary `energies` member and the
+// metadata `energies` array of one section (spec § 5.5).
+constexpr double kTrajectoryEnergyToleranceEh = 1e-10;
+
+std::string QvfWriter::add_frames_section(const std::string& kind, const Json& metadata,
+                                          const Tensor& coords, const Tensor* lattice,
+                                          const TrajectoryExtras& extras,
+                                          const std::string& section_id) {
+    check_new_id(section_id);
+    const bool trajectory = kind == "trajectory";
+    if (coords.shape.size() != 3 || coords.shape[2] != 3)
+        throw std::runtime_error(kind + " coords must be [n_frames, n_atoms, 3]");
+    if (trajectory && coords.dtype == DType::Float32)
+        require_tensor(coords, DType::Float32, kind + " coords");
+    else
+        require_tensor(coords, DType::Float64,
+                       kind + (trajectory ? " coords (float64 or float32)" : " coords"));
+    const int64_t n_frames = coords.shape[0];
+    const int64_t n_atoms = coords.shape[1];
+
+    // The metadata, parsed when it is a raw fragment, for the checks below.
+    Json meta = metadata;
+    if (metadata.type() == Json::Type::Raw) {
+        try {
+            meta = Json::parse(metadata.as_string());
+        } catch (const std::exception& e) {
+            throw std::runtime_error(kind + " metadata is not valid JSON: " + e.what());
+        }
+    }
+    if (!meta.is_object()) throw std::runtime_error(kind + " metadata must be a JSON object");
+    if (trajectory)
+        check_payload_units(kind, meta,
+                            {{"energies", Unit::Hartree}, {"coords", Unit::Angstrom},
+                             {"times", Unit::Femtosecond}, {"timestep_fs", Unit::Femtosecond},
+                             {"lattice", Unit::Angstrom}, {"cell_volumes", Unit::Angstrom3},
+                             {"temperatures", Unit::Kelvin}});
+    else
+        check_payload_units(kind, meta,
+                            {{"energies", Unit::Hartree}, {"coords", Unit::Angstrom},
+                             {"times", Unit::Femtosecond}, {"timestep_fs", Unit::Femtosecond},
+                             {"lattice", Unit::Bohr}});
+
+    // precision names the dtype of coords; float32 coords add it when absent.
+    const std::string dtype = dtype_name(coords.dtype);
+    bool add_precision = false;
+    if (meta.contains("precision")) {
+        const Json& p = meta.at("precision");
+        if (!p.is_string() || (p.as_string() != "float64" && p.as_string() != "float32"))
+            throw std::runtime_error(kind + " metadata precision must be \"float64\" or "
+                                            "\"float32\"");
+        if (p.as_string() != dtype)
+            throw std::runtime_error(kind + " metadata precision \"" + p.as_string() +
+                                     "\" contradicts " + dtype + " coords");
+    } else if (coords.dtype == DType::Float32) {
+        add_precision = true;
+    }
+
+    if (lattice) {
+        const auto& s = lattice->shape;
+        const bool fixed = (s.size() == 2 && s[0] == 3 && s[1] == 3);
+        const bool per_frame = (s.size() == 3 && s[1] == 3 && s[2] == 3);
+        if (!fixed && !per_frame)
+            throw std::runtime_error(kind + " lattice must be [3,3] or [n_frames,3,3]");
+        if (per_frame && s[0] != n_frames)
+            throw std::runtime_error(kind + " per-frame lattice frame count != coords frames");
+        require_tensor(*lattice, DType::Float64, kind + " lattice");
+    }
+    if (trajectory) {
+        const Json* pbc = meta.contains("pbc") ? &meta.at("pbc") : nullptr;
+        bool periodic = false;
+        if (pbc) {
+            if (!pbc->is_array() || pbc->size() != 3)
+                throw std::runtime_error("trajectory metadata pbc must be three booleans");
+            for (const Json& x : pbc->elements()) {
+                if (!x.is_bool())
+                    throw std::runtime_error("trajectory metadata pbc must be three booleans");
+                periodic = periodic || x.as_bool();
+            }
+        }
+        if (lattice && !pbc)
+            throw std::runtime_error("trajectory lattice needs metadata \"pbc\": pbc is "
+                                     "REQUIRED when lattice is present (spec § 5.5)");
+        if (!lattice && periodic)
+            throw std::runtime_error("trajectory metadata pbc marks a periodic axis, so "
+                                     "a lattice is required (spec § 5.5)");
+    }
+
+    struct Frame {
+        const char* role;
+        const Tensor* t;
+        bool vectors;
+    };
+    const Frame frames[] = {
+        {"velocities", extras.velocities, true},  {"gradient", extras.gradient, true},
+        {"times", extras.times, false},           {"energies", extras.energies, false},
+        {"cell_volumes", extras.cell_volumes, false},
+        {"temperatures", extras.temperatures, false},
+    };
+    for (const Frame& f : frames) {
+        if (!f.t) continue;
+        const std::string what = kind + " " + f.role;
+        const std::vector<int64_t> want =
+            f.vectors ? std::vector<int64_t>{n_frames, n_atoms, 3}
+                      : std::vector<int64_t>{n_frames};
+        if (f.t->shape != want)
+            throw std::runtime_error(what + " must be " + shape_str(want) +
+                                     " to match coords, got " + shape_str(f.t->shape));
+        require_tensor(*f.t, DType::Float64, what);
+    }
+    if (extras.energies && meta.contains("energies")) {
+        const Json& listed = meta.at("energies");
+        const std::vector<double> binary = f64_values(*extras.energies);
+        bool agree = listed.is_array() && listed.size() == binary.size();
+        for (size_t k = 0; agree && k < binary.size(); ++k)
+            agree = listed.at(k).is_number() &&
+                    std::fabs(listed.at(k).as_double() - binary[k]) <=
+                        kTrajectoryEnergyToleranceEh;
+        if (!agree)
+            throw std::runtime_error(kind + " energies and metadata energies must agree "
+                                            "within 1e-10 hartree (spec § 5.5)");
+    }
+
+    const std::string sid = reserve_id(section_id);
+    Json members = Json::object();
+    if (add_precision) {
+        meta.set("precision", "float32");
+        members.set("metadata", json_member(sid + "/metadata.json", meta));
+    } else {
+        members.set("metadata", json_member(sid + "/metadata.json", metadata));
+    }
+    members.set("coords", binary_member(sid + "/coords.bin", coords));
+    if (lattice) members.set("lattice", binary_member(sid + "/lattice.bin", *lattice));
+    for (const Frame& f : frames)
+        if (f.t)
+            members.set(f.role, binary_member(sid + "/" + f.role + ".bin", *f.t));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", kind).set("members", members);
+    sections_.push_back(section);
+    return sid;
+}
+
 std::string QvfWriter::add_trajectory(const Json& metadata, const Tensor& coords,
                                       const std::string& section_id) {
-    if (coords.shape.size() != 3 || coords.shape[2] != 3)
-        throw std::runtime_error("trajectory coords must be [n_frames, n_atoms, 3]");
-    Json members = Json::object();
-    members.set("metadata", json_member(section_id + "/metadata.json", metadata));
-    members.set("coords", binary_member(section_id + "/coords.bin", coords));
-    Json section = Json::object();
-    section.set("id", reserve_id(section_id)).set("kind", "trajectory")
-           .set("members", members);
-    sections_.push_back(section);
-    return section_id;
+    return add_trajectory(metadata, coords, TrajectoryExtras(), section_id);
+}
+
+std::string QvfWriter::add_trajectory(const Json& metadata, const Tensor& coords,
+                                      const TrajectoryExtras& extras,
+                                      const std::string& section_id) {
+    return add_frames_section("trajectory", metadata, coords, extras.lattice, extras,
+                              section_id);
+}
+
+// The [3, 3] rows-in-Å matrices of `lattices`, flattened frame by frame.
+static Tensor lattice_rows_tensor(const std::vector<Lattice>& lattices, bool per_frame) {
+    std::vector<double> flat;
+    flat.reserve(9 * lattices.size());
+    for (const Lattice& cell : lattices)
+        for (const auto& row : cell.rows_angstrom())
+            flat.insert(flat.end(), row.begin(), row.end());
+    if (!per_frame) return tensor_f64(flat, {3, 3});
+    return tensor_f64(flat, {static_cast<int64_t>(lattices.size()), 3, 3});
+}
+
+std::string QvfWriter::add_trajectory(const Json& metadata, const Tensor& coords,
+                                      const Lattice& lattice,
+                                      const TrajectoryExtras& extras,
+                                      const std::string& section_id) {
+    if (extras.lattice)
+        throw std::runtime_error("trajectory: pass the lattice once, as a Lattice or "
+                                 "as extras.lattice");
+    const Tensor t = lattice_rows_tensor({lattice}, false);
+    return add_frames_section("trajectory", metadata, coords, &t, extras, section_id);
+}
+
+std::string QvfWriter::add_trajectory(const Json& metadata, const Tensor& coords,
+                                      const std::vector<Lattice>& lattices,
+                                      const TrajectoryExtras& extras,
+                                      const std::string& section_id) {
+    if (extras.lattice)
+        throw std::runtime_error("trajectory: pass the lattice once, as Lattices or "
+                                 "as extras.lattice");
+    const Tensor t = lattice_rows_tensor(lattices, true);
+    return add_frames_section("trajectory", metadata, coords, &t, extras, section_id);
 }
 
 std::string QvfWriter::add_reaction_path(const Json& metadata, const Tensor& coords,
                                          const Tensor* lattice,
                                          const std::string& section_id) {
-    if (coords.shape.size() != 3 || coords.shape[2] != 3)
-        throw std::runtime_error("reaction.path coords must be [n_frames, n_atoms, 3]");
-    Json members = Json::object();
-    members.set("metadata", json_member(section_id + "/metadata.json", metadata));
-    members.set("coords", binary_member(section_id + "/coords.bin", coords));
-    if (lattice) {
-        const auto& s = lattice->shape;
-        bool fixed = (s.size() == 2 && s[0] == 3 && s[1] == 3);
-        bool per_frame = (s.size() == 3 && s[1] == 3 && s[2] == 3);
-        if (!fixed && !per_frame)
-            throw std::runtime_error(
-                "reaction.path lattice must be [3,3] or [n_frames,3,3]");
-        if (per_frame && s[0] != coords.shape[0])
-            throw std::runtime_error(
-                "reaction.path per-frame lattice frame count != coords frames");
-        if (lattice->dtype != DType::Float64)
-            throw std::runtime_error("reaction.path lattice must be float64");
-        members.set("lattice", binary_member(section_id + "/lattice.bin", *lattice));
-    }
-    Json section = Json::object();
-    section.set("id", reserve_id(section_id)).set("kind", "reaction.path")
-           .set("members", members);
-    sections_.push_back(section);
-    return section_id;
+    return add_reaction_path(metadata, coords, lattice, TrajectoryExtras(), section_id);
+}
+
+std::string QvfWriter::add_reaction_path(const Json& metadata, const Tensor& coords,
+                                         const Tensor* lattice,
+                                         const TrajectoryExtras& extras,
+                                         const std::string& section_id) {
+    if (extras.lattice || extras.cell_volumes || extras.temperatures)
+        throw std::runtime_error(
+            "reaction.path carries velocities, gradient, times and energies; its cell "
+            "is the lattice argument (columns, bohr), and it has no cell_volumes or "
+            "temperatures");
+    return add_frames_section("reaction.path", metadata, coords, lattice, extras,
+                              section_id);
+}
+
+std::string QvfWriter::add_reaction_path(const Json& metadata, const Tensor& coords,
+                                         const Lattice* lattice,
+                                         const std::string& section_id) {
+    if (!lattice)
+        return add_reaction_path(metadata, coords,
+                                 static_cast<const Tensor*>(nullptr), section_id);
+    const Lattice::Mat3 cols = lattice->columns_bohr();
+    std::vector<double> flat;
+    flat.reserve(9);
+    for (const auto& row : cols) flat.insert(flat.end(), row.begin(), row.end());
+    const Tensor t = tensor_f64(flat, {3, 3});
+    return add_reaction_path(metadata, coords, &t, section_id);
+}
+
+std::string QvfWriter::add_reaction_path(const Json& metadata, const Tensor& coords,
+                                         std::nullptr_t,
+                                         const std::string& section_id) {
+    return add_reaction_path(metadata, coords,
+                             static_cast<const Tensor*>(nullptr), section_id);
 }
 
 std::string QvfWriter::add_reaction_waypoints(const std::string& trajectory_ref,
                                               const Json& waypoints,
                                               const std::string& section_id) {
+    check_new_id(section_id);
     if (!ids_.count(trajectory_ref))
         throw std::runtime_error("trajectory_ref not yet added: " + trajectory_ref);
     Json members = Json::object();
@@ -2431,10 +12608,165 @@ std::string QvfWriter::add_reaction_waypoints(const std::string& trajectory_ref,
     return section_id;
 }
 
+// -- reaction.scheme (spec § 5.14) ------------------------------------------
+
+namespace {
+
+// `key` is present in the object `obj` and not null (null means absent).
+bool given_field(const Json& obj, const char* key) {
+    return obj.has(key) && !obj.at(key).is_null();
+}
+
+// A strict payload object: every key is in `allowed` or begins with x_.
+void check_strict_keys(const Json& obj, std::initializer_list<const char*> allowed,
+                       const std::string& what) {
+    if (!obj.is_object()) field_error(what, "must be a JSON object");
+    std::string names;
+    for (const char* a : allowed) names += (names.empty() ? "" : ", ") + std::string(a);
+    for (const auto& kv : obj.items()) {
+        bool known = is_vendor_key(kv.first);
+        for (const char* a : allowed) known = known || kv.first == a;
+        if (!known)
+            throw std::runtime_error(what + ": unknown key '" + kv.first + "'; allowed are " +
+                                     names + " and keys beginning x_");
+    }
+}
+
+// One role of a reaction.scheme step as participant objects: each item is a
+// structure section id or {structure_ref, coefficient?} (further keys x_).
+Json scheme_participants(const Json* items, const std::string& what, bool required) {
+    if (!items || items->is_null()) {
+        if (required) field_error(what, "is required");
+        return Json::array();
+    }
+    const Json list = resolved(*items, what);
+    if (!list.is_array()) field_error(what, "must be an array of participants");
+    Json out = Json::array();
+    std::map<std::string, size_t> uses;   // sorted, for the message
+    size_t k = 0;
+    for (const Json& raw : list.elements()) {
+        const std::string where = what + "[" + std::to_string(k++) + "]";
+        Json entry = Json::object();
+        if (raw.is_string()) {
+            entry.set("structure_ref", raw);
+        } else {
+            entry = resolved(raw, where);
+            if (!entry.is_object())
+                throw std::runtime_error(where + " must be a structure section id or an "
+                                                 "object, got " + entry.dump(0));
+            check_strict_keys(entry, {"structure_ref", "coefficient"}, where);
+        }
+        if (!entry.has("structure_ref") || !entry.at("structure_ref").is_string() ||
+            entry.at("structure_ref").as_string().empty())
+            field_error(where + ": structure_ref", "must be a non-empty string");
+        if (entry.has("coefficient"))
+            checked_number(entry.at("coefficient"), where + " coefficient", true);
+        ++uses[entry.at("structure_ref").as_string()];
+        out.push_back(entry);
+    }
+    if (required && out.size() == 0) field_error(what, "needs at least one participant");
+    std::string repeated;
+    for (const auto& u : uses)
+        if (u.second > 1) repeated += (repeated.empty() ? "'" : ", '") + u.first + "'";
+    if (!repeated.empty())
+        throw std::runtime_error(what + " names " + repeated +
+                                 " more than once; a coefficient says how many "
+                                 "(QVF spec § 5.14)");
+    return out;
+}
+
+}  // namespace
+
+std::string QvfWriter::add_reaction_scheme(const Json& steps_in, const std::string& label,
+                                           const std::string& section_id) {
+    const Json steps = resolved(steps_in, "reaction.scheme steps");
+    if (!steps.is_array())
+        throw std::runtime_error("reaction.scheme steps must be a JSON array of step "
+                                 "objects (QVF spec § 5.14)");
+    Json out = Json::array();
+    std::set<std::string> seen;
+    size_t k = 0;
+    for (const Json& raw : steps.elements()) {
+        const std::string what = "reaction.scheme step " + std::to_string(k++);
+        const Json step = resolved(raw, what);
+        check_strict_keys(step,
+                          {"id", "label", "reactants", "products", "reagents", "arrow",
+                           "conditions", "yield_percent", "yield_text"},
+                          what);
+        const Json* id = step.has("id") ? &step.at("id") : nullptr;
+        if (!id || !id->is_string() || !is_valid_id(id->as_string()))
+            throw std::runtime_error(what + ": id must match [A-Za-z0-9_.-]+, got " +
+                                     (id ? id->dump(0) : std::string("nothing")));
+        if (!seen.insert(id->as_string()).second)
+            throw std::runtime_error(what + ": id '" + id->as_string() +
+                                     "' is used by another step");
+        Json entry = Json::object();
+        entry.set("id", *id);
+        if (given_field(step, "label"))
+            entry.set("label", checked_text(step.at("label"), what + " label"));
+        for (const char* role : {"reactants", "products", "reagents"}) {
+            const bool reagents = std::strcmp(role, "reagents") == 0;
+            if (reagents && !given_field(step, role)) continue;
+            const Json parts = scheme_participants(step.has(role) ? &step.at(role) : nullptr,
+                                                   what + " " + role, !reagents);
+            for (const Json& p : parts.elements())
+                require_section_kind(what + " " + role + " structure_ref",
+                                     p.at("structure_ref").as_string(), "structure");
+            entry.set(role, parts);
+        }
+        if (given_field(step, "arrow")) {
+            const Json& arrow = step.at("arrow");
+            const std::string a = arrow.is_string() ? arrow.as_string() : std::string();
+            if (a != "forward" && a != "equilibrium" && a != "retrosynthetic" &&
+                a != "resonance")
+                throw std::runtime_error(what + " arrow must be one of forward, equilibrium, "
+                                                "retrosynthetic, resonance, got " +
+                                         arrow.dump(0));
+            entry.set("arrow", arrow);
+        }
+        if (given_field(step, "conditions")) {
+            const Json lines = resolved(step.at("conditions"), what + " conditions");
+            bool ok = lines.is_array();
+            if (ok)
+                for (const Json& line : lines.elements()) ok = ok && line.is_string();
+            if (!ok)
+                field_error(what + ": conditions", "must be an array of strings, one per line");
+            entry.set("conditions", lines);
+        }
+        if (given_field(step, "yield_percent")) {
+            const Json& y = step.at("yield_percent");
+            const double v = checked_number(y, what + " yield_percent", false);
+            if (v < 0.0 || v > 100.0)
+                throw std::runtime_error(what + ": yield_percent must be from 0 to 100, got " +
+                                         y.dump(0));
+            entry.set("yield_percent", y);
+        }
+        if (given_field(step, "yield_text"))
+            entry.set("yield_text", checked_text(step.at("yield_text"), what + " yield_text"));
+        for (const auto& kv : step.items())
+            if (is_vendor_key(kv.first)) entry.set(kv.first, kv.second);
+        out.push_back(entry);
+    }
+    if (out.size() == 0) throw std::runtime_error("reaction.scheme needs at least one step");
+    check_new_id(section_id);
+    Json payload = Json::object();
+    payload.set("steps", out);
+    Json members = Json::object();
+    members.set("scheme", json_member(section_id + "/scheme.json", payload));
+    Json section = Json::object();
+    section.set("id", reserve_id(section_id)).set("kind", "reaction.scheme");
+    if (!label.empty()) section.set("label", label);
+    section.set("members", members);
+    sections_.push_back(section);
+    return section_id;
+}
+
 std::string QvfWriter::add_scan_surface(const Json& metadata, const Tensor& axis_a,
                                         const Tensor& axis_b, const Tensor& energies,
                                         const Tensor* geometries,
                                         const std::string& section_id) {
+    check_new_id(section_id);
+    check_payload_units("scan.surface", metadata, {});
     Json members = Json::object();
     members.set("metadata", json_member(section_id + "/metadata.json", metadata));
     members.set("axis_a", binary_member(section_id + "/axis_a.bin", axis_a));
@@ -2452,24 +12784,355 @@ std::string QvfWriter::add_scan_surface(const Json& metadata, const Tensor& axis
 
 std::string QvfWriter::add_vibrations(const Json& metadata,
                                       const Tensor& displacements,
-                                      const std::string& section_id) {
+                                      const std::string& section_id,
+                                      const std::string& hessian_ref) {
+    check_new_id(section_id);
     if (displacements.shape.size() != 3 || displacements.shape[2] != 3)
         throw std::runtime_error("displacements must be [n_modes, n_atoms, 3]");
+    if (!hessian_ref.empty()) {  // spec § 5.5: names an existing hessian section
+        bool found = false;
+        for (const Json& s : sections_.elements())
+            if (s.at("id").as_string() == hessian_ref &&
+                s.at("kind").as_string() == "hessian")
+                found = true;
+        if (!found)
+            throw std::runtime_error("vibrations hessian_ref names no hessian section "
+                                     "added so far: " + hessian_ref);
+    }
     Json members = Json::object();
     members.set("metadata", json_member(section_id + "/metadata.json", metadata));
     members.set("displacements",
                 binary_member(section_id + "/displacements.bin", displacements));
     Json section = Json::object();
-    section.set("id", reserve_id(section_id)).set("kind", "vibrations")
-           .set("members", members);
+    section.set("id", reserve_id(section_id)).set("kind", "vibrations");
+    if (!hessian_ref.empty()) section.set("hessian_ref", hessian_ref);
+    section.set("members", members);
     sections_.push_back(section);
     return section_id;
+}
+
+// -- energy derivatives (spec § 5.10, § 5.11) -------------------------------
+
+// Throws unless `t` is float64 with itemsize * prod(shape) bytes, so a refused
+// call is refused before anything is written.
+static void require_f64_tensor(const Tensor& t, const char* what) {
+    if (t.dtype != DType::Float64)
+        throw std::runtime_error(std::string(what) + " must be float64");
+    size_t n = 1;
+    for (int64_t d : t.shape) {
+        if (d < 0) throw std::runtime_error(std::string(what) + " has a negative extent");
+        n *= static_cast<size_t>(d);
+    }
+    if (t.bytes.size() != 8 * n)
+        throw std::runtime_error(std::string(what) +
+                                 " byte length != 8 * prod(shape)");
+}
+
+static void require_meta(const Json& meta, const char* what) {
+    if (!meta.is_null() && meta.type() != Json::Type::Object &&
+        meta.type() != Json::Type::Raw)
+        throw std::runtime_error(std::string(what) + " meta must be a JSON object");
+}
+
+std::string QvfWriter::add_forces(const Tensor& gradient, const Tensor* stress,
+                                  const Json& meta, const std::string& section_id) {
+    check_new_id(section_id);
+    if (gradient.shape.size() != 2 || gradient.shape[1] != 3)
+        throw std::runtime_error("forces gradient must be [n_atoms, 3]");
+    require_f64_tensor(gradient, "forces gradient");
+    if (stress) {
+        if (stress->shape.size() != 2 || stress->shape[0] != 3 || stress->shape[1] != 3)
+            throw std::runtime_error("forces stress must be [3, 3]");
+        require_f64_tensor(*stress, "forces stress");
+    }
+    require_meta(meta, "forces");
+    const std::string sid = reserve_id(section_id);
+    Json members = Json::object();
+    members.set("gradient", binary_member(sid + "/gradient.bin", gradient));
+    if (stress) members.set("stress", binary_member(sid + "/stress.bin", *stress));
+    if (!meta.is_null()) members.set("meta", json_member(sid + "/meta.json", meta));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", "forces").set("members", members);
+    sections_.push_back(section);
+    return sid;
+}
+
+std::string QvfWriter::add_hessian(const Tensor& matrix, const Json& meta,
+                                   const std::string& section_id) {
+    check_new_id(section_id);
+    const auto& s = matrix.shape;
+    if (s.size() != 2 || s[0] != s[1])
+        throw std::runtime_error("hessian matrix must be square [3N, 3N]");
+    if (s[0] % 3 != 0)
+        throw std::runtime_error("hessian matrix extent is not divisible by 3");
+    require_f64_tensor(matrix, "hessian matrix");
+    require_meta(meta, "hessian");
+    if (meta.type() == Json::Type::Object) {
+        const bool weighted = meta.has("mass_weighted") &&
+                              meta.at("mass_weighted").is_bool() &&
+                              meta.at("mass_weighted").as_bool();
+        if (weighted && !meta.has("atom_masses_amu"))
+            throw std::runtime_error(
+                "hessian meta: a mass-weighted matrix needs atom_masses_amu");
+        if (meta.has("atom_masses_amu")) {
+            const Json& masses = meta.at("atom_masses_amu");
+            if (!masses.is_array() || static_cast<int64_t>(masses.size()) != s[0] / 3)
+                throw std::runtime_error(
+                    "hessian meta atom_masses_amu must hold one mass per atom "
+                    "(N = matrix extent / 3)");
+        }
+    }
+    const std::string sid = reserve_id(section_id);
+    Json members = Json::object();
+    members.set("matrix", binary_member(sid + "/matrix.bin", matrix));
+    if (!meta.is_null()) members.set("meta", json_member(sid + "/meta.json", meta));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", "hessian").set("members", members);
+    sections_.push_back(section);
+    return sid;
+}
+
+// -- excited states (spec § 5.12) ---------------------------------------------
+
+// The fields of a state ($defs/ExcitedState) and of a contribution
+// ($defs/ExcitedStateContribution); other keys must begin with x_.
+static const char* const kStateFields[] = {
+    "index", "excitation_energy", "total_energy", "multiplicity", "symmetry",
+    "oscillator_strength", "rotatory_strength_cgs", "transition_dipole",
+    "transition_magnetic_dipole", "contributions", "nto_ref", "density_ref"};
+static const char* const kContributionFields[] = {"from_mo", "to_mo", "spin", "weight"};
+
+template <size_t N>
+static bool is_listed(const std::string& key, const char* const (&list)[N]) {
+    for (const char* k : list)
+        if (key == k) return true;
+    return key.compare(0, 2, "x_") == 0;
+}
+
+static bool is_json_int(const Json& j) { return j.type() == Json::Type::Int; }
+
+// A {value, units} energy whose unit is a unit name; a number is written in
+// `default_unit`.
+static Json state_energy(const Json& v, const char* default_unit, const std::string& what) {
+    if (is_finite_number(v)) {
+        Json e = Json::object();
+        e.set("value", v.as_double()).set("units", default_unit);
+        return e;
+    }
+    if (!v.is_object() || v.size() != 2 || !v.has("value") || !v.has("units") ||
+        !is_finite_number(v.at("value")))
+        throw std::runtime_error(what + " must be a number or a {value, units} object");
+    check_unit_name(what + " units", v.at("units"));
+    return v;
+}
+
+// Orbital rows of a wavefunction.gto section by channel: "" for
+// mo_coefficients, "alpha" and "beta" for the unrestricted pair.
+static std::map<std::string, int64_t> section_mo_rows(const Json& section) {
+    std::map<std::string, int64_t> rows;
+    if (!section.has("members")) return rows;
+    const Json& members = section.at("members");
+    static const struct {
+        const char* role;
+        const char* key;
+    } kRoles[] = {{"mo_coefficients", ""},
+                  {"mo_coefficients_alpha", "alpha"},
+                  {"mo_coefficients_beta", "beta"}};
+    for (const auto& r : kRoles)
+        if (members.has(r.role) && members.at(r.role).has("shape") &&
+            members.at(r.role).at("shape").size() > 0)
+            rows[r.key] = members.at(r.role).at("shape").at(size_t{0}).as_int();
+    return rows;
+}
+
+std::string QvfWriter::add_excited_states(const Json& states_in, const Json& meta_in,
+                                          const std::string& wavefunction_ref,
+                                          const std::string& section_id) {
+    check_new_id(section_id);
+    const Json states = states_in.type() == Json::Type::Raw
+                            ? Json::parse(states_in.as_string())
+                            : states_in;
+    const Json meta = meta_in.type() == Json::Type::Raw ? Json::parse(meta_in.as_string())
+                                                        : meta_in;
+    if (!states.is_array())
+        throw std::runtime_error("excited_states: states must be a JSON array (QVF spec § 5.12)");
+    if (!meta.is_null() && !meta.is_object())
+        throw std::runtime_error("excited_states: meta must be a JSON object");
+
+    auto kind_of = [this](const std::string& id) -> std::string {
+        for (const Json& s : sections_.elements())
+            if (s.at("id").as_string() == id) return s.at("kind").as_string();
+        return "";
+    };
+    auto need = [&kind_of](const std::string& what, const Json& ref,
+                           std::initializer_list<const char*> kinds) {
+        const std::string found = ref.is_string() ? kind_of(ref.as_string()) : "";
+        std::string names;
+        for (const char* k : kinds) {
+            if (found == k) return;
+            names += names.empty() ? std::string(k) : std::string(" or ") + k;
+        }
+        throw std::runtime_error("excited_states: " + what + " " + ref.dump(0) +
+                                 " must name an added " + names +
+                                 " section (QVF spec § 5.12)");
+    };
+
+    bool have_rows = false;
+    std::map<std::string, int64_t> rows;
+    if (!wavefunction_ref.empty()) {
+        need("wavefunction_ref", Json(wavefunction_ref), {"wavefunction.gto"});
+        rows = section_mo_rows(sections_.at(section_index(wavefunction_ref)));
+        have_rows = true;
+    }
+
+    Json out_states = Json::array();
+    int64_t prev = 0;
+    for (size_t k = 0; k < states.size(); ++k) {
+        const Json& st = states.at(k);
+        const std::string what = "excited_states: states[" + std::to_string(k) + "]";
+        if (!st.is_object()) throw std::runtime_error(what + " must be a JSON object");
+        if (!st.has("index") || !st.has("excitation_energy"))
+            throw std::runtime_error(what + " needs index and excitation_energy "
+                                            "(QVF spec § 5.12)");
+        Json out = Json::object();
+        for (const auto& kv : st.items()) {
+            const std::string& key = kv.first;
+            const Json& v = kv.second;
+            const std::string field = what + "." + key;
+            if (!is_listed(key, kStateFields))
+                throw std::runtime_error(what + ": unknown field '" + key +
+                                         "' (QVF spec § 5.12)");
+            if (key == "index") {
+                if (!is_json_int(v) || v.as_int() < 1)
+                    throw std::runtime_error(field + " must be an integer >= 1");
+                if (k > 0 && v.as_int() <= prev)
+                    throw std::runtime_error(field + " " + std::to_string(v.as_int()) +
+                                             " follows index " + std::to_string(prev) +
+                                             "; indices are unique and ascending "
+                                             "(QVF spec § 5.12)");
+                prev = v.as_int();
+                out.set(key, v);
+            } else if (key == "excitation_energy") {
+                out.set(key, state_energy(v, "ev", field));
+            } else if (key == "total_energy") {
+                out.set(key, state_energy(v, "hartree", field));
+            } else if (key == "multiplicity") {
+                if (!is_json_int(v) || v.as_int() < 1)
+                    throw std::runtime_error(field + " must be an integer >= 1");
+                out.set(key, v);
+            } else if (key == "symmetry") {
+                if (!v.is_string()) throw std::runtime_error(field + " must be a string");
+                out.set(key, v);
+            } else if (key == "oscillator_strength" || key == "rotatory_strength_cgs") {
+                if (!is_finite_number(v) ||
+                    (key == "oscillator_strength" && v.as_double() < 0))
+                    throw std::runtime_error(field + " must be a finite number" +
+                                             (key == "oscillator_strength" ? " >= 0" : ""));
+                out.set(key, v);
+            } else if (key == "transition_dipole" || key == "transition_magnetic_dipole") {
+                bool ok = v.is_array() && v.size() == 3;
+                for (size_t c = 0; ok && c < 3; ++c) ok = is_finite_number(v.at(c));
+                if (!ok) throw std::runtime_error(field + " must be three numbers");
+                out.set(key, v);
+            } else if (key == "contributions") {
+                if (!v.is_array()) throw std::runtime_error(field + " must be an array");
+                for (size_t c = 0; c < v.size(); ++c) {
+                    const Json& con = v.at(c);
+                    const std::string cw = field + "[" + std::to_string(c) + "]";
+                    if (!con.is_object() || !con.has("from_mo") || !con.has("to_mo") ||
+                        !con.has("weight"))
+                        throw std::runtime_error(cw + " needs from_mo, to_mo and weight "
+                                                      "(QVF spec § 5.12)");
+                    for (const auto& ckv : con.items())
+                        if (!is_listed(ckv.first, kContributionFields))
+                            throw std::runtime_error(cw + ": unknown field '" + ckv.first +
+                                                     "' (QVF spec § 5.12)");
+                    if (!is_finite_number(con.at("weight")))
+                        throw std::runtime_error(cw + ".weight must be a number");
+                    std::string spin;
+                    if (con.has("spin")) {
+                        const Json& sj = con.at("spin");
+                        if (!sj.is_string() ||
+                            (sj.as_string() != "alpha" && sj.as_string() != "beta"))
+                            throw std::runtime_error(cw + ".spin must be 'alpha' or 'beta'");
+                        spin = sj.as_string();
+                    }
+                    bool have_n = false;
+                    int64_t n = 0;
+                    if (have_rows) {
+                        if (rows.count("")) {
+                            have_n = true;
+                            n = rows.at("");
+                        } else if (!spin.empty()) {
+                            if (rows.count(spin)) {
+                                have_n = true;
+                                n = rows.at(spin);
+                            }
+                        } else {
+                            for (const char* ch : {"alpha", "beta"})
+                                if (rows.count(ch)) {
+                                    n = have_n ? std::min(n, rows.at(ch)) : rows.at(ch);
+                                    have_n = true;
+                                }
+                        }
+                    }
+                    for (const char* mo_key : {"from_mo", "to_mo"}) {
+                        const Json& mo = con.at(mo_key);
+                        if (!is_json_int(mo) || mo.as_int() < 0)
+                            throw std::runtime_error(cw + "." + mo_key +
+                                                     " must be an integer >= 0");
+                        if (have_n && mo.as_int() >= n)
+                            throw std::runtime_error(
+                                cw + "." + mo_key + " " + std::to_string(mo.as_int()) +
+                                " is not one of the " + std::to_string(n) +
+                                " orbital rows of the reference wavefunction "
+                                "(QVF spec § 5.12)");
+                    }
+                }
+                out.set(key, v);
+            } else if (key == "nto_ref") {
+                need("states[" + std::to_string(k) + "].nto_ref", v, {"wavefunction.gto"});
+                out.set(key, v);
+            } else if (key == "density_ref") {
+                need("states[" + std::to_string(k) + "].density_ref", v,
+                     {"volume.transition_density", "volume.difference"});
+                out.set(key, v);
+            } else {
+                out.set(key, v);  // an x_ key
+            }
+        }
+        out_states.push_back(out);
+    }
+
+    Json payload = Json::object();
+    payload.set("states", out_states);
+    if (!meta.is_null()) {
+        if (meta.has("units"))
+            check_units_object("excited_states meta", meta.at("units"),
+                               {{"oscillator_strength", Unit::Dimensionless}});
+        if (meta.has("n_states") &&
+            (!is_json_int(meta.at("n_states")) ||
+             meta.at("n_states").as_int() != static_cast<int64_t>(states.size())))
+            throw std::runtime_error("excited_states: meta.n_states must equal the number "
+                                     "of states (QVF spec § 5.12)");
+        payload.set("meta", meta);
+    }
+    const std::string sid = reserve_id(section_id);
+    Json members = Json::object();
+    members.set("states", json_member(sid + "/states.json", payload));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", "excited_states");
+    if (!wavefunction_ref.empty()) section.set("wavefunction_ref", wavefunction_ref);
+    section.set("members", members);
+    sections_.push_back(section);
+    return sid;
 }
 
 // -- symmetry & periodic kinds ----------------------------------------------
 
 std::string QvfWriter::add_structure_symmetry(const Json& data,
                                               const std::string& section_id) {
+    check_new_id(section_id);
     Json members = Json::object();
     members.set("data", json_member("structure/symmetry.json", data));
     Json section = Json::object();
@@ -2481,6 +13144,7 @@ std::string QvfWriter::add_structure_symmetry(const Json& data,
 
 std::string QvfWriter::add_fermi_surface(const Json& mesh, const Tensor& energies,
                                          const std::string& section_id) {
+    check_new_id(section_id);
     if (energies.shape.size() != 4)
         throw std::runtime_error("fermi_surface energies must be 4-D");
     Json members = Json::object();
@@ -2496,6 +13160,23 @@ std::string QvfWriter::add_fermi_surface(const Json& mesh, const Tensor& energie
 std::string QvfWriter::add_phonon_bands(const Json& qpath, const Tensor& frequencies,
                                         const Tensor* eigenvectors,
                                         const std::string& section_id) {
+    check_new_id(section_id);
+    if (eigenvectors) {  // checked before any member is written (spec § 5.6)
+        const auto& s = eigenvectors->shape;
+        const bool is_real = s.size() == 4 && s[3] == 3;
+        const bool is_complex = s.size() == 5 && s[3] == 3 && s[4] == 2;
+        if (!is_real && !is_complex)
+            throw std::runtime_error(
+                "phonon_bands eigenvectors must be [n_q, n_modes, n_atoms, 3] (real) "
+                "or [n_q, n_modes, n_atoms, 3, 2] (complex, last axis [re, im])");
+        if (eigenvectors->dtype != DType::Float64)
+            throw std::runtime_error("phonon_bands eigenvectors must be float64");
+        const auto& f = frequencies.shape;
+        if (f.size() != 2 || s[0] != f[0] || s[1] != f[1])
+            throw std::runtime_error(
+                "phonon_bands eigenvectors [n_q, n_modes] must match frequencies "
+                "[n_q, n_modes]");
+    }
     Json members = Json::object();
     members.set("qpath", json_member("phonons/" + section_id + "_qpath.json", qpath));
     members.set("frequencies",
@@ -2513,6 +13194,26 @@ std::string QvfWriter::add_phonon_bands(const Json& qpath, const Tensor& frequen
 std::string QvfWriter::add_phonon_dos(const Json& meta, const Tensor& frequencies,
                                       const Tensor& dos, const Tensor* projected,
                                       const std::string& section_id) {
+    check_new_id(section_id);
+    if (projected) {  // checked before any member is written (spec § 5.6)
+        const auto& s = projected->shape;
+        if (s.size() != 2)
+            throw std::runtime_error(
+                "phonon_dos projected must be [n_channels, n_points]");
+        if (projected->dtype != DType::Float64)
+            throw std::runtime_error("phonon_dos projected must be float64");
+        if (frequencies.shape.size() != 1 || s[1] != frequencies.shape[0])
+            throw std::runtime_error(
+                "phonon_dos projected [n_channels, n_points] must match frequencies "
+                "[n_points]");
+        if (meta.type() == Json::Type::Object && meta.has("channels")) {
+            const Json& channels = meta.at("channels");
+            if (channels.type() == Json::Type::Array &&
+                static_cast<int64_t>(channels.size()) != s[0])
+                throw std::runtime_error(
+                    "phonon_dos meta channels must have one entry per projected row");
+        }
+    }
     Json members = Json::object();
     members.set("meta", json_member("phonons/" + section_id + "_meta.json", meta));
     members.set("frequencies",
@@ -2531,6 +13232,7 @@ std::string QvfWriter::add_phonon_dos(const Json& meta, const Tensor& frequencie
 std::string QvfWriter::add_equation_of_state(const Tensor& volumes,
                                              const Tensor& energies, const Json& fit,
                                              const std::string& section_id) {
+    check_new_id(section_id);
     Json members = Json::object();
     members.set("volumes", binary_member("eos/" + section_id + "_volumes.bin", volumes));
     members.set("energies",
@@ -2545,6 +13247,8 @@ std::string QvfWriter::add_equation_of_state(const Tensor& volumes,
 
 std::string QvfWriter::add_topology_qtaim(const Json& critical_points,
                                           const std::string& section_id) {
+    check_new_id(section_id);
+    check_payload_units("topology.qtaim", critical_points, {});
     Json members = Json::object();
     members.set("critical_points",
                 json_member("topology/" + section_id + ".json", critical_points));
@@ -2555,19 +13259,297 @@ std::string QvfWriter::add_topology_qtaim(const Json& critical_points,
     return section_id;
 }
 
+// -- property kinds (spec § 5.13) --------------------------------------------
+//
+// The writer has no JSON Schema engine, so these checks repeat what the payload
+// definitions say that can be judged from the object alone (shapes, required
+// fields, enumerations, strictness) plus the two rules of the validators that
+// involve only the payload (symmetric elastic matrices, static = electronic +
+// ionic). The rules that need other parts of the archive (one Born tensor per
+// atom, the dipole against the root block) are left to the validators.
+
+// Largest disagreement the validators accept between two statements of one
+// property: matrix symmetry (relative to the largest entry) and static against
+// electronic + ionic.
+static const double kPropertyTolerance = 1e-6;
+
+// The payload as a parsed JSON object (a Json::raw fragment is parsed; malformed
+// JSON throws).
+static Json property_object(const Json& properties, const std::string& what) {
+    Json doc = properties.type() == Json::Type::Raw ? Json::parse(properties.as_string())
+                                                    : properties;
+    if (!doc.is_object())
+        throw std::runtime_error(what + ": the payload must be a JSON object");
+    return doc;
+}
+
+// A strict payload object: only `allowed` keys and keys beginning x_.
+static void check_property_keys(const Json& obj, std::initializer_list<const char*> allowed,
+                                const std::string& what) {
+    if (!obj.is_object()) throw std::runtime_error(what + " must be a JSON object");
+    for (const auto& kv : obj.items()) {
+        bool ok = kv.first.compare(0, 2, "x_") == 0;
+        for (const char* a : allowed)
+            if (kv.first == a) ok = true;
+        if (!ok)
+            throw std::runtime_error(what + ": unknown key '" + kv.first + "'");
+    }
+}
+
+static const Json& require_property_member(const Json& obj, const char* key,
+                                           const std::string& what) {
+    if (!obj.has(key)) throw std::runtime_error(what + " requires " + key);
+    return obj.at(key);
+}
+
+// `v` as an array of n finite numbers.
+static std::vector<double> property_numbers(const Json& v, size_t n, const std::string& what) {
+    if (!v.is_array() || v.size() != n)
+        throw std::runtime_error(what + " must have " + std::to_string(n) + " numbers");
+    std::vector<double> out;
+    for (const Json& x : v.elements()) {
+        if (!is_finite_number(x)) throw std::runtime_error(what + " must hold finite numbers");
+        out.push_back(x.as_double());
+    }
+    return out;
+}
+
+// `v` as rows x cols finite numbers, row-major.
+static std::vector<double> property_matrix(const Json& v, size_t rows, size_t cols,
+                                           const std::string& what) {
+    if (!v.is_array() || v.size() != rows)
+        throw std::runtime_error(what + " must be " + std::to_string(rows) + " x " +
+                                 std::to_string(cols));
+    std::vector<double> out;
+    for (const Json& row : v.elements()) {
+        if (!row.is_array() || row.size() != cols)
+            throw std::runtime_error(what + " must be " + std::to_string(rows) + " x " +
+                                     std::to_string(cols));
+        for (const double x : property_numbers(row, cols, what)) out.push_back(x);
+    }
+    return out;
+}
+
+// Throws unless the n x n matrix is symmetric to within 1e-6 of its largest
+// absolute entry, the rule the validators apply.
+static void require_symmetric(const std::vector<double>& m, size_t n, const std::string& what) {
+    double scale = 0.0;
+    for (double x : m) scale = std::max(scale, std::fabs(x));
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+            if (std::fabs(m[i * n + j] - m[j * n + i]) > kPropertyTolerance * scale)
+                throw std::runtime_error(what + " must be symmetric: entry (" +
+                                         std::to_string(i) + ", " + std::to_string(j) +
+                                         ") differs from entry (" + std::to_string(j) + ", " +
+                                         std::to_string(i) + ") (spec § 5.13)");
+}
+
+static void require_one_of(const Json& v, std::initializer_list<const char*> options,
+                           const std::string& what) {
+    if (v.is_string())
+        for (const char* o : options)
+            if (v.as_string() == o) return;
+    std::string list;
+    for (const char* o : options) list += (list.empty() ? "" : ", ") + std::string(o);
+    throw std::runtime_error(what + " must be one of " + list);
+}
+
+static void validate_electric_properties(const Json& doc) {
+    const std::string what = "properties.electric";
+    check_property_keys(doc, {"origin", "dipole", "quadrupole", "octupole", "polarizability",
+                              "hyperpolarizability", "units"}, what);
+    if (doc.has("origin")) {
+        const Json& o = doc.at("origin");
+        if (o.is_string()) {
+            if (o.as_string().empty()) throw std::runtime_error(what + " origin must not be empty");
+        } else {
+            property_numbers(o, 3, what + " origin");
+        }
+    }
+    bool any_block = false;
+    if (doc.has("dipole")) {
+        any_block = true;
+        const Json& d = doc.at("dipole");
+        const std::string w = what + " dipole";
+        check_property_keys(d, {"vector", "total", "units"}, w);
+        property_numbers(require_property_member(d, "vector", w), 3, w + " vector");
+        if (d.has("total") && (!is_finite_number(d.at("total")) || d.at("total").as_double() < 0))
+            throw std::runtime_error(w + " total must be a number >= 0");
+        if (d.has("units") &&
+            !(d.at("units").is_string() && d.at("units").as_string() == "debye"))
+            throw std::runtime_error(w + " units must be 'debye'; spec § 5.13 fixes it");
+    }
+    if (doc.has("quadrupole")) {
+        any_block = true;
+        const Json& q = doc.at("quadrupole");
+        const std::string w = what + " quadrupole";
+        check_property_keys(q, {"matrix", "traceless", "convention"}, w);
+        const std::vector<double> m =
+            property_matrix(require_property_member(q, "matrix", w), 3, 3, w + " matrix");
+        require_symmetric(m, 3, w + " matrix");
+        const Json& traceless = require_property_member(q, "traceless", w);
+        if (!traceless.is_bool()) throw std::runtime_error(w + " traceless must be a boolean");
+        const Json& convention = require_property_member(q, "convention", w);
+        require_one_of(convention, {"buckingham", "cartesian"}, w + " convention");
+        if (convention.as_string() == "buckingham" && !traceless.as_bool())
+            throw std::runtime_error(w + ": the buckingham convention is traceless");
+    }
+    if (doc.has("octupole")) {
+        any_block = true;
+        const Json& o = doc.at("octupole");
+        const std::string w = what + " octupole";
+        check_property_keys(o, {"tensor", "convention"}, w);
+        property_numbers(require_property_member(o, "tensor", w), 27, w + " tensor");
+        if (o.has("convention"))
+            require_one_of(o.at("convention"), {"buckingham", "cartesian"}, w + " convention");
+    }
+    if (doc.has("polarizability")) {
+        any_block = true;
+        const Json& p = doc.at("polarizability");
+        const std::string w = what + " polarizability";
+        check_property_keys(p, {"matrix", "frequency_ev", "isotropic"}, w);
+        property_matrix(require_property_member(p, "matrix", w), 3, 3, w + " matrix");
+        if (p.has("frequency_ev") &&
+            (!is_finite_number(p.at("frequency_ev")) || p.at("frequency_ev").as_double() < 0))
+            throw std::runtime_error(w + " frequency_ev must be a number >= 0");
+        if (p.has("isotropic") && !is_finite_number(p.at("isotropic")))
+            throw std::runtime_error(w + " isotropic must be a number");
+    }
+    if (doc.has("hyperpolarizability")) {
+        any_block = true;
+        const Json& b = doc.at("hyperpolarizability");
+        const std::string w = what + " hyperpolarizability";
+        check_property_keys(b, {"tensor", "frequencies_ev"}, w);
+        property_numbers(require_property_member(b, "tensor", w), 27, w + " tensor");
+        if (b.has("frequencies_ev")) property_numbers(b.at("frequencies_ev"), 2, w + " frequencies_ev");
+    }
+    if (!any_block)
+        throw std::runtime_error(what + " needs at least one of dipole, quadrupole, octupole, "
+                                        "polarizability, hyperpolarizability");
+    if (doc.has("units"))
+        check_units_object(what, doc.at("units"),
+                           {{"dipole", Unit::Debye}, {"origin", Unit::Bohr}});
+}
+
+static void validate_elastic_properties(const Json& doc) {
+    const std::string what = "properties.elastic";
+    check_property_keys(doc, {"stiffness", "compliance", "bulk_modulus_gpa", "shear_modulus_gpa",
+                              "youngs_modulus_gpa", "poisson_ratio", "average", "units"}, what);
+    const std::vector<double> c =
+        property_matrix(require_property_member(doc, "stiffness", what), 6, 6, what + " stiffness");
+    require_symmetric(c, 6, what + " stiffness");
+    if (doc.has("compliance")) {
+        const std::vector<double> s =
+            property_matrix(doc.at("compliance"), 6, 6, what + " compliance");
+        require_symmetric(s, 6, what + " compliance");
+    }
+    for (const char* key : {"bulk_modulus_gpa", "shear_modulus_gpa", "youngs_modulus_gpa",
+                            "poisson_ratio"})
+        if (doc.has(key) && !is_finite_number(doc.at(key)))
+            throw std::runtime_error(what + " " + key + " must be a number");
+    if (doc.has("average"))
+        require_one_of(doc.at("average"), {"voigt", "reuss", "hill"}, what + " average");
+    if (doc.has("units"))
+        check_units_object(what, doc.at("units"),
+                           {{"stiffness", Unit::Gigapascal},
+                            {"bulk_modulus_gpa", Unit::Gigapascal},
+                            {"shear_modulus_gpa", Unit::Gigapascal},
+                            {"youngs_modulus_gpa", Unit::Gigapascal},
+                            {"poisson_ratio", Unit::Dimensionless}});
+}
+
+static void validate_dielectric_properties(const Json& doc) {
+    const std::string what = "properties.dielectric";
+    check_property_keys(doc, {"electronic", "ionic", "static", "born_charges", "piezoelectric",
+                              "units"}, what);
+    const std::vector<double> e = property_matrix(
+        require_property_member(doc, "electronic", what), 3, 3, what + " electronic");
+    std::vector<double> ion, st;
+    if (doc.has("ionic")) ion = property_matrix(doc.at("ionic"), 3, 3, what + " ionic");
+    if (doc.has("static")) st = property_matrix(doc.at("static"), 3, 3, what + " static");
+    if (!ion.empty() && !st.empty())
+        for (size_t k = 0; k < 9; ++k)
+            if (std::fabs(st[k] - (e[k] + ion[k])) > kPropertyTolerance)
+                throw std::runtime_error(what + " static[" + std::to_string(k / 3) + "][" +
+                                         std::to_string(k % 3) +
+                                         "] is not electronic + ionic; static must equal their "
+                                         "sum within 1e-6 (spec § 5.13)");
+    if (doc.has("born_charges")) {
+        const Json& b = doc.at("born_charges");
+        if (!b.is_array() || b.size() == 0)
+            throw std::runtime_error(what + " born_charges must be a non-empty array of 3 x 3 "
+                                            "tensors, one per atom");
+        for (const Json& tensor : b.elements())
+            property_matrix(tensor, 3, 3, what + " born_charges tensor");
+    }
+    if (doc.has("piezoelectric"))
+        property_matrix(doc.at("piezoelectric"), 3, 6, what + " piezoelectric");
+    if (doc.has("units"))
+        check_units_object(what, doc.at("units"),
+                           {{"electronic", Unit::Dimensionless},
+                            {"ionic", Unit::Dimensionless},
+                            {"static", Unit::Dimensionless},
+                            {"born_charges", Unit::ElementaryCharge}});
+}
+
+std::string QvfWriter::add_properties_section(const std::string& kind,
+                                              const std::string& section_id,
+                                              const Json& payload) {
+    check_new_id(section_id);
+    const std::string sid = reserve_id(section_id);
+    Json members = Json::object();
+    members.set("properties", json_member(sid + "/properties.json", payload));
+    Json section = Json::object();
+    section.set("id", sid).set("kind", kind).set("members", members);
+    sections_.push_back(section);
+    return sid;
+}
+
+std::string QvfWriter::add_electric_properties(const Json& properties,
+                                               const std::string& section_id) {
+    validate_electric_properties(property_object(properties, "properties.electric"));
+    return add_properties_section("properties.electric", section_id, properties);
+}
+
+std::string QvfWriter::add_elastic_properties(const Json& properties,
+                                              const std::string& section_id) {
+    validate_elastic_properties(property_object(properties, "properties.elastic"));
+    return add_properties_section("properties.elastic", section_id, properties);
+}
+
+std::string QvfWriter::add_dielectric_properties(const Json& properties,
+                                                 const std::string& section_id) {
+    validate_dielectric_properties(property_object(properties, "properties.dielectric"));
+    return add_properties_section("properties.dielectric", section_id, properties);
+}
+
 // -- output -----------------------------------------------------------------
 
 Json QvfWriter::build_manifest() const {
     Json m = Json::object();
     m.set("qvf_version", 1);
     m.set("schema_uri", "https://vibe-qc.org/spec/qvf/1/manifest.schema.json");
+    m.set("byte_order", "little");  // the only v1 byte order (spec § 2.2)
     Json src = Json::object();
     src.set("program", source_.program).set("version", source_.version)
        .set("calculation", source_.calculation);
     m.set("source", src);
+    // Root metadata (spec § 3.5), with the automatic created_utc / uuid unless
+    // set_metadata() supplied them; made once, then reused.
+    Json metadata = root_.has("metadata") ? root_.at("metadata") : Json::object();
+    if (auto_metadata) {
+        if (auto_uuid_.empty()) {
+            auto_created_utc_ = metadata_utc_now();
+            auto_uuid_ = metadata_random_uuid();
+        }
+        if (!metadata.has("created_utc")) metadata.set("created_utc", auto_created_utc_);
+        if (!metadata.has("uuid")) metadata.set("uuid", auto_uuid_);
+    }
+    if (metadata.size() > 0) m.set("metadata", metadata);
     // Merge optional root blocks in a deterministic order.
     for (const char* key : {"provenance", "thermochemistry", "dipole_moment",
-                            "constraints", "extensions", "viewer_defaults"}) {
+                            "constraints", "energies", "extensions",
+                            "viewer_defaults"}) {
         for (const auto& kv : root_.items())
             if (kv.first == key) m.set(key, kv.second);
     }
@@ -2575,23 +13557,435 @@ Json QvfWriter::build_manifest() const {
     return m;
 }
 
+// -- streaming and in-place update (spec § 2.1; container layer) -------------
+
+static std::string qvf_path(const std::string& path) {
+    std::string out = path;
+    if (out.size() < 4 || out.substr(out.size() - 4) != ".qvf") out += ".qvf";
+    return out;
+}
+
+static bool same_file(const std::string& a, const std::string& b) {
+    std::error_code ec;
+    if (std::filesystem::equivalent(a, b, ec)) return true;
+    return a == b;
+}
+
+static size_t itemsize_of(DType d) { return dtype_itemsize(d); }
+
+QvfWriter::QvfWriter(Source source, const std::string& path) : QvfWriter(std::move(source)) {
+    out_ = std::make_shared<detail::WriterOutput>();
+    out_->path = qvf_path(path);
+    out_->zip.reset(new container::ZipWriter(
+        std::unique_ptr<container::Sink>(new container::FileSink(out_->path))));
+}
+
+// Root blocks build_manifest() writes from root_; any other root key of an
+// updated archive is kept verbatim.
+static bool is_modelled_root_block(const std::string& key) {
+    for (const char* k : {"metadata", "provenance", "thermochemistry", "dipole_moment",
+                          "constraints", "energies", "extensions", "viewer_defaults"})
+        if (key == k) return true;
+    return false;
+}
+
+QvfWriter QvfWriter::open_for_update(const std::string& path) {
+    container::ZipReader zip = container::ZipReader::open(path);
+    // Superseded manifest.json copies of an earlier update are expected; any
+    // other repeated name makes the archive ambiguous (spec § 2.1, § 2.3).
+    for (const std::string& name : zip.duplicates())
+        if (name != "manifest.json")
+            throw std::runtime_error("E_ZIP_DUPLICATE_ENTRY: duplicate ZIP entry name '" +
+                                     name + "'; refusing to update");
+    const container::Limits lim{};
+    if (!zip.has("manifest.json"))
+        throw std::runtime_error("not a QVF archive (no manifest.json): " + path);
+    const std::vector<uint8_t> raw = zip.read("manifest.json", lim.max_json_bytes);
+    const Json m = Json::parse(std::string(raw.begin(), raw.end()), lim.max_json_depth);
+    if (!m.is_object()) throw std::runtime_error("manifest.json is not a JSON object");
+    // The withdrawn qvf_version 2 is read as 1 (spec § 3.1); the update
+    // writes 1 and the v1 schema_uri.
+    const double version = m.has("qvf_version") && m.at("qvf_version").is_number()
+                               ? m.at("qvf_version").as_double() : 0.0;
+    if (version != 1.0 && version != 2.0)
+        throw std::runtime_error("only qvf_version 1 archives (or the withdrawn 2, read as 1) "
+                                 "can be updated");
+    const bool withdrawn_version = version == 2.0;
+    const Json* src = m.has("source") ? &m.at("source") : nullptr;
+    if (!src || !src->is_object() || !src->has("program") || !src->has("version") ||
+        !src->at("program").is_string() || !src->at("version").is_string())
+        throw std::runtime_error("manifest.json has no usable source block");
+    Source source{src->at("program").as_string(), src->at("version").as_string(),
+                  src->has("calculation") && src->at("calculation").is_string()
+                      ? src->at("calculation").as_string() : std::string()};
+    if (!m.has("sections") || !m.at("sections").is_array())
+        throw std::runtime_error("manifest.json has no sections array");
+    if (m.has("byte_order") &&
+        !(m.at("byte_order").is_string() && m.at("byte_order").as_string() == "little"))
+        throw std::runtime_error("byte_order is not 'little' (spec § 2.2); refusing to update");
+
+    QvfWriter w(std::move(source));
+    w.auto_metadata = false;   // created_utc / uuid stay as the archive has them
+    std::shared_ptr<detail::WriterOutput> out = std::make_shared<detail::WriterOutput>();
+    out->path = path;
+    out->update = true;
+    out->source = *src;
+    out->has_source = true;
+    for (const auto& kv : m.items()) {
+        if (kv.first == "qvf_version" || kv.first == "source" || kv.first == "sections")
+            continue;
+        if (kv.first == "schema_uri" && withdrawn_version)
+            continue;   // build_manifest() writes the v1 URI
+        if (is_modelled_root_block(kv.first))
+            w.root_.set(kv.first, kv.second);
+        else
+            out->preserved_root.set(kv.first, kv.second);
+    }
+    w.sections_ = m.at("sections");
+    for (const Json& s : w.sections_.elements()) {
+        if (!s.is_object() || !s.has("id") || !s.at("id").is_string() || !s.has("members") ||
+            !s.at("members").is_object())
+            throw std::runtime_error("manifest.json has a malformed section");
+        w.ids_.insert(s.at("id").as_string());
+        for (const auto& mv : s.at("members").items())
+            if (mv.second.is_object() && mv.second.has("path") &&
+                mv.second.at("path").is_string())
+                w.paths_.insert(mv.second.at("path").as_string());
+    }
+    // Every existing entry name is taken: a new member may not reuse one.
+    for (const std::string& name : zip.names()) {
+        w.paths_.insert(name);
+        out->archived.insert(name);
+    }
+    if (m.has("metadata") && m.at("metadata").is_object() &&
+        m.at("metadata").has("modified_utc"))
+        out->loaded_modified = m.at("metadata").at("modified_utc");
+    // The custom atom_properties roles described so far, so that more can
+    // be added (best effort: a malformed meta member is left as it is).
+    for (const Json& s : w.sections_.elements()) {
+        if (!s.has("kind") || !s.at("kind").is_string() ||
+            s.at("kind").as_string() != "atom_properties" || !s.at("members").has("meta"))
+            continue;
+        try {
+            const Json& spec = s.at("members").at("meta");
+            const std::vector<uint8_t> b = zip.read(spec.at("path").as_string(), lim);
+            w.set_atom_properties_meta(Json::parse(std::string(b.begin(), b.end())));
+        } catch (const std::exception&) {
+        }
+    }
+    // Σ Z of each structure, for set_structure_identity (best effort, as above).
+    for (const Json& s : w.sections_.elements()) {
+        if (!s.has("kind") || !s.at("kind").is_string() ||
+            s.at("kind").as_string() != "structure" || !s.at("members").has("structure"))
+            continue;
+        try {
+            const Json& spec = s.at("members").at("structure");
+            const std::vector<uint8_t> b = zip.read(spec.at("path").as_string(), lim);
+            int64_t sum_z = 0;
+            if (payload_sum_z(Json::parse(std::string(b.begin(), b.end()), lim.max_json_depth),
+                              sum_z))
+                w.structure_sum_z_.emplace(s.at("id").as_string(), sum_z);
+        } catch (const std::exception&) {
+        }
+    }
+    w.out_ = std::move(out);
+    return w;
+}
+
+// Start appending to the bound archive: reopen it after its last entry and
+// flush the members buffered so far.
+void QvfWriter::open_bound_archive() {
+    if (!out_ || out_->zip) return;
+    out_->zip.reset(new container::ZipWriter(container::ZipWriter::append(out_->path)));
+    for (const auto& f : files_)
+        out_->zip->write(f.first, f.second,
+                         stored_.count(f.first) ? container::Method::Store
+                                                : container::Method::Deflate,
+                         force_zip64);
+    files_.clear();
+}
+
+// The manifest to write. An update keeps the archive's source and unmodelled
+// root keys, and stamps metadata.modified_utc with the time of the update
+// (spec § 2.3) unless the caller set a value of its own.
+Json QvfWriter::final_manifest() const {
+    Json m = build_manifest();
+    if (out_ && out_->update) {
+        if (out_->has_source) m.set("source", out_->source);
+        for (const auto& kv : out_->preserved_root.items()) m.set(kv.first, kv.second);
+        Json metadata = m.has("metadata") ? m.at("metadata") : Json::object();
+        const bool caller_set =
+            metadata.has("modified_utc") &&
+            (out_->loaded_modified.is_null() ||
+             metadata.at("modified_utc").dump(0) != out_->loaded_modified.dump(0));
+        if (!caller_set && metadata.is_object()) {
+            if (out_->stamp.empty()) out_->stamp = metadata_utc_now();
+            metadata.set("modified_utc", out_->stamp);
+            m.set("metadata", metadata);
+        }
+    }
+    return m;
+}
+
+// The buffered members, then manifest.json (STOREd, last), then the central
+// directory. When `zip` appends to an archive (spec § 2.3), the previous
+// manifest stays listed as a superseded entry: readers use the last one.
+void QvfWriter::emit_archive(container::ZipWriter& zip) {
+    if (member_open_)
+        throw std::runtime_error("a member sink is open; close it before writing");
+    if (force_zip64) zip.set_force_zip64(true);
+    const std::string manifest = final_manifest().dump(2);
+    for (const auto& f : files_)
+        zip.write(f.first, f.second,
+                  stored_.count(f.first) ? container::Method::Store : container::Method::Deflate,
+                  force_zip64);
+    if (out_ && out_->update) zip.allow_repeated_name("manifest.json");
+    zip.write("manifest.json", manifest, container::Method::Store, force_zip64);
+    zip.finish();
+}
+
 std::vector<uint8_t> QvfWriter::to_bytes() {
-    std::string manifest = build_manifest().dump(2);
-    detail::ZipWriter zip;
-    zip.add("manifest.json", manifest, /*compress=*/false);  // STORE: cheap TOC
-    for (const auto& f : files_) zip.add(f.first, f.second);  // DEFLATE if smaller
-    return zip.finish();
+    if (out_) {
+        if (out_->zip || !out_->update)
+            throw std::runtime_error("to_bytes() is not available while members stream "
+                                     "to a file; call write()");
+        // An update not yet started: the updated archive, in memory.
+        std::ifstream fh(out_->path, std::ios::binary);
+        if (!fh) throw std::runtime_error("cannot open: " + out_->path);
+        std::vector<uint8_t> current((std::istreambuf_iterator<char>(fh)),
+                                     std::istreambuf_iterator<char>());
+        container::ZipWriter zip = container::ZipWriter::append(std::move(current));
+        emit_archive(zip);
+        return static_cast<container::MemorySink&>(zip.sink()).take();
+    }
+    container::MemorySink* mem = new container::MemorySink;
+    container::ZipWriter zip{std::unique_ptr<container::Sink>(mem)};
+    emit_archive(zip);
+    return mem->take();
 }
 
 std::string QvfWriter::write(const std::string& path) {
-    std::string out = path;
-    if (out.size() < 4 || out.substr(out.size() - 4) != ".qvf") out += ".qvf";
-    std::vector<uint8_t> bytes = to_bytes();
-    std::ofstream fh(out, std::ios::binary);
-    if (!fh) throw std::runtime_error("cannot open for writing: " + out);
-    fh.write(reinterpret_cast<const char*>(bytes.data()),
-             static_cast<std::streamsize>(bytes.size()));
+    const std::string out = qvf_path(path);
+    if (out_) {
+        if (!same_file(out, out_->path) && !same_file(path, out_->path))
+            throw std::runtime_error("this writer is bound to " + out_->path +
+                                     "; call write() to finish it");
+        return write();
+    }
+    if (member_open_)
+        throw std::runtime_error("a member sink is open; close it before writing");
+    container::ZipWriter zip{std::unique_ptr<container::Sink>(new container::FileSink(out))};
+    emit_archive(zip);
     return out;
+}
+
+std::string QvfWriter::write() {
+    if (!out_)
+        throw std::runtime_error("write() needs a path unless the writer is bound to a "
+                                 "file (QvfWriter(source, path) or open_for_update)");
+    if (member_open_)
+        throw std::runtime_error("a member sink is open; close it before writing");
+    open_bound_archive();
+    const Json written = final_manifest();
+    emit_archive(*out_->zip);
+    // A later write() appends to the finished archive: every name in it is
+    // taken, and its modified_utc is the one just written.
+    for (const container::EntryInfo& e : out_->zip->entries()) out_->archived.insert(e.name);
+    out_->zip.reset();
+    out_->update = true;
+    if (written.has("metadata")) {
+        root_.set("metadata", written.at("metadata"));
+        out_->loaded_modified = written.at("metadata").has("modified_utc")
+                                    ? written.at("metadata").at("modified_utc") : Json();
+    }
+    out_->stamp.clear();
+    return out_->path;
+}
+
+MemberSink QvfWriter::begin_binary(const std::string& section_id, const std::string& role,
+                                   DType dtype, std::vector<int64_t> shape) {
+    if (member_open_)
+        throw std::runtime_error("a member sink is already open");
+    const Json& section = sections_.elements()[section_index(section_id)];
+    if (role.empty()) throw std::runtime_error("begin_binary: empty role");
+    if (section.at("members").has(role))
+        throw std::runtime_error("section '" + section_id + "' already has a member '" +
+                                 role + "'");
+    uint64_t expected = itemsize_of(dtype);
+    for (int64_t d : shape) {
+        if (d < 0) throw std::runtime_error("begin_binary: negative extent in shape");
+        const uint64_t u = static_cast<uint64_t>(d);
+        if (u != 0 && expected > UINT64_MAX / u)
+            throw std::runtime_error("begin_binary: shape too large");
+        expected *= u;
+    }
+    const std::string path = entry_name(section_id + "/" + role + ".bin");
+
+    std::unique_ptr<MemberSink::State> st(new MemberSink::State);
+    st->writer = this;
+    st->section_id = section_id;
+    st->role = role;
+    st->path = path;
+    st->dtype = dtype;
+    st->shape = std::move(shape);
+    st->expected = expected;
+    if (out_) {
+        open_bound_archive();
+        // DEFLATE in blocks adds at most 5 bytes per 32 KiB; begin with ZIP64
+        // when the entry may reach 4 GiB.
+        const bool zip64 = force_zip64 || expected >= 0xFFFFFFFFull - expected / 4096 - 65536;
+        st->entry.reset(new container::EntrySink(
+            out_->zip->begin(path, container::Method::Deflate, zip64)));
+    }
+    paths_.insert(path);
+    member_open_ = true;
+    return MemberSink(std::move(st));
+}
+
+// -- MemberSink ---------------------------------------------------------------
+
+MemberSink::MemberSink(std::unique_ptr<State> state) : s_(std::move(state)) {}
+MemberSink::MemberSink(MemberSink&&) noexcept = default;
+MemberSink& MemberSink::operator=(MemberSink&& other) noexcept {
+    if (this != &other) {
+        abandon();
+        s_ = std::move(other.s_);
+    }
+    return *this;
+}
+MemberSink::~MemberSink() { abandon(); }
+
+void MemberSink::abandon() noexcept {
+    if (!s_ || !s_->open) return;
+    s_->open = false;
+    s_->writer->member_open_ = false;
+    s_->writer->paths_.erase(s_->path);
+    s_->entry.reset();          // an unfinished ZIP entry is left out of the directory
+    s_->buffer.clear();
+}
+
+uint64_t MemberSink::bytes_written() const { return s_ ? s_->written : 0; }
+uint64_t MemberSink::bytes_expected() const { return s_ ? s_->expected : 0; }
+const std::string& MemberSink::path() const {
+    static const std::string empty;
+    return s_ ? s_->path : empty;
+}
+
+void MemberSink::write(const void* data, size_t n) {
+    if (!s_ || !s_->open) throw std::runtime_error("write to a closed member sink");
+    State& st = *s_;
+    if (n > st.expected - st.written)
+        throw std::runtime_error("member " + st.path + ": more bytes than dtype x shape (" +
+                                 std::to_string(st.expected) + ")");
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    if (st.entry) {
+        st.entry->write(p, n);
+    } else {
+        st.buffer.insert(st.buffer.end(), p, p + n);
+        st.sha.update(p, n);
+    }
+    st.written += n;
+}
+
+void MemberSink::close() {
+    if (!s_ || !s_->open) throw std::runtime_error("member sink already closed");
+    State& st = *s_;
+    if (st.written != st.expected) {
+        const std::string msg = "member " + st.path + ": " + std::to_string(st.written) +
+                                " bytes written, dtype x shape needs " +
+                                std::to_string(st.expected);
+        abandon();
+        throw std::runtime_error(msg);
+    }
+    std::string sha;
+    if (st.entry) {
+        try {
+            sha = st.entry->close().sha256;
+        } catch (...) {
+            abandon();
+            throw;
+        }
+    } else {
+        sha = st.sha.hex();
+    }
+    QvfWriter& w = *st.writer;
+    st.open = false;
+    w.member_open_ = false;
+    Json spec = Json::object();
+    spec.set("path", st.path).set("format", "binary");
+    spec.set("dtype", std::string(dtype_name(st.dtype)));
+    Json shape = Json::array();
+    for (int64_t d : st.shape) shape.push_back(Json(static_cast<long long>(d)));
+    spec.set("shape", shape).set("sha256", sha);
+    spec.set("size", static_cast<long long>(st.written));
+    if (!st.entry) w.files_.emplace_back(st.path, std::move(st.buffer));
+    // Json has no mutable element access: rebuild the sections array.
+    Json rebuilt = Json::array();
+    for (const Json& s : w.sections_.elements()) {
+        if (s.has("id") && s.at("id").is_string() && s.at("id").as_string() == st.section_id) {
+            Json members = s.at("members");
+            members.set(st.role, spec);
+            Json updated = s;
+            updated.set("members", members);
+            rebuilt.push_back(updated);
+        } else {
+            rebuilt.push_back(s);
+        }
+    }
+    w.sections_ = std::move(rebuilt);
+}
+
+// -- repack -------------------------------------------------------------------
+
+void repack(const std::string& in, const std::string& out) {
+    const bool in_place = same_file(in, out);
+    const std::string target = in_place ? out + ".repack-tmp" : out;
+    {
+        container::ZipReader zip = container::ZipReader::open(in);
+        // Superseded manifest.json copies are what repack removes (spec
+        // § 2.3); any other repeated name makes the archive ambiguous.
+        for (const std::string& name : zip.duplicates())
+            if (name != "manifest.json")
+                throw std::runtime_error("E_ZIP_DUPLICATE_ENTRY: duplicate ZIP entry name '" +
+                                         name + "'; refusing to repack");
+        const container::Limits lim{};
+        if (!zip.has("manifest.json"))
+            throw std::runtime_error("not a QVF archive (no manifest.json): " + in);
+        const std::vector<uint8_t> manifest = zip.read("manifest.json", lim.max_json_bytes);
+        const Json m =
+            Json::parse(std::string(manifest.begin(), manifest.end()), lim.max_json_depth);
+        std::set<std::string> referenced;
+        if (m.is_object() && m.has("sections") && m.at("sections").is_array())
+            for (const Json& s : m.at("sections").elements())
+                if (s.is_object() && s.has("members") && s.at("members").is_object())
+                    for (const auto& mv : s.at("members").items())
+                        if (mv.second.is_object() && mv.second.has("path") &&
+                            mv.second.at("path").is_string())
+                            referenced.insert(mv.second.at("path").as_string());
+        container::ZipWriter w{
+            std::unique_ptr<container::Sink>(new container::FileSink(target))};
+        const uint64_t kWhole = uint64_t(16) << 20;   // larger members are streamed
+        for (const container::ZipEntry& e : zip.entries()) {
+            if (e.name == "manifest.json" || !referenced.count(e.name)) continue;
+            const container::Method method =
+                e.method == 0 ? container::Method::Store : container::Method::Deflate;
+            if (e.usize <= kWhole) {
+                w.write(e.name, zip.read(e.name, lim), method, e.zip64);
+            } else {
+                const bool zip64 = e.zip64 || e.usize >= 0xFFFFFFFFull - e.usize / 4096 - 65536;
+                container::EntrySink sink = w.begin(e.name, method, zip64);
+                zip.read_into(e.name, [&sink](const uint8_t* p, size_t n) { sink.write(p, n); },
+                              lim);
+                sink.close();
+            }
+        }
+        w.write("manifest.json", manifest, container::Method::Store);
+        w.finish();
+    }
+    if (in_place) {
+        std::filesystem::remove(out);
+        std::filesystem::rename(target, out);
+    }
 }
 
 }  // namespace qvf
@@ -2600,8 +13994,15 @@ std::string QvfWriter::write(const std::string& path) {
 
 // qvf_reader.cpp — implementation of the QVF C++ reader. License: Apache-2.0.
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
+#include <map>
+#include <set>
 #include <stdexcept>
 
 
@@ -2615,12 +14016,2944 @@ static size_t dtype_itemsize(const std::string& d) {
     return 0;
 }
 
-struct QvfReader::Impl {
-    detail::ZipReader zip;
+// --- validation helpers (spec § 6, Appendix B) ------------------------------
+namespace detail {
+namespace vld {
+
+// Canonical kinds (the schema's Section.oneOf branches), from the tables
+// generated from the schema (qvf/kinds_generated.hpp); a vendor kind
+// (x_<...>) is always accepted.
+inline bool is_canonical_kind(const std::string& k) { return gen::is_canonical_kind(k); }
+
+// A one-dimensional spectrum kind: its `spectrum` member is a SpectrumPayload.
+inline bool is_spectrum_1d(const std::string& kind) {
+    return gen::payload_def(kind, "spectrum") == "SpectrumPayload";
+}
+
+inline bool starts_with(const std::string& s, const char* prefix) {
+    return s.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+inline std::string quote_str(const std::string& s) { return "'" + s + "'"; }
+
+inline std::string format_number(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%g", v);
+    return buf;
+}
+
+// Compact rendering of a JSON value for messages.
+inline std::string show(const Json& j) {
+    std::string s;
+    try {
+        s = j.dump(0);
+    } catch (const std::exception&) {
+        return "<value>";
+    }
+    if (s.size() > 80) s = s.substr(0, 77) + "...";
+    return s;
+}
+
+// The value of `key` when `obj` is an object that has it (null included).
+inline const Json* get(const Json& obj, const std::string& key) {
+    if (!obj.is_object() || !obj.contains(key)) return nullptr;
+    return &obj.at(key);
+}
+
+// Python-style truthiness, so both reference validators agree on loosely
+// typed flags (`critical`) and non-empty checks (`source.program`).
+inline bool truthy(const Json& j) {
+    switch (j.type()) {
+        case Json::Type::Null: return false;
+        case Json::Type::Bool: return j.as_bool();
+        case Json::Type::Int:
+        case Json::Type::Double: return j.as_double() != 0.0;
+        case Json::Type::String:
+        case Json::Type::Raw: return !j.as_string().empty();
+        case Json::Type::Array:
+        case Json::Type::Object: return j.size() != 0;
+    }
+    return false;
+}
+
+// JSON Pointer (RFC 6901) pieces into manifest.json.
+inline std::string escape_pointer(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '~') out += "~0";
+        else if (c == '/') out += "~1";
+        else out.push_back(c);
+    }
+    return out;
+}
+inline std::string section_pointer(size_t i) {
+    return "/sections/" + std::to_string(i);
+}
+inline std::string member_pointer(size_t i, const std::string& role) {
+    return section_pointer(i) + "/members/" + escape_pointer(role);
+}
+
+// Why a member path / ZIP entry name is illegal (spec § 2.1); empty if legal.
+inline std::string path_problem(const std::string& p) {
+    if (p.find('\\') != std::string::npos) return "contains a backslash";
+    if (p.find('\0') != std::string::npos) return "contains a NUL character";
+    if (!p.empty() && p[0] == '/') return "begins with '/'";
+    if (p.size() >= 2 && p[1] == ':' &&
+        ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')))
+        return "begins with a drive letter";
+    size_t start = 0;
+    while (true) {
+        size_t slash = p.find('/', start);
+        size_t len = slash == std::string::npos ? std::string::npos : slash - start;
+        if (p.compare(start, len, "..") == 0) return "contains a '..' segment";
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return "";
+}
+
+// Strict UTF-8 (no overlongs, no surrogates, nothing above U+10FFFF), the
+// same acceptance as Python's bytes.decode("utf-8").
+inline bool valid_utf8(const std::vector<uint8_t>& s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        uint8_t c = s[i];
+        if (c < 0x80) { ++i; continue; }
+        size_t len;
+        uint32_t cp, min;
+        if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1Fu; min = 0x80; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0Fu; min = 0x800; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07u; min = 0x10000; }
+        else return false;
+        if (len > n - i) return false;
+        for (size_t k = 1; k < len; ++k) {
+            if ((s[i + k] & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (s[i + k] & 0x3Fu);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+        i += len;
+    }
+    return true;
+}
+
+class Sink {
+public:
+    explicit Sink(std::vector<Finding>& out) : out_(out) {}
+    void error(const char* code, std::string where, std::string message) {
+        out_.push_back(Finding{Finding::Severity::Error, code, std::move(where),
+                               std::move(message)});
+    }
+    void warning(const char* code, std::string where, std::string message) {
+        out_.push_back(Finding{Finding::Severity::Warning, code, std::move(where),
+                               std::move(message)});
+    }
+
+private:
+    std::vector<Finding>& out_;
+};
+
+// Semantic checks on a `structure` payload (spec § 5.1); mirrors
+// _structure_payload_errors() in python/qvf_reader.py.
+inline std::vector<std::string> structure_payload_errors(const std::string& sid,
+                                                         const Json& payload) {
+    std::vector<std::string> errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    if (!payload.is_object()) {
+        errs.push_back(sec + "structure payload must be a JSON object");
+        return errs;
+    }
+    auto non_null = [&](const char* key) -> const Json* {
+        const Json* v = get(payload, key);
+        return v && !v->is_null() ? v : nullptr;
+    };
+    const Json* pbc = non_null("pbc");
+    const Json* lattice = non_null("lattice_vectors");
+    const Json* dim = non_null("dimensionality");
+
+    if (dim && !dim->is_number()) {
+        errs.push_back(sec + "dimensionality must be an integer, got " + show(*dim) +
+                       " (spec § 5.1)");
+        dim = nullptr;
+    }
+    if (!pbc) {
+        if (lattice)
+            errs.push_back(sec + "structure payload has lattice_vectors but no "
+                                 "'pbc'; pbc is REQUIRED for periodic structures "
+                                 "(spec § 5.1)");
+        if (dim && dim->as_double() != 0.0)
+            errs.push_back(sec + "dimensionality " + show(*dim) +
+                           " without 'pbc'; absent pbc means a molecule, so "
+                           "dimensionality must be 0 (spec § 5.1)");
+        return errs;
+    }
+    bool three_bools = pbc->is_array() && pbc->size() == 3;
+    int n_periodic = 0;
+    if (three_bools) {
+        for (const Json& x : pbc->elements()) {
+            if (!x.is_bool()) { three_bools = false; break; }
+            n_periodic += x.as_bool() ? 1 : 0;
+        }
+    }
+    if (!three_bools) {
+        errs.push_back(sec + "pbc must be three booleans, got " + show(*pbc));
+        return errs;
+    }
+    if (n_periodic && !(lattice && lattice->is_array()))
+        errs.push_back(sec + "pbc marks " + std::to_string(n_periodic) +
+                       " periodic axis/axes but lattice_vectors is " +
+                       (lattice ? "not an array" : "null or absent"));
+    if (dim && dim->as_double() != static_cast<double>(n_periodic))
+        errs.push_back(sec + "dimensionality " + show(*dim) + " != sum(pbc) " +
+                       std::to_string(n_periodic) + " (spec § 5.1 invariant)");
+    return errs;
+}
+
+// Every declared unit of a member payload (spec § 4.3, "Declared units"),
+// as (location inside the payload, value): each value of its `units` object,
+// for a one-dimensional spectrum x_units, y_units and broadening.units, the
+// `units` string of a volume.series `axis` member, and for excited_states
+// each value of meta.units. Mirrors _declared_units() in python/qvf_reader.py.
+inline std::vector<std::pair<std::string, const Json*>> declared_units(
+    const std::string& kind, const std::string& role, const Json& payload) {
+    std::vector<std::pair<std::string, const Json*>> out;
+    if (!payload.is_object()) return out;
+    if (const Json* units = get(payload, "units")) {
+        if (units->is_object())
+            for (const auto& kv : units->items())
+                out.emplace_back("units/" + kv.first, &kv.second);
+        else if (kind == "volume.series" && role == "axis")
+            out.emplace_back("units", units);
+    }
+    if (kind == "excited_states")
+        if (const Json* meta = get(payload, "meta"))
+            if (const Json* units = get(*meta, "units"))
+                if (units->is_object())
+                    for (const auto& kv : units->items())
+                        out.emplace_back("meta/units/" + kv.first, &kv.second);
+    if (!is_spectrum_1d(kind)) return out;
+    for (const char* key : {"x_units", "y_units"})
+        if (const Json* v = get(payload, key)) out.emplace_back(key, v);
+    if (const Json* b = get(payload, "broadening"))
+        if (const Json* v = get(*b, "units")) out.emplace_back("broadening/units", v);
+    return out;
+}
+
+// The equal-length rule of a 1-D `spectrum` payload (spec § 5.4):
+// `frequencies`, `intensities` and, when present, `x` have one shared length.
+// JSON Schema cannot say so, so this runs with or without the schema check.
+// Mirrors _spectrum_payload_errors() in python/qvf_reader.py.
+inline std::vector<std::string> spectrum_payload_errors(const std::string& sid,
+                                                        const Json* payload) {
+    std::vector<std::string> errs;
+    if (!payload || !payload->is_object()) return errs;
+    const Json* freqs = schema::find_last(*payload, "frequencies");
+    if (!freqs || !freqs->is_array()) return errs;
+    for (const char* key : {"intensities", "x"}) {
+        const Json* other = schema::find_last(*payload, key);
+        if (other && other->is_array() && other->size() != freqs->size())
+            errs.push_back("section " + quote_str(sid) + ": spectrum " + key + " has " +
+                           std::to_string(other->size()) + " entries but frequencies has " +
+                           std::to_string(freqs->size()) +
+                           "; they must have the same length (spec § 5.4)");
+    }
+    return errs;
+}
+
+// A member spec's `shape` when it is an array of non-negative integers.
+inline bool shape_of(const Json* member, std::vector<int64_t>& out) {
+    out.clear();
+    const Json* shape = member ? get(*member, "shape") : nullptr;
+    if (!shape || !shape->is_array()) return false;
+    for (const Json& d : shape->elements()) {
+        if (d.type() != Json::Type::Int || d.as_int() < 0) return false;
+        out.push_back(d.as_int());
+    }
+    return true;
+}
+
+// "[a, b, c]" for dims[from, to).
+inline std::string dims_str(const std::vector<int64_t>& dims, size_t from = 0,
+                            size_t to = static_cast<size_t>(-1)) {
+    std::string s = "[";
+    for (size_t k = from; k < dims.size() && k < to; ++k) {
+        if (k > from) s += ", ";
+        s += std::to_string(dims[k]);
+    }
+    return s + "]";
+}
+
+// Spin-axis agreement of a `bands` section's binary members (spec § 5.6),
+// checked from the manifest alone; mirrors _bands_shape_errors() in
+// python/qvf_reader.py. Returns (role, message) pairs.
+inline std::vector<std::pair<std::string, std::string>> bands_shape_errors(
+    const std::string& sid, const Json& members) {
+    std::vector<std::pair<std::string, std::string>> errs;
+    std::vector<int64_t> eig, proj, occ;
+    if (!shape_of(get(members, "eigenvalues"), eig) || eig.size() != 3) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    if (shape_of(get(members, "projections"), proj)) {
+        if (proj.size() == 4 && !std::equal(eig.begin(), eig.end(), proj.begin()))
+            errs.emplace_back("projections",
+                              sec + "projections shape " + dims_str(proj) +
+                                  " has [n_spin, n_k, n_bands] = " + dims_str(proj, 0, 3) +
+                                  ", but eigenvalues is " + dims_str(eig) + " (spec § 5.6)");
+        else if (proj.size() == 3 && (proj[0] != eig[1] || proj[1] != eig[2]))
+            errs.emplace_back("projections",
+                              sec + "rank-3 projections shape " + dims_str(proj) +
+                                  " has [n_k, n_bands] = " + dims_str(proj, 0, 2) +
+                                  ", but eigenvalues has " + dims_str(eig, 1) +
+                                  " (spec § 5.6)");
+    }
+    if (shape_of(get(members, "occupations"), occ) && occ.size() == 3 && occ != eig)
+        errs.emplace_back("occupations",
+                          sec + "occupations shape " + dims_str(occ) +
+                              " differs from eigenvalues " + dims_str(eig) +
+                              "; both are [n_spin, n_k, n_bands] (spec § 5.6)");
+    return errs;
+}
+
+// --- trajectory / reaction.path (spec § 5.5) ----------------------------------
+
+// Largest allowed difference, in hartree, between the binary `energies` member
+// of a trajectory or reaction path and its metadata.energies.
+constexpr double kTrajectoryEnergyToleranceEh = 1e-10;
+
+inline bool is_trajectory_kind(const std::string& kind) {
+    return kind == "trajectory" || kind == "reaction.path";
+}
+
+// The values of a rank-1 float64 member whose byte length matches its shape,
+// decoded little-endian; false for anything else.
+inline bool float64_values(const Json* member, const std::vector<uint8_t>* bytes,
+                           std::vector<double>& out) {
+    std::vector<int64_t> shape;
+    const Json* dtype = member ? get(*member, "dtype") : nullptr;
+    if (!bytes || !dtype || !dtype->is_string() || dtype->as_string() != "float64" ||
+        !shape_of(member, shape) || shape.size() != 1 ||
+        bytes->size() != 8 * static_cast<uint64_t>(shape[0]))
+        return false;
+    out.assign(static_cast<size_t>(shape[0]), 0.0);
+    for (size_t k = 0; k < out.size(); ++k) {
+        uint64_t bits = 0;
+        for (int b = 7; b >= 0; --b) bits = (bits << 8) | (*bytes)[8 * k + b];
+        std::memcpy(&out[k], &bits, 8);
+    }
+    return true;
+}
+
+// Shape and consistency rules of a `trajectory` or `reaction.path` section:
+// coords float32 only with metadata.precision "float32" (and precision, when
+// present, naming the dtype); against a [n_frames, n_atoms, 3] coords (another
+// rank is left to the schema), velocities and gradient [n_frames, n_atoms, 3]; times and energies (and, for a trajectory,
+// cell_volumes and temperatures) [n_frames]; lattice [3, 3] or
+// [n_frames, 3, 3], each kind's lattice read in its own convention (§ 4.3)
+// but checked here by shape only; the binary energies equal to
+// metadata.energies within 1e-10 hartree; a trajectory lattice needs
+// metadata.pbc and a true pbc entry needs the lattice. Rules that need the
+// metadata are skipped when it could not be read. Mirrors _trajectory_errors()
+// in python/qvf_reader.py. Returns (role, message) pairs.
+inline std::vector<std::pair<std::string, std::string>> trajectory_errors(
+    const std::string& sid, const std::string& kind, const Json& members,
+    const Json* metadata, const std::vector<uint8_t>* energies_bytes) {
+    std::vector<std::pair<std::string, std::string>> errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    const Json* meta = metadata && metadata->is_object() ? metadata : nullptr;
+    const Json* coords_spec = get(members, "coords");
+    const Json* dtype = coords_spec ? get(*coords_spec, "dtype") : nullptr;
+    if (meta && dtype && dtype->is_string() &&
+        (dtype->as_string() == "float32" || dtype->as_string() == "float64")) {
+        const Json* p = get(*meta, "precision");
+        const bool f32 = p && p->is_string() && p->as_string() == "float32";
+        if (dtype->as_string() == "float32" && !f32)
+            errs.emplace_back("coords", sec + "coords are float32 but metadata.precision is " +
+                                            (p ? show(*p) : std::string("absent")) +
+                                            "; float32 coords require precision 'float32' "
+                                            "(spec § 5.5)");
+        else if (dtype->as_string() == "float64" && f32)
+            errs.emplace_back("coords", sec + "metadata.precision is 'float32' but coords are "
+                                            "float64; precision must name the dtype of "
+                                            "coords (spec § 5.5)");
+    }
+    // A coords shape of another rank is left to the schema; the extents below
+    // are only compared against a [n_frames, n_atoms, 3] coords.
+    std::vector<int64_t> coords, shape;
+    if (shape_of(coords_spec, coords) && coords.size() == 3 && coords[2] == 3) {
+        const std::vector<int64_t> vectors = {coords[0], coords[1], 3};
+        const std::vector<int64_t> scalars = {coords[0]};
+        for (const char* role : {"velocities", "gradient"})
+            if (shape_of(get(members, role), shape) && shape != vectors)
+                errs.emplace_back(role, sec + role + " shape " + dims_str(shape) +
+                                            " is not [n_frames, n_atoms, 3] = " +
+                                            dims_str(vectors) +
+                                            ", the extents of coords (spec § 5.5)");
+        const bool trajectory = kind == "trajectory";
+        for (const char* role : {"times", "energies", "cell_volumes", "temperatures"}) {
+            const std::string r = role;
+            if (!trajectory && (r == "cell_volumes" || r == "temperatures")) continue;
+            if (shape_of(get(members, role), shape) && shape != scalars)
+                errs.emplace_back(role, sec + role + " shape " + dims_str(shape) +
+                                            " is not [n_frames] = " + dims_str(scalars) +
+                                            ", the frames of coords (spec § 5.5)");
+        }
+        const std::vector<int64_t> fixed = {3, 3};
+        const std::vector<int64_t> per_frame = {coords[0], 3, 3};
+        if (shape_of(get(members, "lattice"), shape) && shape != fixed && shape != per_frame)
+            errs.emplace_back("lattice", sec + "lattice shape " + dims_str(shape) +
+                                             " is neither [3, 3] nor [n_frames, 3, 3] = " +
+                                             dims_str(per_frame) + " (spec § 5.5)");
+    }
+    if (meta) {
+        std::vector<double> binary;
+        const Json* listed = get(*meta, "energies");
+        bool numbers = listed && listed->is_array();
+        if (numbers)
+            for (const Json& x : listed->elements()) numbers = numbers && x.is_number();
+        if (numbers && float64_values(get(members, "energies"), energies_bytes, binary)) {
+            if (listed->size() != binary.size()) {
+                errs.emplace_back("energies",
+                                  sec + "the energies member has " +
+                                      std::to_string(binary.size()) +
+                                      " values but metadata.energies has " +
+                                      std::to_string(listed->size()) +
+                                      "; they must agree (spec § 5.5)");
+            } else {
+                size_t bad = 0, first = 0;
+                for (size_t k = 0; k < binary.size(); ++k)
+                    if (!(std::fabs(binary[k] - listed->at(k).as_double()) <=
+                          kTrajectoryEnergyToleranceEh)) {
+                        if (!bad) first = k;
+                        ++bad;
+                    }
+                if (bad)
+                    errs.emplace_back(
+                        "energies",
+                        sec + "the energies member disagrees with metadata.energies at " +
+                            std::to_string(bad) + " frame(s), first frame " +
+                            std::to_string(first) + ": " + format_number(binary[first]) +
+                            " vs " + format_number(listed->at(first).as_double()) +
+                            " hartree; they must agree within 1e-10 hartree (spec § 5.5)");
+            }
+        }
+    }
+    if (kind == "trajectory" && meta) {
+        const Json* pbc = get(*meta, "pbc");
+        const bool has_lattice = members.contains("lattice");
+        bool periodic = false;
+        if (pbc && pbc->is_array())
+            for (const Json& x : pbc->elements())
+                if (x.is_bool() && x.as_bool()) periodic = true;
+        if (has_lattice && (!pbc || pbc->is_null()))
+            errs.emplace_back("metadata", sec + "the section has a lattice member but its "
+                                                "metadata has no pbc; pbc is REQUIRED when "
+                                                "lattice is present (spec § 5.5)");
+        else if (periodic && !has_lattice)
+            errs.emplace_back("metadata", sec + "metadata.pbc " + show(*pbc) +
+                                              " marks a periodic axis but the section has "
+                                              "no lattice member (spec § 5.5)");
+    }
+    return errs;
+}
+
+// --- root energies (spec § 3.6) ---------------------------------------------
+
+// Largest allowed difference, in hartree, between two root statements of one
+// energy.
+constexpr double kEnergyToleranceEh = 1e-8;
+
+inline std::string ascii_lower(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+// Hartree per unit for the energy units the root consistency check converts
+// (CODATA 2018); false for any other unit. Mirrors _HARTREE_PER_UNIT in
+// python/qvf_reader.py.
+inline bool hartree_per_unit(const std::string& unit, double& factor) {
+    const std::string u = ascii_lower(unit);
+    if (u == "hartree" || u == "eh" || u == "ha") factor = 1.0;
+    else if (u == "ev") factor = 1.0 / 27.211386245988;
+    else if (u == "kcal_per_mol") factor = 1.0 / 627.5094740631;
+    else if (u == "kj_per_mol") factor = 1.0 / 2625.4996394799;
+    else return false;
+    return true;
+}
+
+// A {value, units} energy in hartree; false when it is malformed or its unit
+// is not one the check converts.
+inline bool energy_eh(const Json* energy, double& out) {
+    if (!energy || !energy->is_object()) return false;
+    const Json* value = get(*energy, "value");
+    const Json* units = get(*energy, "units");
+    double factor = 0.0;
+    if (!value || !value->is_number() || !units || !units->is_string() ||
+        !hartree_per_unit(units->as_string(), factor))
+        return false;
+    out = value->as_double() * factor;
+    return true;
+}
+
+inline std::string fixed10(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.10f", v);
+    return buf;
+}
+
+// Root blocks that state one energy twice must agree: every `energies` total
+// stated for the method provenance.method names against provenance.scf_energy,
+// and energies.components.zpve against thermochemistry.zpve_eh. Mirrors
+// _root_consistency_errors() in python/qvf_reader.py. Returns (where, message).
+inline std::vector<std::pair<std::string, std::string>> root_consistency_errors(
+    const Json& manifest) {
+    std::vector<std::pair<std::string, std::string>> errs;
+    const Json* energies = get(manifest, "energies");
+    if (!energies || !energies->is_object()) return errs;
+    auto compare = [&](const std::string& where, const std::string& label,
+                       const Json* got_json, double ref, const std::string& ref_label) {
+        double got = 0.0;
+        if (energy_eh(got_json, got) && std::fabs(got - ref) > kEnergyToleranceEh)
+            errs.emplace_back(where, label + " is " + fixed10(got) + " hartree but " +
+                                         ref_label + " is " + fixed10(ref) +
+                                         " hartree; they state one energy and must "
+                                         "agree within 1e-8 hartree (spec § 3.6)");
+    };
+    const Json* prov = get(manifest, "provenance");
+    const Json* method = prov ? get(*prov, "method") : nullptr;
+    double scf = 0.0;
+    if (method && method->is_string() && energy_eh(get(*prov, "scf_energy"), scf)) {
+        const std::string key = ascii_lower(method->as_string());
+        const std::string ref_label =
+            "provenance.scf_energy (method " + quote_str(method->as_string()) + ")";
+        const Json* em = get(*energies, "method");
+        if (em && em->is_string() && ascii_lower(em->as_string()) == key)
+            compare("/energies/total", "energies.total", get(*energies, "total"), scf,
+                    ref_label);
+        const Json* by = get(*energies, "by_method");
+        if (by && by->is_array()) {
+            size_t k = 0;
+            for (const Json& entry : by->elements()) {
+                const Json* m = get(entry, "method");
+                if (m && m->is_string() && ascii_lower(m->as_string()) == key)
+                    compare("/energies/by_method/" + std::to_string(k) + "/total",
+                            "energies.by_method[" + std::to_string(k) + "].total",
+                            get(entry, "total"), scf, ref_label);
+                ++k;
+            }
+        }
+    }
+    const Json* thermo = get(manifest, "thermochemistry");
+    const Json* zpve = thermo ? get(*thermo, "zpve_eh") : nullptr;
+    const Json* components = get(*energies, "components");
+    if (zpve && zpve->is_number() && components && components->is_object())
+        compare("/energies/components/zpve", "energies.components.zpve",
+                get(*components, "zpve"), zpve->as_double(), "thermochemistry.zpve_eh");
+    return errs;
+}
+
+// --- forces / hessian (spec § 5.10, § 5.11) ------------------------------------
+
+struct RoleFinding {
+    const char* code;
+    std::string role, message;
+};
+
+// Shape and reference rules of a `forces` or `hessian` section: gradient
+// [n_atoms, 3], stress [3, 3], matrix square with an extent 3N divisible by 3,
+// meta.atom_masses_amu with N entries, and n_atoms / N equal to the atom count
+// of the section's structure when that resolves (the section-level
+// structure_ref, else meta.structure_ref, else the only structure section). A
+// meta.structure_ref must name a structure section. Mirrors
+// _derivative_errors() in python/qvf_reader.py.
+inline std::vector<RoleFinding> derivative_errors(
+    const std::string& sid, const std::string& kind, const Json& section,
+    const Json* members, const Json* meta,
+    const std::map<std::string, int64_t>& n_atoms_of,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::string* only_structure) {
+    std::vector<RoleFinding> errs;
+    if (!members || !members->is_object()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    const Json no_meta = Json::object();
+    const Json& m = meta && meta->is_object() ? *meta : no_meta;
+    const Json* meta_ref = get(m, "structure_ref");
+    if (meta_ref) {
+        auto it = meta_ref->is_string() ? kinds_by_id.find(meta_ref->as_string())
+                                        : kinds_by_id.end();
+        if (it == kinds_by_id.end() || it->second != "structure")
+            errs.push_back({"E_REF_UNRESOLVED", "meta",
+                            sec + "meta.structure_ref " + show(*meta_ref) +
+                                " does not name a structure section (spec § 5.10)"});
+    }
+    bool have_structure = false;
+    std::string structure;
+    if (const Json* ref = get(section, "structure_ref")) {
+        if (ref->is_string()) {
+            have_structure = true;
+            structure = ref->as_string();
+        }
+    } else if (meta_ref && meta_ref->is_string()) {
+        have_structure = true;
+        structure = meta_ref->as_string();
+    } else if (only_structure) {
+        have_structure = true;
+        structure = *only_structure;
+    }
+    bool have_n = false;
+    int64_t n_struct = 0;
+    if (have_structure) {
+        auto it = n_atoms_of.find(structure);
+        if (it != n_atoms_of.end()) {
+            have_n = true;
+            n_struct = it->second;
+        }
+    }
+
+    std::vector<int64_t> shape;
+    if (kind == "forces") {
+        if (shape_of(get(*members, "gradient"), shape)) {
+            if (shape.size() != 2 || shape[1] != 3)
+                errs.push_back({"E_MEMBER_MALFORMED", "gradient",
+                                sec + "gradient shape " + dims_str(shape) +
+                                    " is not [n_atoms, 3] (spec § 5.10)"});
+            else if (have_n && shape[0] != n_struct)
+                errs.push_back({"E_MEMBER_MALFORMED", "gradient",
+                                sec + "gradient has " + std::to_string(shape[0]) +
+                                    " rows but structure " + quote_str(structure) +
+                                    " has " + std::to_string(n_struct) +
+                                    " atoms (spec § 5.10)"});
+        }
+        if (shape_of(get(*members, "stress"), shape) &&
+            (shape.size() != 2 || shape[0] != 3 || shape[1] != 3))
+            errs.push_back({"E_MEMBER_MALFORMED", "stress",
+                            sec + "stress shape " + dims_str(shape) +
+                                " is not [3, 3] (spec § 5.10)"});
+        return errs;
+    }
+
+    if (!shape_of(get(*members, "matrix"), shape)) return errs;
+    if (shape.size() != 2 || shape[0] != shape[1]) {
+        errs.push_back({"E_MEMBER_MALFORMED", "matrix",
+                        sec + "matrix shape " + dims_str(shape) +
+                            " is not square (spec § 5.11)"});
+        return errs;
+    }
+    if (shape[0] % 3 != 0) {
+        errs.push_back({"E_MEMBER_MALFORMED", "matrix",
+                        sec + "matrix extent " + std::to_string(shape[0]) +
+                            " is not divisible by 3, so the matrix is not [3N, 3N] "
+                            "(spec § 5.11)"});
+        return errs;
+    }
+    const int64_t n = shape[0] / 3;
+    if (have_n && n != n_struct)
+        errs.push_back({"E_MEMBER_MALFORMED", "matrix",
+                        sec + "matrix " + dims_str(shape) + " is for " +
+                            std::to_string(n) + " atoms but structure " +
+                            quote_str(structure) + " has " + std::to_string(n_struct) +
+                            " atoms (spec § 5.11)"});
+    const Json* masses = get(m, "atom_masses_amu");
+    if (masses && masses->is_array() && static_cast<int64_t>(masses->size()) != n)
+        errs.push_back({"E_MEMBER_MALFORMED", "meta",
+                        sec + "meta.atom_masses_amu has " +
+                            std::to_string(masses->size()) +
+                            " entries but the matrix is for " + std::to_string(n) +
+                            " atoms (spec § 5.11)"});
+    return errs;
+}
+
+// --- wavefunction.bloch (spec § 5.3.1) ----------------------------------------
+
+// Largest allowed difference between 1 and the sum of the k-point weights.
+constexpr double kBlochWeightTolerance = 1e-6;
+
+// A JSON number with an integral value (2 or 2.0).
+inline bool is_integral(const Json* j) {
+    if (!j || !j->is_number()) return false;
+    const double v = j->as_double();
+    return std::isfinite(v) && std::floor(v) == v;
+}
+
+// Shape and structure rules of a `wavefunction.bloch` section that JSON Schema
+// cannot express: mo_coefficients [n_k, n_spin, n_mo, n_ao, 2] with n_spin 1
+// or 2; energies and occupations with its [n_k, n_spin, n_mo] (each other's
+// when the coefficients are malformed); n_k k-points, labels and weights in
+// the kpoints payload, the weights summing to 1 within 1e-6; mo_metadata
+// n_spin (1 for restricted, 2 for unrestricted), n_mo, n_ao and n_mo_per_k,
+// and basis.n_ao, agreeing with those axes; a structure (the section-level
+// structure_ref, else basis.structure_ref) with at least one periodic axis.
+// Mirrors _bloch_errors() in python/qvf_reader.py. The `role` of each finding
+// is its location relative to the section: "members/<role>" or
+// "structure_ref".
+inline std::vector<RoleFinding> bloch_errors(
+    const std::string& sid, const Json& section, const Json* members,
+    const std::map<std::string, Json>& docs,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, bool>& periodic_of) {
+    std::vector<RoleFinding> errs;
+    if (!members || !members->is_object()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    auto err = [&](const char* code, const std::string& where, const std::string& msg) {
+        errs.push_back({code, where, sec + msg + " (spec § 5.3.1)"});
+    };
+    auto doc = [&](const char* role) -> const Json* {
+        auto it = docs.find(role);
+        return it == docs.end() || !it->second.is_object() ? nullptr : &it->second;
+    };
+
+    std::vector<int64_t> coeff, ref, shape;
+    bool have_coeff = shape_of(get(*members, "mo_coefficients"), coeff);
+    if (have_coeff && (coeff.size() != 5 || coeff[4] != 2 || coeff[1] < 1 || coeff[1] > 2)) {
+        err("E_MEMBER_MALFORMED", "members/mo_coefficients",
+            "mo_coefficients shape " + dims_str(coeff) +
+                " is not [n_k, n_spin, n_mo, n_ao, 2] with n_spin 1 or 2");
+        have_coeff = false;
+    }
+    bool have_ref = have_coeff;
+    std::string ref_role = "mo_coefficients";
+    if (have_coeff) ref.assign(coeff.begin(), coeff.begin() + 3);
+    for (const char* role : {"energies", "occupations"}) {
+        if (!shape_of(get(*members, role), shape)) continue;
+        const std::string name = role;
+        if (shape.size() != 3) {
+            err("E_MEMBER_MALFORMED", "members/" + name,
+                name + " shape " + dims_str(shape) + " is not [n_k, n_spin, n_mo]");
+        } else if (!have_ref) {
+            ref = shape;
+            ref_role = name;
+            have_ref = true;
+        } else if (shape != ref) {
+            err("E_MEMBER_MALFORMED", "members/" + name,
+                name + " shape " + dims_str(shape) +
+                    " differs from the [n_k, n_spin, n_mo] = " + dims_str(ref) + " of " +
+                    ref_role);
+        }
+    }
+
+    if (const Json* kp = doc("kpoints")) {
+        const Json* points = get(*kp, "kpoints");
+        const bool have_nk = points && points->is_array();
+        const int64_t n_k = have_nk ? static_cast<int64_t>(points->size()) : 0;
+        if (have_nk && have_ref && n_k != ref[0])
+            err("E_MEMBER_MALFORMED", "members/kpoints",
+                "kpoints lists " + std::to_string(n_k) + " k-points but axis 0 of " +
+                    ref_role + " is " + std::to_string(ref[0]));
+        for (const char* key : {"weights", "labels"}) {
+            const Json* arr = get(*kp, key);
+            if (arr && arr->is_array() && have_nk && static_cast<int64_t>(arr->size()) != n_k)
+                err("E_MEMBER_MALFORMED", "members/kpoints",
+                    std::string("kpoints.") + key + " has " + std::to_string(arr->size()) +
+                        " entries for " + std::to_string(n_k) + " k-points");
+        }
+        const Json* weights = get(*kp, "weights");
+        if (weights && weights->is_array()) {
+            bool numbers = true;
+            double sum = 0.0;
+            for (const Json& x : weights->elements()) {
+                if (!x.is_number()) {
+                    numbers = false;
+                    break;
+                }
+                sum += x.as_double();
+            }
+            if (numbers && std::fabs(sum - 1.0) > kBlochWeightTolerance)
+                err("E_MEMBER_MALFORMED", "members/kpoints",
+                    "kpoints.weights sum to " + format_number(sum) +
+                        ", not to 1 within 1e-6");
+        }
+    }
+
+    if (const Json* meta = doc("mo_metadata")) {
+        const Json* spin = get(*meta, "spin");
+        const Json* n_spin = get(*meta, "n_spin");
+        int64_t want = 0;
+        if (spin && spin->is_string()) {
+            if (spin->as_string() == "restricted") want = 1;
+            else if (spin->as_string() == "unrestricted") want = 2;
+        }
+        if (want && is_integral(n_spin) && n_spin->as_double() != static_cast<double>(want))
+            err("E_MEMBER_MALFORMED", "members/mo_metadata",
+                "mo_metadata.spin " + show(*spin) + " has n_spin " + std::to_string(want) +
+                    ", not " + show(*n_spin));
+        static const struct {
+            const char* key;
+            size_t axis;
+            bool of_coeff;
+        } kAxes[] = {{"n_spin", 1, false}, {"n_mo", 2, false}, {"n_ao", 3, true}};
+        for (const auto& a : kAxes) {
+            const Json* v = get(*meta, a.key);
+            const bool have = a.of_coeff ? have_coeff : have_ref;
+            const std::vector<int64_t>& dims = a.of_coeff ? coeff : ref;
+            if (is_integral(v) && have &&
+                v->as_double() != static_cast<double>(dims[a.axis]))
+                err("E_MEMBER_MALFORMED", "members/mo_metadata",
+                    std::string("mo_metadata.") + a.key + " is " + show(*v) + " but axis " +
+                        std::to_string(a.axis) + " of " +
+                        (a.of_coeff ? std::string("mo_coefficients") : ref_role) + " is " +
+                        std::to_string(dims[a.axis]));
+        }
+        const Json* per_k = get(*meta, "n_mo_per_k");
+        if (per_k && per_k->is_array()) {
+            if (have_ref && static_cast<int64_t>(per_k->size()) != ref[0])
+                err("E_MEMBER_MALFORMED", "members/mo_metadata",
+                    "mo_metadata.n_mo_per_k has " + std::to_string(per_k->size()) +
+                        " entries but axis 0 of " + ref_role + " is " +
+                        std::to_string(ref[0]));
+            bool have_n_mo = have_ref;
+            double n_mo = have_ref ? static_cast<double>(ref[2]) : 0.0;
+            if (!have_ref && is_integral(get(*meta, "n_mo"))) {
+                have_n_mo = true;
+                n_mo = get(*meta, "n_mo")->as_double();
+            }
+            if (have_n_mo)
+                for (const Json& x : per_k->elements())
+                    if (x.is_number() && x.as_double() > n_mo) {
+                        err("E_MEMBER_MALFORMED", "members/mo_metadata",
+                            "mo_metadata.n_mo_per_k has an entry above n_mo = " +
+                                format_number(n_mo));
+                        break;
+                    }
+        }
+    }
+
+    const Json* basis = doc("basis");
+    if (basis && have_coeff) {
+        const Json* n_ao = get(*basis, "n_ao");
+        if (is_integral(n_ao) && n_ao->as_double() != static_cast<double>(coeff[3]))
+            err("E_MEMBER_MALFORMED", "members/basis",
+                "basis.n_ao is " + show(*n_ao) + " but axis 3 of mo_coefficients is " +
+                    std::to_string(coeff[3]));
+    }
+
+    std::string structure, where;
+    auto names_structure = [&](const Json* r) {
+        if (!r || !r->is_string()) return false;
+        auto it = kinds_by_id.find(r->as_string());
+        return it != kinds_by_id.end() && it->second == "structure";
+    };
+    if (const Json* r = get(section, "structure_ref")) {
+        if (!names_structure(r)) return errs;   // reported by the generic rule (§ 4.1)
+        structure = r->as_string();
+        where = "structure_ref";
+    } else if (basis) {
+        const Json* r = get(*basis, "structure_ref");
+        where = "members/basis";
+        if (!names_structure(r)) {
+            err("E_REF_UNRESOLVED", where,
+                "basis.structure_ref " + (r ? show(*r) : std::string("nothing")) +
+                    " does not name a structure section");
+            return errs;
+        }
+        structure = r->as_string();
+    } else {
+        return errs;   // no basis payload: its own finding says why
+    }
+    auto it = periodic_of.find(structure);
+    if (it != periodic_of.end() && !it->second)
+        err("E_MEMBER_MALFORMED", where,
+            "structure " + quote_str(structure) +
+                " has no periodic axis; Bloch orbitals need a periodic structure");
+    return errs;
+}
+
+// A wavefunction.bloch section, checked after every structure has been read.
+struct BlochSection {
+    size_t index;
+    std::string sid;
+    const Json* section;
+    const Json* members;
+    std::map<std::string, Json> docs;
+};
+
+// A forces / hessian section, checked after every structure has been read.
+struct DerivativeSection {
+    size_t index;
+    std::string sid, kind;
+    const Json* section;
+    const Json* members;
+    bool has_meta;
+    Json meta;
+};
+// --- excited states, the spectra that name them, transition densities ---------
+// (spec § 5.2, § 5.4, § 5.12); mirrors _excited_states_errors(),
+// _spectrum_states_errors() and _transition_density_errors() in
+// python/qvf_reader.py.
+
+inline bool is_int(const Json* j) { return j && j->type() == Json::Type::Int; }
+
+// Orbital rows of a wavefunction.gto section by channel, from the manifest
+// shapes: "" for mo_coefficients, "alpha" / "beta" for the unrestricted pair.
+using MoRows = std::map<std::string, int64_t>;
+
+inline MoRows mo_rows(const Json* members) {
+    MoRows rows;
+    if (!members || !members->is_object()) return rows;
+    static const struct {
+        const char* role;
+        const char* key;
+    } kRoles[] = {{"mo_coefficients", ""},
+                  {"mo_coefficients_alpha", "alpha"},
+                  {"mo_coefficients_beta", "beta"}};
+    std::vector<int64_t> shape;
+    for (const auto& r : kRoles)
+        if (shape_of(get(*members, r.role), shape) && !shape.empty()) rows[r.key] = shape[0];
+    return rows;
+}
+
+// The rows a contribution with `spin` may index: those of mo_coefficients,
+// else of the channel spin selects, else (no spin) of both channels.
+inline bool contribution_rows(const MoRows& rows, const Json* spin, int64_t& n) {
+    auto it = rows.find("");
+    if (it != rows.end()) {
+        n = it->second;
+        return true;
+    }
+    if (spin && spin->is_string() &&
+        (spin->as_string() == "alpha" || spin->as_string() == "beta")) {
+        auto c = rows.find(spin->as_string());
+        if (c == rows.end()) return false;
+        n = c->second;
+        return true;
+    }
+    bool any = false;
+    for (const char* ch : {"alpha", "beta"}) {
+        auto c = rows.find(ch);
+        if (c == rows.end()) continue;
+        n = any ? std::min(n, c->second) : c->second;
+        any = true;
+    }
+    return any;
+}
+
+// The `index` values of an excited_states payload's states; `known` is false
+// when the payload has no `states` array.
+struct StateIndices {
+    bool known = false;
+    std::set<int64_t> values;
+};
+
+inline StateIndices state_indices(const Json* payload) {
+    StateIndices out;
+    const Json* states = payload ? get(*payload, "states") : nullptr;
+    if (!states || !states->is_array()) return out;
+    out.known = true;
+    for (const Json& s : states->elements()) {
+        const Json* idx = get(s, "index");
+        if (is_int(idx)) out.values.insert(idx->as_int());
+    }
+    return out;
+}
+
+// A finding about a section field (`field` non-empty) or, with an empty
+// `field`, about the section's payload member.
+struct FieldFinding {
+    const char* code;
+    std::string field, message;
+};
+
+inline std::vector<FieldFinding> excited_states_errors(
+    const std::string& sid, const Json& section, const Json* payload,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, MoRows>& mo_rows_of) {
+    std::vector<FieldFinding> errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    auto kind_of = [&](const Json* ref) -> std::string {
+        if (!ref || !ref->is_string()) return "";
+        auto it = kinds_by_id.find(ref->as_string());
+        return it == kinds_by_id.end() ? "" : it->second;
+    };
+    bool have_wf = false;
+    std::string wf_ref;
+    if (const Json* ref = get(section, "wavefunction_ref")) {
+        if (kind_of(ref) != "wavefunction.gto")
+            errs.push_back({"E_REF_UNRESOLVED", "wavefunction_ref",
+                            sec + "wavefunction_ref " + show(*ref) +
+                                " does not name a wavefunction.gto section (spec § 5.12)"});
+        else {
+            have_wf = true;
+            wf_ref = ref->as_string();
+        }
+    }
+    const Json* states = payload ? get(*payload, "states") : nullptr;
+    if (!states || !states->is_array()) return errs;
+    MoRows rows;
+    if (have_wf) {
+        auto it = mo_rows_of.find(wf_ref);
+        if (it != mo_rows_of.end()) rows = it->second;
+    }
+    std::set<int64_t> seen;
+    bool have_prev = false;
+    int64_t prev = 0;
+    const std::vector<Json>& list = states->elements();
+    for (size_t k = 0; k < list.size(); ++k) {
+        const Json& state = list[k];
+        if (!state.is_object()) continue;
+        const std::string at = "states[" + std::to_string(k) + "]";
+        const Json* idx = get(state, "index");
+        if (is_int(idx)) {
+            const int64_t v = idx->as_int();
+            if (seen.count(v))
+                errs.push_back({"E_MEMBER_MALFORMED", "",
+                                sec + at + ".index " + std::to_string(v) +
+                                    " repeats an earlier index; state indices are unique "
+                                    "(spec § 5.12)"});
+            else if (have_prev && v < prev)
+                errs.push_back({"E_MEMBER_MALFORMED", "",
+                                sec + at + ".index " + std::to_string(v) + " follows index " +
+                                    std::to_string(prev) +
+                                    "; states are listed in ascending order of index "
+                                    "(spec § 5.12)"});
+            seen.insert(v);
+            prev = v;
+            have_prev = true;
+        }
+        if (const Json* ref = get(state, "nto_ref"))
+            if (kind_of(ref) != "wavefunction.gto")
+                errs.push_back({"E_REF_UNRESOLVED", "",
+                                sec + at + ".nto_ref " + show(*ref) +
+                                    " does not name a wavefunction.gto section (spec § 5.12)"});
+        if (const Json* ref = get(state, "density_ref")) {
+            const std::string k2 = kind_of(ref);
+            if (k2 != "volume.transition_density" && k2 != "volume.difference")
+                errs.push_back({"E_REF_UNRESOLVED", "",
+                                sec + at + ".density_ref " + show(*ref) +
+                                    " does not name a volume.transition_density or "
+                                    "volume.difference section (spec § 5.12)"});
+        }
+        const Json* contributions = get(state, "contributions");
+        if (!have_wf || !contributions || !contributions->is_array()) continue;
+        const std::vector<Json>& cs = contributions->elements();
+        for (size_t c = 0; c < cs.size(); ++c) {
+            if (!cs[c].is_object()) continue;
+            int64_t n = 0;
+            if (!contribution_rows(rows, get(cs[c], "spin"), n)) continue;
+            for (const char* key : {"from_mo", "to_mo"}) {
+                const Json* mo = get(cs[c], key);
+                if (is_int(mo) && (mo->as_int() < 0 || mo->as_int() >= n))
+                    errs.push_back({"E_MEMBER_MALFORMED", "",
+                                    sec + at + ".contributions[" + std::to_string(c) +
+                                        "]." + key + " " + std::to_string(mo->as_int()) +
+                                        " is not one of the " + std::to_string(n) +
+                                        " orbital rows of wavefunction " +
+                                        quote_str(wf_ref) + " (spec § 5.12)"});
+            }
+        }
+    }
+    const Json* meta = get(*payload, "meta");
+    const Json* n_states = meta ? get(*meta, "n_states") : nullptr;
+    if (is_int(n_states) && n_states->as_int() != static_cast<int64_t>(list.size()))
+        errs.push_back({"E_MEMBER_MALFORMED", "",
+                        sec + "meta.n_states is " + std::to_string(n_states->as_int()) +
+                            " but states has " + std::to_string(list.size()) +
+                            " entries (spec § 5.12)"});
+    return errs;
+}
+
+// A one-dimensional spectrum's states_ref names an excited_states section, and
+// every peaks[].assignment.state_index is the index of one of its states.
+inline std::vector<std::string> spectrum_states_errors(
+    const std::string& sid, const Json& payload,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, StateIndices>& indices_of) {
+    std::vector<std::string> errs;
+    const Json* ref = get(payload, "states_ref");
+    if (!ref) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    auto it = ref->is_string() ? kinds_by_id.find(ref->as_string()) : kinds_by_id.end();
+    if (it == kinds_by_id.end() || it->second != "excited_states") {
+        errs.push_back(sec + "spectrum states_ref " + show(*ref) +
+                       " does not name an excited_states section (spec § 5.4)");
+        return errs;
+    }
+    auto ix = indices_of.find(ref->as_string());
+    const Json* peaks = get(payload, "peaks");
+    if (ix == indices_of.end() || !ix->second.known || !peaks || !peaks->is_array())
+        return errs;
+    const std::vector<Json>& list = peaks->elements();
+    for (size_t k = 0; k < list.size(); ++k) {
+        const Json* assignment = get(list[k], "assignment");
+        const Json* state = assignment ? get(*assignment, "state_index") : nullptr;
+        if (is_int(state) && !ix->second.values.count(state->as_int()))
+            errs.push_back(sec + "peaks[" + std::to_string(k) + "].assignment.state_index " +
+                           std::to_string(state->as_int()) +
+                           " names no state of excited_states section " +
+                           quote_str(ref->as_string()) + " (spec § 5.4)");
+    }
+    return errs;
+}
+
+
+// --- property kinds (spec § 5.13) ----------------------------------------------
+
+inline bool is_property_kind(const std::string& kind) {
+    return kind == "properties.electric" || kind == "properties.elastic" ||
+           kind == "properties.dielectric";
+}
+
+// Largest allowed disagreement between two statements of one property: matrix
+// symmetry (relative to the largest entry), static against electronic + ionic,
+// and the electric dipole against the root dipole (debye).
+constexpr double kPropertyTolerance = 1e-6;
+
+// `v` as a rows x cols matrix of finite numbers, row-major in `out`; false when
+// it is anything else (the payload schema reports that). Mirrors _matrix_of()
+// in python/qvf_reader.py.
+inline bool matrix_of(const Json* v, size_t rows, size_t cols, std::vector<double>& out) {
+    out.clear();
+    if (!v || !v->is_array() || v->size() != rows) return false;
+    for (const Json& row : v->elements()) {
+        if (!row.is_array() || row.size() != cols) return false;
+        for (const Json& x : row.elements()) {
+            if (!x.is_number() || !std::isfinite(x.as_double())) return false;
+            out.push_back(x.as_double());
+        }
+    }
+    return true;
+}
+
+// `v` as three finite numbers in `out`; false when it is anything else.
+inline bool vector3_of(const Json* v, std::vector<double>& out) {
+    out.clear();
+    if (!v || !v->is_array() || v->size() != 3) return false;
+    for (const Json& x : v->elements()) {
+        if (!x.is_number() || !std::isfinite(x.as_double())) return false;
+        out.push_back(x.as_double());
+    }
+    return true;
+}
+
+// The first (i, j), i < j, whose two entries of the n x n matrix differ by more
+// than 1e-6 of the largest absolute entry; false when it is symmetric.
+inline bool first_asymmetry(const std::vector<double>& m, size_t n, size_t& bi, size_t& bj) {
+    double scale = 0.0;
+    for (double x : m) scale = std::max(scale, std::fabs(x));
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+            if (std::fabs(m[i * n + j] - m[j * n + i]) > kPropertyTolerance * scale) {
+                bi = i;
+                bj = j;
+                return true;
+            }
+    return false;
+}
+
+struct CodeFinding {
+    const char* code;
+    std::string message;
+};
+
+// Rules of the property kinds that JSON Schema cannot express (spec § 5.13):
+// symmetric elastic matrices, static = electronic + ionic, one Born tensor per
+// atom of the section's structure (the section-level structure_ref, else the
+// only structure section) when that resolves, and a dipole that agrees with the
+// root dipole_moment within 1e-6 debye. Mirrors _property_errors() in
+// python/qvf_reader.py.
+inline std::vector<CodeFinding> property_errors(
+    const std::string& sid, const std::string& kind, const Json& section,
+    const Json& payload, const Json& manifest,
+    const std::map<std::string, int64_t>& n_atoms_of, const std::string* only_structure) {
+    std::vector<CodeFinding> errs;
+    if (!payload.is_object()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    std::vector<double> m;
+    if (kind == "properties.elastic") {
+        for (const char* name : {"stiffness", "compliance"}) {
+            size_t i = 0, j = 0;
+            if (matrix_of(get(payload, name), 6, 6, m) && first_asymmetry(m, 6, i, j))
+                errs.push_back({"E_MEMBER_MALFORMED",
+                                sec + name + " is not symmetric: entry (" + std::to_string(i) +
+                                    ", " + std::to_string(j) + ") is " +
+                                    format_number(m[i * 6 + j]) + " but entry (" +
+                                    std::to_string(j) + ", " + std::to_string(i) + ") is " +
+                                    format_number(m[j * 6 + i]) +
+                                    "; they must agree within 1e-6 of the largest entry "
+                                    "(spec § 5.13)"});
+        }
+    } else if (kind == "properties.dielectric") {
+        std::vector<double> e, ion, s;
+        if (matrix_of(get(payload, "electronic"), 3, 3, e) &&
+            matrix_of(get(payload, "ionic"), 3, 3, ion) &&
+            matrix_of(get(payload, "static"), 3, 3, s)) {
+            for (size_t k = 0; k < 9; ++k) {
+                if (std::fabs(s[k] - (e[k] + ion[k])) > kPropertyTolerance) {
+                    errs.push_back({"E_MEMBER_MALFORMED",
+                                    sec + "static[" + std::to_string(k / 3) + "][" +
+                                        std::to_string(k % 3) + "] is " + format_number(s[k]) +
+                                        " but electronic + ionic is " +
+                                        format_number(e[k] + ion[k]) +
+                                        "; static must equal their sum within 1e-6 "
+                                        "(spec § 5.13)"});
+                    break;
+                }
+            }
+        }
+        const Json* born = get(payload, "born_charges");
+        if (born && born->is_array()) {
+            bool have = false;
+            std::string structure;
+            if (const Json* ref = get(section, "structure_ref")) {
+                if (ref->is_string()) {
+                    have = true;
+                    structure = ref->as_string();
+                }
+            } else if (only_structure) {
+                have = true;
+                structure = *only_structure;
+            }
+            auto it = have ? n_atoms_of.find(structure) : n_atoms_of.end();
+            if (it != n_atoms_of.end() && static_cast<int64_t>(born->size()) != it->second)
+                errs.push_back({"E_MEMBER_MALFORMED",
+                                sec + "born_charges has " + std::to_string(born->size()) +
+                                    " tensors but structure " + quote_str(structure) +
+                                    " has " + std::to_string(it->second) +
+                                    " atoms; there must be one per atom (spec § 5.13)"});
+        }
+    } else {  // properties.electric
+        const Json* dipole = get(payload, "dipole");
+        const Json* root = get(manifest, "dipole_moment");
+        if (dipole && dipole->is_object() && root && root->is_object()) {
+            std::vector<double> vec, root_vec;
+            const Json* v = get(*dipole, "vector");
+            const Json* rv = get(*root, "vector_debye");
+            if (vector3_of(v, vec) && vector3_of(rv, root_vec)) {
+                bool differs = false;
+                for (size_t k = 0; k < 3; ++k)
+                    if (std::fabs(vec[k] - root_vec[k]) > kPropertyTolerance) differs = true;
+                if (differs)
+                    errs.push_back({"E_ROOT_INCONSISTENT",
+                                    sec + "dipole.vector " + show(*v) +
+                                        " differs from the root dipole_moment.vector_debye " +
+                                        show(*rv) +
+                                        "; the two state one dipole and must agree within "
+                                        "1e-6 debye (spec § 5.13)"});
+            }
+            const Json* total = get(*dipole, "total");
+            const Json* root_total = get(*root, "total_debye");
+            if (total && root_total && total->is_number() && root_total->is_number() &&
+                std::isfinite(total->as_double()) && std::isfinite(root_total->as_double()) &&
+                std::fabs(total->as_double() - root_total->as_double()) > kPropertyTolerance)
+                errs.push_back({"E_ROOT_INCONSISTENT",
+                                sec + "dipole.total " + show(*total) +
+                                    " differs from the root dipole_moment.total_debye " +
+                                    show(*root_total) +
+                                    "; the two state one dipole and must agree within 1e-6 "
+                                    "debye (spec § 5.13)"});
+        }
+    }
+    return errs;
+}
+
+// A volume.transition_density section's excited_states_ref names an
+// excited_states section, and its state_index the index of one of its states.
+// Returns (field, message) pairs.
+inline std::vector<std::pair<std::string, std::string>> transition_density_errors(
+    const std::string& sid, const Json& section,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, StateIndices>& indices_of) {
+    std::vector<std::pair<std::string, std::string>> errs;
+    const Json* ref = get(section, "excited_states_ref");
+    if (!ref) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    auto it = ref->is_string() ? kinds_by_id.find(ref->as_string()) : kinds_by_id.end();
+    if (it == kinds_by_id.end() || it->second != "excited_states") {
+        errs.emplace_back("excited_states_ref",
+                          sec + "excited_states_ref " + show(*ref) +
+                              " does not name an excited_states section (spec § 5.2)");
+        return errs;
+    }
+    const Json* state = get(section, "state_index");
+    auto ix = indices_of.find(ref->as_string());
+    if (is_int(state) && ix != indices_of.end() && ix->second.known &&
+        !ix->second.values.count(state->as_int()))
+        errs.emplace_back("state_index",
+                          sec + "state_index " + std::to_string(state->as_int()) +
+                              " names no state of excited_states section " +
+                              quote_str(ref->as_string()) + " (spec § 5.2)");
+    return errs;
+}
+
+// An excited_states section, a spectrum with states_ref, a transition
+// density, or a standalone bonds section, checked after every section has
+// been read.
+struct DeferredSection {
+    size_t index;
+    std::string sid;
+    const Json* section;
+    bool has_doc;
+    Json doc;
+};
+
+// Atom indices of a standalone `bonds` section against the structure its
+// structure_ref names (spec § 5.1). Only a section whose structure_ref names
+// a structure section with a known atom count is checked; a reference that
+// does not resolve is the generic reference check's finding, and a section
+// without one is not checked. Every integer i and j of the payload's `pairs`
+// must be an atom of that structure. Returns messages, located at the `bonds`
+// member. Mirrors _bonds_errors() in python/qvf_reader.py.
+inline std::vector<std::string> bonds_errors(
+    const std::string& sid, const Json& section, const Json* payload,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, int64_t>& n_atoms_of) {
+    std::vector<std::string> errs;
+    const Json* ref = get(section, "structure_ref");
+    if (!ref || !ref->is_string()) return errs;
+    const std::string structure = ref->as_string();
+    auto kind = kinds_by_id.find(structure);
+    if (kind == kinds_by_id.end() || kind->second != "structure") return errs;
+    auto count = n_atoms_of.find(structure);
+    const Json* pairs = payload && payload->is_object() ? get(*payload, "pairs") : nullptr;
+    if (count == n_atoms_of.end() || !pairs || !pairs->is_array()) return errs;
+    const int64_t n = count->second;
+    for (size_t k = 0; k < pairs->size(); ++k) {
+        const Json& pair = pairs->at(k);
+        if (!pair.is_object()) continue;
+        for (const char* key : {"i", "j"}) {
+            const Json* atom = get(pair, key);
+            if (is_int(atom) && (atom->as_int() < 0 || atom->as_int() >= n))
+                errs.push_back("section " + quote_str(sid) + ": pairs[" +
+                               std::to_string(k) + "]." + key + " " +
+                               std::to_string(atom->as_int()) + " is not one of the " +
+                               std::to_string(n) + " atoms of structure " +
+                               quote_str(structure) +
+                               ", which structure_ref names (spec § 5.1)");
+        }
+    }
+    return errs;
+}
+
+// A properties.* section, checked after every structure has been read.
+struct PropertySection {
+    size_t index;
+    std::string sid, kind;
+    const Json* section;
+    Json payload;
+};
+
+// Custom roles of an `atom_properties` section need a `meta` entry (spec § 5.7);
+// mirrors _atom_properties_meta_errors() in python/qvf_reader.py. Every
+// custom.<name> member needs an object entry of that name in the section's
+// `meta` member; a section without one has none. A `meta` member that is
+// declared but could not be read (its own finding says why) is not judged.
+// Returns (role, message) pairs.
+inline std::vector<std::pair<std::string, std::string>> atom_properties_meta_errors(
+    const std::string& sid, const Json& members, const std::map<std::string, Json>& docs) {
+    std::vector<std::pair<std::string, std::string>> errs;
+    std::vector<std::string> custom;
+    for (const auto& kv : members.items())
+        if (starts_with(kv.first, "custom.")) custom.push_back(kv.first);
+    if (custom.empty()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": custom role ";
+    if (!members.contains("meta")) {
+        for (const auto& r : custom)
+            errs.emplace_back(r, sec + quote_str(r) +
+                                     " has no meta member to describe it (spec § 5.7)");
+        return errs;
+    }
+    const auto it = docs.find("meta");
+    if (it == docs.end()) return errs;
+    if (!it->second.is_object()) {
+        for (const auto& r : custom)
+            errs.emplace_back(r, sec + quote_str(r) +
+                                     ": the meta member is not a JSON object (spec § 5.7)");
+        return errs;
+    }
+    for (const auto& r : custom) {
+        const Json* entry = get(it->second, r);
+        if (!entry || !entry->is_object())
+            errs.emplace_back(r, sec + quote_str(r) +
+                                     " has no entry in the meta member (spec § 5.7)");
+    }
+    return errs;
+}
+
+// A member spec's `size` against the uncompressed size its ZIP entry records
+// (spec § 4.2): nullptr when absent or equal; otherwise the finding code,
+// E_MEMBER_MALFORMED (not a non-negative integer) or E_BINARY_SIZE, with
+// `message` set. Reads the central directory only.
+inline const char* size_problem(const Json& m, const ZipReader::Entry& e,
+                                std::string& message) {
+    const Json* sj = get(m, "size");
+    if (!sj) return nullptr;
+    if (sj->type() != Json::Type::Int || sj->as_int() < 0) {
+        message = "member " + quote_str(e.name) +
+                  ": size must be a non-negative integer, got " + show(*sj);
+        return "E_MEMBER_MALFORMED";
+    }
+    if (static_cast<uint64_t>(sj->as_int()) != static_cast<uint64_t>(e.usize)) {
+        message = "member " + quote_str(e.name) + ": declared size " +
+                  std::to_string(sj->as_int()) + " != " + std::to_string(e.usize) +
+                  " bytes recorded in the ZIP central directory";
+        return "E_BINARY_SIZE";
+    }
+    return nullptr;
+}
+
+// --- wavefunction.gto (spec § 5.3, Appendix A.1) ------------------------------
+
+// Tolerances of the electron count and of the Appendix A.1 normalization check.
+constexpr double kNElectronsTolerance = 1e-6;
+constexpr double kNormalizationRtol = 1e-6;
+
+// One shell of a `basis` payload as the checks read it. `usable` is false when
+// its primitive arrays are not numbers, an exponent is not above 0, or the
+// lengths differ (the schema check reports those).
+struct ShellInfo {
+    int l = 0;
+    bool pure = true;
+    bool usable = false;
+    std::vector<double> exponents, coefficients;
+};
+
+inline bool is_plain_number(const Json& j) {
+    return j.type() == Json::Type::Int || j.type() == Json::Type::Double;
+}
+
+// The shells of a `basis` payload; false when the AO layout cannot be read
+// (no shell list, or a shell whose `l` or `pure` is malformed). Mirrors
+// _basis_shells() in python/qvf_reader.py.
+inline bool basis_shells(const Json* basis, std::vector<ShellInfo>& out) {
+    out.clear();
+    const Json* shells = basis ? get(*basis, "shells") : nullptr;
+    if (!shells || !shells->is_array()) return false;
+    bool default_pure = true;
+    if (const Json* p = get(*basis, "pure")) {
+        if (!p->is_bool()) return false;
+        default_pure = p->as_bool();
+    }
+    for (const Json& sh : shells->elements()) {
+        if (!sh.is_object()) return false;
+        const Json* l = get(sh, "l");
+        if (!l || l->type() != Json::Type::Int || l->as_int() < 0 || l->as_int() > 7)
+            return false;
+        ShellInfo info;
+        info.l = static_cast<int>(l->as_int());
+        info.pure = default_pure;
+        if (const Json* p = get(sh, "pure")) {
+            if (!p->is_bool()) return false;
+            info.pure = p->as_bool();
+        }
+        const Json* e = get(sh, "exponents");
+        const Json* c = get(sh, "coefficients");
+        info.usable = e && c && e->is_array() && c->is_array() &&
+                      e->size() == c->size() && e->size() > 0;
+        if (info.usable)
+            for (size_t k = 0; k < e->size(); ++k) {
+                const Json& a = e->at(k);
+                const Json& b = c->at(k);
+                if (!is_plain_number(a) || !(a.as_double() > 0) || !is_plain_number(b)) {
+                    info.usable = false;
+                    break;
+                }
+                info.exponents.push_back(a.as_double());
+                info.coefficients.push_back(b.as_double());
+            }
+        if (!info.usable) {
+            info.exponents.clear();
+            info.coefficients.clear();
+        }
+        out.push_back(std::move(info));
+    }
+    return true;
+}
+
+// --- volumes (spec § 5.2) ------------------------------------------------------
+
+// Data shape and series axis of a volume section: volume.laplacian data is
+// [nx, ny, nz], volume.vector [nx, ny, nz, 3], volume.complex [nx, ny, nz, 2]
+// and volume.series [n, nx, ny, nz]; a series axis has one `values` entry,
+// and one `labels` entry when it has labels, per slab, and its
+// trajectory_ref names a trajectory or reaction.path section. Mirrors
+// _volume_errors() in python/qvf_reader.py.
+inline std::vector<RoleFinding> volume_errors(
+    const std::string& sid, const std::string& kind, const Json* members,
+    const std::map<std::string, Json>& docs,
+    const std::map<std::string, std::string>& kinds_by_id) {
+    std::vector<RoleFinding> errs;
+    size_t rank = 0;
+    int64_t trailing = 0;
+    const char* form = "";
+    if (kind == "volume.laplacian") { rank = 3; form = "[nx, ny, nz]"; }
+    else if (kind == "volume.vector") { rank = 4; trailing = 3; form = "[nx, ny, nz, 3]"; }
+    else if (kind == "volume.complex") { rank = 4; trailing = 2; form = "[nx, ny, nz, 2]"; }
+    else if (kind == "volume.series") { rank = 4; form = "[n, nx, ny, nz]"; }
+    if (!rank || !members || !members->is_object()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    std::vector<int64_t> shape;
+    bool have_shape = shape_of(get(*members, "data"), shape);
+    if (have_shape && (shape.size() != rank || (trailing && shape.back() != trailing))) {
+        errs.push_back({"E_MEMBER_MALFORMED", "data",
+                        sec + kind + " data shape " + dims_str(shape) + " is not " +
+                            form + " (spec § 5.2)"});
+        have_shape = false;
+    }
+    auto it = docs.find("axis");
+    if (kind != "volume.series" || it == docs.end() || !it->second.is_object()) return errs;
+    const Json& axis = it->second;
+    for (const char* key : {"values", "labels"}) {
+        const Json* seq = get(axis, key);
+        if (have_shape && seq && seq->is_array() &&
+            static_cast<int64_t>(seq->size()) != shape[0])
+            errs.push_back({"E_MEMBER_MALFORMED", "axis",
+                            sec + "axis." + key + " has " + std::to_string(seq->size()) +
+                                " entries but data " + dims_str(shape) + " has " +
+                                std::to_string(shape[0]) +
+                                " slabs; it needs one per slab (spec § 5.2)"});
+    }
+    if (const Json* ref = get(axis, "trajectory_ref")) {
+        auto k = ref->is_string() ? kinds_by_id.find(ref->as_string()) : kinds_by_id.end();
+        if (k == kinds_by_id.end() ||
+            (k->second != "trajectory" && k->second != "reaction.path"))
+            errs.push_back({"E_REF_UNRESOLVED", "axis",
+                            sec + "axis.trajectory_ref " + show(*ref) +
+                                " does not name a trajectory or reaction.path section "
+                                "(spec § 5.2)"});
+    }
+    return errs;
+}
+
+// True for a member whose payload is a volume grid ($defs/VolumeGridPayload):
+// the `grid` of a canonical volume.* or basis.ao section, and the
+// `volume_grid` of a reaction.path section.
+inline bool is_grid_payload(const std::string& kind, const std::string& role) {
+    if (role == "volume_grid") return kind == "reaction.path";
+    return role == "grid" && is_canonical_kind(kind) &&
+           (starts_with(kind, "volume.") || kind == "basis.ao");
+}
+
+// Three numbers, or false.
+inline bool vec3_of(const Json* j, std::array<double, 3>& out) {
+    if (!j || !j->is_array() || j->size() != 3) return false;
+    for (size_t i = 0; i < 3; ++i) {
+        if (!j->at(i).is_number()) return false;
+        out[i] = j->at(i).as_double();
+    }
+    return true;
+}
+
+inline int64_t shell_size(int l, bool pure) {
+    return pure ? 2 * l + 1 : (l + 1) * (l + 2) / 2;
+}
+
+// n_ao of a `basis` payload: counted from its shells, or its `n_ao` when the
+// shells cannot be read (spec § 5.3); false when neither works.
+inline bool basis_n_ao(const Json* basis, int64_t& n_ao) {
+    std::vector<ShellInfo> shells;
+    if (basis_shells(basis, shells)) {
+        n_ao = 0;
+        for (const auto& s : shells) n_ao += shell_size(s.l, s.pure);
+        return true;
+    }
+    const Json* n = basis ? get(*basis, "n_ao") : nullptr;
+    if (n && n->type() == Json::Type::Int && n->as_int() >= 0) {
+        n_ao = n->as_int();
+        return true;
+    }
+    return false;
+}
+
+// Self-overlap of the axial component (l, 0, 0) of a contracted shell on the
+// N_i-normalized primitives of Appendix A.1:
+// sum_ij c_i c_j (2 sqrt(a_i a_j) / (a_i + a_j))^(l + 3/2).
+inline double axial_self_overlap(const ShellInfo& s) {
+    double total = 0.0;
+    for (size_t i = 0; i < s.exponents.size(); ++i)
+        for (size_t j = 0; j < s.exponents.size(); ++j) {
+            const double a = s.exponents[i], b = s.exponents[j];
+            total += s.coefficients[i] * s.coefficients[j] *
+                     std::pow(2.0 * std::sqrt(a * b) / (a + b), s.l + 1.5);
+        }
+    return total;
+}
+
+inline double odd_double_factorial(int n) {  // (2n - 1)!!, (-1)!! = 1
+    double out = 1.0;
+    for (int k = 1; k < 2 * n; k += 2) out *= k;
+    return out;
+}
+
+// (name, factor) of each component of a shell in Appendix A.2 order: its
+// diagonal overlap is factor * S_axial.
+inline std::vector<std::pair<std::string, double>> shell_components(int l, bool pure) {
+    std::vector<std::pair<std::string, double>> out;
+    if (pure) {
+        for (int m = -l; m <= l; ++m)
+            out.emplace_back(m > 0 ? "m = +" + std::to_string(m)
+                                   : "m = " + std::to_string(m),
+                             1.0);
+        return out;
+    }
+    for (int lx = l; lx >= 0; --lx)
+        for (int ly = l - lx; ly >= 0; --ly) {
+            const int lz = l - lx - ly;
+            std::string name = std::string(static_cast<size_t>(lx), 'x') +
+                               std::string(static_cast<size_t>(ly), 'y') +
+                               std::string(static_cast<size_t>(lz), 'z');
+            out.emplace_back("Cartesian " + (name.empty() ? std::string("s") : name) +
+                                 " [" + std::to_string(lx) + ", " + std::to_string(ly) +
+                                 ", " + std::to_string(lz) + "]",
+                             odd_double_factorial(lx) * odd_double_factorial(ly) *
+                                 odd_double_factorial(lz) / odd_double_factorial(l));
+        }
+    return out;
+}
+
+inline std::string g10(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.10g", v);
+    return buf;
+}
+
+// The Appendix A.1 check of a wavefunction.gto `overlap` member: every
+// diagonal entry agrees with the self-overlap the basis gives for that AO, to
+// a relative tolerance of 1e-6. Runs only on a well-formed float64
+// [n_ao, n_ao] overlap of a basis whose AO layout can be read. Returns at most
+// one message. Mirrors _normalization_errors() in python/qvf_reader.py.
+inline std::vector<std::string> normalization_errors(const std::string& sid,
+                                                     const Json* basis,
+                                                     const Json* overlap,
+                                                     const std::vector<uint8_t>* bytes) {
+    std::vector<std::string> errs;
+    std::vector<ShellInfo> shells;
+    std::vector<int64_t> shape;
+    if (!bytes || !basis_shells(basis, shells) || !shape_of(overlap, shape)) return errs;
+    int64_t n_ao = 0;
+    for (const auto& s : shells) n_ao += shell_size(s.l, s.pure);
+    const Json* dtype = get(*overlap, "dtype");
+    if (shape.size() != 2 || shape[0] != n_ao || shape[1] != n_ao || !dtype ||
+        !dtype->is_string() || dtype->as_string() != "float64" ||
+        bytes->size() != static_cast<size_t>(8 * n_ao * n_ao))
+        return errs;
+    size_t n_bad = 0;
+    std::string first;
+    int64_t ao = 0;
+    for (size_t k = 0; k < shells.size(); ++k) {
+        const ShellInfo& s = shells[k];
+        const auto components = shell_components(s.l, s.pure);
+        if (s.usable) {
+            const double s_axial = axial_self_overlap(s);
+            for (size_t j = 0; j < components.size(); ++j) {
+                const int64_t i = ao + static_cast<int64_t>(j);
+                const double want = s_axial * components[j].second;
+                uint64_t bits = 0;
+                const size_t off = static_cast<size_t>(8 * (i * n_ao + i));
+                for (int b = 0; b < 8; ++b)
+                    bits |= static_cast<uint64_t>((*bytes)[off + static_cast<size_t>(b)])
+                            << (8 * b);
+                double got;
+                std::memcpy(&got, &bits, 8);
+                if (!(std::fabs(got - want) <= kNormalizationRtol * std::fabs(want))) {
+                    if (n_bad++ == 0)
+                        first = "AO " + std::to_string(i) + " (shell " + std::to_string(k) +
+                                ", l = " + std::to_string(s.l) + ", " +
+                                components[j].first + ") is " + g10(got) +
+                                " but the basis gives " + g10(want);
+                }
+            }
+        }
+        ao += static_cast<int64_t>(components.size());
+    }
+    if (n_bad)
+        errs.push_back("section " + quote_str(sid) + ": " + std::to_string(n_bad) + " of " +
+                       std::to_string(n_ao) +
+                       " overlap diagonal entries disagree with the self-overlaps "
+                       "Appendix A.1 gives for the basis; first: " +
+                       first +
+                       ". The basis.json coefficients are not on N_i-normalized "
+                       "primitives, or the AO order disagrees with Appendix A.2 "
+                       "(spec § 5.3)");
+    return errs;
+}
+
+// Whether mo_metadata declares complex coefficients (spec § 5.3): `complex`,
+// else `coefficient_encoding`, else real. -1 when the declaration is
+// malformed (the schema check reports it), else 0 or 1.
+inline int coefficients_complex(const Json* meta) {
+    if (!meta || !meta->is_object()) return -1;
+    if (const Json* c = get(*meta, "complex")) return c->is_bool() ? (c->as_bool() ? 1 : 0) : -1;
+    if (const Json* e = get(*meta, "coefficient_encoding")) {
+        if (e->is_string() && e->as_string() == "complex_split_last_axis") return 1;
+        if (e->is_string() && e->as_string() == "real") return 0;
+        return -1;
+    }
+    return 0;
+}
+
+// Unrestricted NTOs (spec § 5.3): local channel rules, then forward pair
+// references. Unit-sum normalization is conditional and is not imposed.
+inline bool nto_text(const Json& meta, const char* key, const char* value) {
+    const Json* p = get(meta, key);
+    return p && p->is_string() && p->as_string() == value;
+}
+inline bool unrestricted_nto(const Json& meta) {
+    return get(meta, "nto_role") && nto_text(meta, "orbital_kind", "nto") &&
+           nto_text(meta, "spin", "unrestricted");
+}
+inline std::vector<std::string> unrestricted_nto_errors(const Json& meta, const Json* members) {
+    std::vector<std::string> errors;
+    if (!unrestricted_nto(meta)) return errors;
+    const MoRows rows = mo_rows(members);
+    for (const char* ch : {"alpha", "beta"}) {
+        const Json* block = get(meta, ch);
+        if (!block || !block->is_object()) continue;
+        const auto n = rows.find(ch);
+        if (n == rows.end()) {
+            errors.push_back(std::string("unrestricted NTOs need mo_coefficients_") + ch + " (spec § 5.3)");
+        } else {
+            bool mismatch = false;
+            for (const char* key : {"energies", "occupations"}) {
+                const Json* a = get(*block, key);
+                if (a && a->is_array() && static_cast<int64_t>(a->size()) != n->second) mismatch = true;
+            }
+            const Json* nm = get(*block, "n_mo");
+            if (is_integral(nm) && nm->as_double() != n->second) mismatch = true;
+            if (mismatch) errors.push_back(std::string("NTO ") + ch + " metadata must have one entry per coefficient row (spec § 5.3)");
+        }
+        const Json* occ = get(*block, "occupations");
+        if (occ && occ->is_array()) {
+            bool numbers = true, bad = false;
+            double previous = 0;
+            for (size_t i = 0; i < occ->size(); ++i) {
+                const Json& x = occ->at(i);
+                if (!x.is_number()) { numbers = false; break; }
+                const double v = x.as_double();
+                if (v < 0 || (i && previous < v)) bad = true;
+                previous = v;
+            }
+            if (numbers && bad) errors.push_back(std::string("NTO ") + ch + " weights must be nonnegative and non-increasing (spec § 5.3)");
+        }
+    }
+    return errors;
+}
+
+inline std::vector<std::pair<std::string, std::string>> nto_pair_errors(
+    const DeferredSection& d, const std::vector<DeferredSection>& ntos,
+    const std::map<std::string, std::string>& kinds,
+    const std::map<std::string, StateIndices>& indices) {
+    std::vector<std::pair<std::string, std::string>> errors;
+    const Json& meta = d.doc;
+    if (!unrestricted_nto(meta)) return errors;
+    const Json* ref = get(meta, "state_ref");
+    const Json* index = get(meta, "state_index");
+    const Json* role = get(meta, "nto_role");
+    if (!ref || !ref->is_string() || !is_integral(index) || !role || !role->is_string() ||
+        (role->as_string() != "hole" && role->as_string() != "particle")) return errors;
+    auto kind = kinds.find(ref->as_string());
+    auto states = indices.find(ref->as_string());
+    if (kind == kinds.end() || kind->second != "excited_states" ||
+        (states != indices.end() && states->second.known && std::none_of(states->second.values.begin(), states->second.values.end(),
+            [index](int64_t v) { return static_cast<double>(v) == index->as_double(); })))
+        errors.emplace_back("E_REF_UNRESOLVED", "NTO state_ref/state_index must name an excited state (spec § 5.3)");
+    const char* opposite = role->as_string() == "hole" ? "particle" : "hole";
+    std::vector<const DeferredSection*> partners;
+    for (const auto& p : ntos) {
+        const Json* pr = get(p.doc, "state_ref");
+        const Json* pi = get(p.doc, "state_index");
+        if (nto_text(p.doc, "orbital_kind", "nto") && pr && pr->is_string() &&
+            pr->as_string() == ref->as_string() && is_integral(pi) && pi->as_double() == index->as_double() &&
+            nto_text(p.doc, "nto_role", opposite)) partners.push_back(&p);
+    }
+    if (partners.size() != 1) {
+        errors.emplace_back("E_REF_UNRESOLVED", "NTOs must have one opposite-role section for the same state (spec § 5.3)");
+        return errors;
+    }
+    const auto& partner = *partners.front();
+    const Json& other = partner.doc;
+    if (!nto_text(other, "spin", "unrestricted")) {
+        errors.emplace_back("E_MEMBER_MALFORMED", "NTO partners must have the same spin layout (spec § 5.3)");
+        return errors;
+    }
+    const MoRows rows = mo_rows(get(*d.section, "members"));
+    const MoRows other_rows = mo_rows(get(*partner.section, "members"));
+    for (const char* ch : {"alpha", "beta"}) {
+        auto a = rows.find(ch), b = other_rows.find(ch);
+        if (a != rows.end() && b != other_rows.end() && a->second != b->second)
+            errors.emplace_back("E_MEMBER_MALFORMED", std::string("NTO partners must have the same ") + ch + " row count (spec § 5.3)");
+        const Json* ab = get(meta, ch); const Json* bb = get(other, ch);
+        const Json* av = ab ? get(*ab, "occupations") : nullptr;
+        const Json* bv = bb ? get(*bb, "occupations") : nullptr;
+        if (av && bv && av->is_array() && bv->is_array()) {
+            const auto numbers = [](const Json& a) {
+                return std::all_of(a.elements().begin(), a.elements().end(),
+                                   [](const Json& x) { return x.is_number(); });
+            };
+            if (!numbers(*av) || !numbers(*bv)) continue;
+            bool equal = av->size() == bv->size();
+            if (equal) for (size_t i = 0; i < av->size(); ++i) {
+                const Json& x = av->at(i); const Json& y = bv->at(i);
+                if (x.is_number() && y.is_number()) equal = equal && x.as_double() == y.as_double();
+                else equal = equal && x.dump() == y.dump();
+            }
+            if (!equal) errors.emplace_back("E_MEMBER_MALFORMED", std::string("NTO partners must have identical ") + ch + " weights (spec § 5.3)");
+        }
+    }
+    return errors;
+}
+
+// Cross-member rules of a wavefunction.gto section (spec § 5.3): coefficient
+// rank against `complex`, symmetry_labels lengths, [n_ao, n_ao] shapes and the
+// pairing of the AO-basis matrices, basis.n_electrons against the occupations
+// (E_MEMBER_MALFORMED) and against provenance.n_electrons
+// (E_ROOT_INCONSISTENT). Mirrors _wavefunction_errors() in python/qvf_reader.py.
+inline std::vector<RoleFinding> wavefunction_errors(const std::string& sid,
+                                                    const Json& members,
+                                                    const std::map<std::string, Json>& docs,
+                                                    const Json* provenance) {
+    std::vector<RoleFinding> errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    auto doc = [&](const char* role) -> const Json* {
+        auto it = docs.find(role);
+        return it == docs.end() ? nullptr : &it->second;
+    };
+    const Json* basis = doc("basis");
+    const Json* meta = doc("mo_metadata");
+    std::vector<int64_t> shape;
+
+    const int cplx = coefficients_complex(meta);
+    if (cplx >= 0)
+        for (const char* role : {"mo_coefficients", "mo_coefficients_alpha",
+                                 "mo_coefficients_beta"}) {
+            if (!shape_of(get(members, role), shape)) continue;
+            if (cplx == 1 && (shape.size() != 3 || shape[2] != 2))
+                errs.push_back({"E_MEMBER_MALFORMED", role,
+                                sec + role + " shape " + dims_str(shape) +
+                                    " has no trailing [re, im] axis of 2, but "
+                                    "mo_metadata declares complex coefficients "
+                                    "(spec § 5.3)"});
+            else if (cplx == 0 && shape.size() != 2)
+                errs.push_back({"E_MEMBER_MALFORMED", role,
+                                sec + role + " shape " + dims_str(shape) +
+                                    " is not [n_mo, n_ao], and mo_metadata does not "
+                                    "declare complex coefficients (spec § 5.3)"});
+        }
+
+    if (meta && meta->is_object()) {
+        std::vector<std::pair<std::string, const Json*>> sets{{"", meta}};
+        for (const char* ch : {"alpha", "beta"})
+            if (const Json* c = get(*meta, ch))
+                if (c->is_object()) sets.emplace_back(std::string(ch) + ".", c);
+        for (const auto& set : sets) {
+            const Json* labels = get(*set.second, "symmetry_labels");
+            const Json* energies = get(*set.second, "energies");
+            if (labels && energies && labels->is_array() && energies->is_array() &&
+                labels->size() != energies->size())
+                errs.push_back({"E_MEMBER_MALFORMED", "mo_metadata",
+                                sec + "mo_metadata " + set.first + "symmetry_labels has " +
+                                    std::to_string(labels->size()) + " entries but " +
+                                    set.first + "energies has " +
+                                    std::to_string(energies->size()) +
+                                    "; there is one label per MO (spec § 5.3)"});
+        }
+    }
+
+    int64_t n_ao = 0;
+    const bool have_n_ao = basis_n_ao(basis, n_ao);
+    for (const char* role : {"overlap", "density_matrix", "density_matrix_alpha",
+                             "density_matrix_beta"})
+        if (have_n_ao && shape_of(get(members, role), shape) &&
+            (shape.size() != 2 || shape[0] != n_ao || shape[1] != n_ao))
+            errs.push_back({"E_MEMBER_MALFORMED", role,
+                            sec + role + " shape " + dims_str(shape) +
+                                " is not [n_ao, n_ao] = [" + std::to_string(n_ao) + ", " +
+                                std::to_string(n_ao) + "] for the basis (spec § 5.3)"});
+    const bool unrestricted =
+        members.contains("mo_coefficients_alpha") && members.contains("mo_coefficients_beta");
+    if (members.contains("density_matrix") && !members.contains("mo_coefficients"))
+        errs.push_back({"E_MEMBER_MALFORMED", "density_matrix",
+                        sec + "density_matrix accompanies mo_coefficients only; an "
+                              "unrestricted wavefunction carries density_matrix_alpha "
+                              "and density_matrix_beta (spec § 5.3)"});
+    for (const auto& pair : {std::make_pair("density_matrix_alpha", "density_matrix_beta"),
+                             std::make_pair("density_matrix_beta", "density_matrix_alpha")}) {
+        const std::string role = pair.first, other = pair.second;
+        if (!members.contains(role)) continue;
+        if (!unrestricted)
+            errs.push_back({"E_MEMBER_MALFORMED", role,
+                            sec + role + " accompanies mo_coefficients_alpha and "
+                                         "mo_coefficients_beta only; a single-set "
+                                         "wavefunction carries density_matrix (spec § 5.3)"});
+        else if (!members.contains(other))
+            errs.push_back({"E_MEMBER_MALFORMED", role,
+                            sec + role + " without " + other +
+                                "; the two come together (spec § 5.3)"});
+    }
+
+    const Json* n_el = basis ? get(*basis, "n_electrons") : nullptr;
+    if (!n_el || !is_plain_number(*n_el)) return errs;
+    const double n = n_el->as_double();
+    const Json* semantics = meta ? get(*meta, "occupation_semantics") : nullptr;
+    if (meta && meta->is_object() &&
+        !(semantics && semantics->is_string() &&
+          semantics->as_string() == "transition_weight")) {
+        std::vector<const Json*> lists;
+        if (const Json* occ = get(*meta, "occupations")) lists.push_back(occ);
+        for (const char* ch : {"alpha", "beta"})
+            if (const Json* c = get(*meta, ch))
+                if (const Json* occ = get(*c, "occupations")) lists.push_back(occ);
+        bool numbers = !lists.empty();
+        double total = 0.0;
+        for (const Json* occ : lists) {
+            if (!occ->is_array()) { numbers = false; break; }
+            for (const Json& x : occ->elements()) {
+                if (!is_plain_number(x)) { numbers = false; break; }
+                total += x.as_double();
+            }
+        }
+        if (numbers && !(std::fabs(total - n) <= kNElectronsTolerance))
+            errs.push_back({"E_MEMBER_MALFORMED", "basis",
+                            sec + "basis.n_electrons is " + show(*n_el) +
+                                " but the mo_metadata occupations sum to " + g10(total) +
+                                "; they must agree within 1e-6 (spec § 5.3)"});
+    }
+    const Json* prov_n = provenance ? get(*provenance, "n_electrons") : nullptr;
+    if (prov_n && is_plain_number(*prov_n) && prov_n->as_double() != n)
+        errs.push_back({"E_ROOT_INCONSISTENT", "basis",
+                        sec + "basis.n_electrons is " + show(*n_el) +
+                            " but provenance.n_electrons is " + show(*prov_n) +
+                            "; they state one electron count and must be equal "
+                            "(spec § 3.2, § 5.3)"});
+    return errs;
+}
+
+// Three booleans, or false.
+inline bool bool3_of(const Json* j, std::array<bool, 3>& out) {
+    if (!j || !j->is_array() || j->size() != 3) return false;
+    for (size_t i = 0; i < 3; ++i) {
+        if (!j->at(i).is_bool()) return false;
+        out[i] = j->at(i).as_bool();
+    }
+    return true;
+}
+
+inline std::string vec_str(const std::array<double, 3>& v) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "[%.6g, %.6g, %.6g]", v[0], v[1], v[2]);
+    return buf;
+}
+
+// A grid payload, checked after every structure has been read.
+struct GridMember {
+    std::string where, sid;
+    const Json* section;
+    Json grid;
+};
+
+// Reference and periodic-span rules of a grid payload: a grid structure_ref
+// names a structure section; the grid's structure is the section-level
+// structure_ref, else the grid's, else the archive's only structure. When it
+// resolves to a structure whose payload was read (`cells`: id -> payload),
+// every axis a with periodic[a] true has pbc[a] true and a span
+// voxel_vectors[a] * (shape[a] - 1) (includes_endpoint true, the default) or
+// voxel_vectors[a] * shape[a] (false) equal to lattice row a in bohr within
+// 1e-6 relative. Malformed fields are left to the schema. Mirrors
+// _grid_errors() in python/qvf_reader.py. Returns (code, message) pairs.
+inline std::vector<std::pair<const char*, std::string>> grid_errors(
+    const std::string& sid, const Json& section, const Json& grid,
+    const std::map<std::string, std::string>& kinds_by_id,
+    const std::map<std::string, Json>& cells, const std::string* only_structure) {
+    std::vector<std::pair<const char*, std::string>> errs;
+    if (!grid.is_object()) return errs;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    const Json* ref = get(grid, "structure_ref");
+    if (ref) {
+        auto it = ref->is_string() ? kinds_by_id.find(ref->as_string()) : kinds_by_id.end();
+        if (it == kinds_by_id.end() || it->second != "structure")
+            errs.emplace_back("E_REF_UNRESOLVED", sec + "grid structure_ref " + show(*ref) +
+                                                      " does not name a structure section "
+                                                      "(spec § 5.2)");
+    }
+    std::array<bool, 3> periodic{};
+    if (!bool3_of(get(grid, "periodic"), periodic) ||
+        !(periodic[0] || periodic[1] || periodic[2]))
+        return errs;
+    std::string structure;
+    if (const Json* sref = get(section, "structure_ref")) {
+        if (!sref->is_string()) return errs;
+        structure = sref->as_string();
+    } else if (ref && ref->is_string()) {
+        structure = ref->as_string();
+    } else if (only_structure) {
+        structure = *only_structure;
+    } else {
+        return errs;
+    }
+    auto cell = cells.find(structure);
+    if (cell == cells.end()) return errs;
+    std::array<bool, 3> pbc{{false, false, false}};
+    const Json* pj = get(cell->second, "pbc");
+    if (pj && !pj->is_null() && !bool3_of(pj, pbc)) return errs;
+    bool endpoint = true;
+    if (const Json* e = get(grid, "includes_endpoint")) {
+        if (!e->is_bool()) return errs;
+        endpoint = e->as_bool();
+    }
+    const Json* shape = get(grid, "shape");
+    const Json* vox = get(grid, "voxel_vectors");
+    if (!shape || !shape->is_array() || shape->size() != 3 || !vox || !vox->is_array() ||
+        vox->size() != 3)
+        return errs;
+    for (size_t a = 0; a < 3; ++a)
+        if (shape->at(a).type() != Json::Type::Int) return errs;
+    const Json* lattice = get(cell->second, "lattice_vectors");
+    for (size_t a = 0; a < 3; ++a) {
+        if (!periodic[a]) continue;
+        const std::string axis = std::to_string(a);
+        if (!pbc[a]) {
+            errs.emplace_back("E_MEMBER_MALFORMED",
+                              sec + "grid axis " + axis + " is periodic but structure " +
+                                  quote_str(structure) + " has pbc[" + axis +
+                                  "] false; a grid axis can be periodic only along a "
+                                  "periodic axis of its structure (spec § 5.2)");
+            continue;
+        }
+        std::array<double, 3> step{}, row{};
+        if (!vec3_of(&vox->at(a), step) || !lattice || !lattice->is_array() ||
+            lattice->size() != 3 || !vec3_of(&lattice->at(a), row))
+            continue;
+        const int64_t n = shape->at(a).as_int() - (endpoint ? 1 : 0);
+        std::array<double, 3> span{}, target{};
+        double diff = 0.0, norm = 0.0;
+        for (size_t c = 0; c < 3; ++c) {
+            span[c] = step[c] * static_cast<double>(n);
+            target[c] = row[c] * kBohrPerAngstrom;   // spec § 4.3, Lattice conventions
+            diff += (span[c] - target[c]) * (span[c] - target[c]);
+            norm += target[c] * target[c];
+        }
+        if (std::sqrt(diff) > 1e-6 * std::sqrt(norm))
+            errs.emplace_back("E_MEMBER_MALFORMED",
+                              sec + "periodic grid axis " + axis + " spans " +
+                                  vec_str(span) + " bohr (voxel_vectors[" + axis +
+                                  "] x " + std::to_string(n) + ", includes_endpoint " +
+                                  (endpoint ? "true" : "false") + ") but lattice vector " +
+                                  axis + " of structure " + quote_str(structure) + " is " +
+                                  vec_str(target) +
+                                  " bohr; a periodic grid spans its cell within 1e-6 "
+                                  "relative (spec § 5.2)");
+    }
+    return errs;
+}
+
+// --- preview, reaction.scheme, chemical identity (spec § 5.15, § 5.14, § 5.1) --
+
+// The bytes of a `preview` member are what its `media_type` says (spec
+// § 5.15): the PNG signature, FF D8 FF for JPEG, or a UTF-8 document with an
+// `<svg` element. Mirrors _preview_member_errors() in python/qvf_reader.py.
+inline std::vector<CodeFinding> preview_member_errors(const std::string& sid,
+                                                      const std::string& role,
+                                                      const Json& member,
+                                                      const std::vector<uint8_t>& raw) {
+    std::vector<CodeFinding> out;
+    const Json* mt = get(member, "media_type");
+    if (!mt || !mt->is_string()) return out;
+    const std::string& media_type = mt->as_string();
+    const std::string where = "section " + quote_str(sid) + " member " + quote_str(role);
+    auto begins_with = [&raw](const char* signature, size_t n) {
+        return raw.size() >= n && std::memcmp(raw.data(), signature, n) == 0;
+    };
+    if (media_type == "image/png" && !begins_with("\x89PNG\r\n\x1a\n", 8)) {
+        out.push_back({"E_MEMBER_MALFORMED", where + ": image/png bytes do not begin with "
+                                                     "the PNG signature (spec § 5.15)"});
+    } else if (media_type == "image/jpeg" && !begins_with("\xff\xd8\xff", 3)) {
+        out.push_back({"E_MEMBER_MALFORMED",
+                       where + ": image/jpeg bytes do not begin with FF D8 FF (spec § 5.15)"});
+    } else if (media_type == "image/svg+xml") {
+        static const char kSvg[] = "<svg";
+        if (!valid_utf8(raw))
+            out.push_back({"E_UTF8", where + ": image/svg+xml bytes do not decode as "
+                                             "UTF-8 (spec § 5.15)"});
+        else if (std::search(raw.begin(), raw.end(), kSvg, kSvg + 4) == raw.end())
+            out.push_back({"E_MEMBER_MALFORMED", where + ": image/svg+xml bytes contain no "
+                                                         "<svg element (spec § 5.15)"});
+    }
+    return out;
+}
+
+// A `reaction.scheme` payload (spec § 5.14): every participant names a
+// `structure` section (E_REF_UNRESOLVED), the step ids are unique and no
+// structure repeats within one role of a step (E_MEMBER_MALFORMED). Mirrors
+// _reaction_scheme_errors() in python/qvf_reader.py.
+inline std::vector<CodeFinding> reaction_scheme_errors(
+    const std::string& sid, const Json& payload,
+    const std::map<std::string, std::string>& kinds_by_id) {
+    std::vector<CodeFinding> out;
+    const Json* steps = get(payload, "steps");
+    if (!steps || !steps->is_array()) return out;
+    const std::string sec = "section " + quote_str(sid) + ": ";
+    std::set<std::string> seen;
+    const std::vector<Json>& list = steps->elements();
+    for (size_t k = 0; k < list.size(); ++k) {
+        const Json& step = list[k];
+        if (!step.is_object()) continue;
+        const Json* id = get(step, "id");
+        if (id && id->is_string()) {
+            if (seen.count(id->as_string()))
+                out.push_back({"E_MEMBER_MALFORMED",
+                               sec + "step id " + quote_str(id->as_string()) +
+                                   " is used by more than one step (spec § 5.14)"});
+            seen.insert(id->as_string());
+        }
+        for (const char* role : {"reactants", "products", "reagents"}) {
+            const Json* items = get(step, role);
+            if (!items || !items->is_array()) continue;
+            std::map<std::string, size_t> uses;   // sorted, as Python's sorted()
+            for (const Json& item : items->elements()) {
+                const Json* ref = get(item, "structure_ref");
+                if (!ref || !ref->is_string()) continue;
+                ++uses[ref->as_string()];
+                auto it = kinds_by_id.find(ref->as_string());
+                if (it == kinds_by_id.end() || it->second != "structure")
+                    out.push_back({"E_REF_UNRESOLVED",
+                                   sec + "step " + std::to_string(k) + " " + role +
+                                       " structure_ref " + quote_str(ref->as_string()) +
+                                       " does not name a structure section (spec § 5.14)"});
+            }
+            for (const auto& u : uses)
+                if (u.second > 1)
+                    out.push_back({"E_MEMBER_MALFORMED",
+                                   sec + "step " + std::to_string(k) + " names " +
+                                       quote_str(u.first) + " more than once among its " +
+                                       role + " (spec § 5.14)"});
+        }
+    }
+    return out;
+}
+
+// The chemical identity of a `structure` section (spec § 5.1): an integer
+// `charge` leaves a non-negative electron count N = sum_z - charge for the
+// atoms of its payload (`sum_z`, nullptr when an atomic number is missing or
+// not a non-negative integer), and an integer `multiplicity` >= 1 has
+// multiplicity - 1 <= N with the parity of N (E_CHARGE_MULTIPLICITY); in an
+// archive with exactly one structure section both equal the integer
+// provenance.charge / provenance.multiplicity (E_ROOT_INCONSISTENT). The
+// findings name the section field. Mirrors _identity_errors() in
+// python/qvf_reader.py; the arithmetic is exact for every int64 value.
+inline std::vector<FieldFinding> identity_errors(const std::string& sid, const Json& section,
+                                                 const int64_t* sum_z, const Json* provenance,
+                                                 bool only_structure) {
+    std::vector<FieldFinding> out;
+    const Json* cj = get(section, "charge");
+    const Json* mj = get(section, "multiplicity");
+    const bool has_charge = is_int(cj);
+    const bool has_mult = is_int(mj) && mj->as_int() >= 1;
+    const int64_t charge = has_charge ? cj->as_int() : 0;
+    const int64_t mult = has_mult ? mj->as_int() : 0;
+    const std::string sec = "structure " + quote_str(sid) + ": ";
+    if (has_charge && sum_z) {
+        const int64_t z = *sum_z;   // >= 0
+        if (charge > z) {
+            out.push_back({"E_CHARGE_MULTIPLICITY", "charge",
+                           sec + "charge " + std::to_string(charge) + " leaves " +
+                               std::to_string(z - charge) +
+                               " electrons for atoms whose atomic numbers sum to " +
+                               std::to_string(z) + " (spec § 5.1)"});
+        } else if (has_mult) {
+            // N = z - charge >= 0, exact in uint64 even for a very negative charge.
+            const uint64_t electrons = static_cast<uint64_t>(z) - static_cast<uint64_t>(charge);
+            const uint64_t unpaired = static_cast<uint64_t>(mult - 1);
+            if (unpaired > electrons || ((electrons ^ unpaired) & 1u))
+                out.push_back({"E_CHARGE_MULTIPLICITY", "multiplicity",
+                               sec + "multiplicity " + std::to_string(mult) +
+                                   " is impossible with " + std::to_string(electrons) +
+                                   " electrons (charge " + std::to_string(charge) +
+                                   "): the unpaired electrons must not exceed the electron "
+                                   "count and must have its parity (spec § 5.1)"});
+        }
+    }
+    if (only_structure && provenance && provenance->is_object()) {
+        const struct {
+            const char* field;
+            bool has;
+            int64_t value;
+        } fields[] = {{"charge", has_charge, charge}, {"multiplicity", has_mult, mult}};
+        for (const auto& fv : fields) {
+            const Json* stated = get(*provenance, fv.field);
+            if (fv.has && is_int(stated) && stated->as_int() != fv.value)
+                out.push_back({"E_ROOT_INCONSISTENT", fv.field,
+                               sec + fv.field + " " + std::to_string(fv.value) +
+                                   " differs from provenance." + fv.field + " " +
+                                   std::to_string(stated->as_int()) +
+                                   ", which describes the archive's only structure "
+                                   "(spec § 5.1)"});
+        }
+    }
+    return out;
+}
+
+// The whole validator. Never throws for malformed input: every problem is a
+// finding. Mirrors _validate_open_zip() in python/qvf_reader.py check for check.
+inline void run_validation(const ZipReader& zip, const Limits& lim,
+                           const ValidationOptions& opts, std::vector<Finding>& out) {
+    Sink f(out);
+    const std::vector<ZipReader::Entry>& entries = zip.entries();
+    const std::vector<std::string> names = zip.names();
+    std::map<std::string, size_t> counts;
+    for (const auto& e : entries) ++counts[e.name];
+
+    // --- container: central-directory checks, before decompressing anything
+    for (const auto& name : names) {
+        const size_t n = counts[name];
+        if (n > 1 && name == "manifest.json") {
+            // An archive updated in place: the last manifest.json is the
+            // manifest, every earlier one is superseded (spec § 2.3).
+            for (size_t copy = 1; copy < n; ++copy)
+                f.warning("W_ORPHAN_MEMBER", "entry:" + name,
+                          "ZIP entry " + quote_str(name) + " (" + std::to_string(copy) +
+                              " of " + std::to_string(n) + ") is superseded by the last " +
+                              quote_str(name) +
+                              " entry (archive updated in place; consumers ignore it)");
+        } else if (n > 1) {
+            f.error("E_ZIP_DUPLICATE_ENTRY", "entry:" + name,
+                    "ZIP entry name " + quote_str(name) + " occurs " + std::to_string(n) +
+                        " times; readers disagree on which entry wins");
+        }
+    }
+    for (const auto& name : names) {
+        std::string why = path_problem(name);
+        if (!why.empty())
+            f.error("E_MEMBER_PATH", "entry:" + name,
+                    "ZIP entry " + quote_str(name) + ": illegal path (" + why + ")");
+    }
+    std::set<std::string> unsafe;  // entries that must not be decompressed
+    uint64_t total = 0;
+    for (const auto& e : entries) {
+        total += e.usize;
+        if (e.usize > lim.max_member_bytes) {
+            f.error("E_MEMBER_TOO_LARGE", "entry:" + e.name,
+                    "ZIP entry " + quote_str(e.name) +
+                        " exceeds the per-member size cap (" +
+                        std::to_string(e.usize) + " > " +
+                        std::to_string(lim.max_member_bytes) +
+                        " bytes uncompressed)");
+            unsafe.insert(e.name);
+        }
+        if (lim.max_ratio > 0 && e.method != 0 && e.usize >= lim.ratio_exempt_bytes &&
+            (e.csize == 0 ||
+             static_cast<double>(e.usize) > lim.max_ratio * static_cast<double>(e.csize))) {
+            std::string ratio =
+                e.csize ? format_number(static_cast<double>(e.usize) / e.csize) : "inf";
+            f.error("E_COMPRESSION_RATIO", "entry:" + e.name,
+                    "ZIP entry " + quote_str(e.name) + " expands " +
+                        std::to_string(e.usize) + " bytes from " +
+                        std::to_string(e.csize) + " (ratio " + ratio + " > " +
+                        format_number(lim.max_ratio) + ")");
+            unsafe.insert(e.name);
+        }
+    }
+    const bool payloads_blocked = total > lim.max_total_bytes;
+    if (payloads_blocked)
+        f.error("E_TOTAL_TOO_LARGE", "archive",
+                "archive expands to " + std::to_string(total) +
+                    " bytes uncompressed, over the " +
+                    std::to_string(lim.max_total_bytes) +
+                    "-byte total cap; member payloads were not read");
+
+    // --- manifest (find() resolves a duplicated name to its last central-
+    // directory record: the current manifest of an updated archive, § 2.3)
+    const ZipReader::Entry* me = zip.find("manifest.json");
+    if (!me) {
+        f.error("E_MANIFEST_MISSING", "manifest.json", "missing manifest.json");
+        return;
+    }
+    if (me->usize > lim.max_json_bytes) {
+        f.error("E_JSON_TOO_LARGE", "manifest.json",
+                "manifest.json is " + std::to_string(me->usize) +
+                    " bytes, over the " + std::to_string(lim.max_json_bytes) +
+                    "-byte JSON cap");
+        return;
+    }
+    if (unsafe.count("manifest.json")) return;
+    std::vector<uint8_t> raw;
+    try {
+        raw = zip.read("manifest.json", lim.max_member_bytes);
+    } catch (const std::exception& ex) {
+        f.error("E_ZIP_UNREADABLE", "entry:manifest.json",
+                std::string("ZIP entry 'manifest.json' cannot be read: ") + ex.what());
+        return;
+    }
     Json manifest;
-    explicit Impl(std::vector<uint8_t> bytes) : zip(std::move(bytes)) {
-        std::vector<uint8_t> mf = zip.read("manifest.json");
-        manifest = Json::parse(std::string(mf.begin(), mf.end()));
+    try {
+        manifest = Json::parse(std::string(raw.begin(), raw.end()), lim.max_json_depth);
+    } catch (const JsonDepthError&) {
+        f.error("E_JSON_TOO_DEEP", "manifest.json",
+                "manifest.json nests deeper than " +
+                    std::to_string(lim.max_json_depth) + " levels");
+        return;
+    } catch (const std::exception& ex) {
+        f.error("E_MANIFEST_JSON", "manifest.json",
+                std::string("manifest.json is not valid JSON: ") + ex.what());
+        return;
+    }
+    if (!valid_utf8(raw)) {
+        f.error("E_MANIFEST_JSON", "manifest.json",
+                "manifest.json is not valid JSON: invalid UTF-8");
+        return;
+    }
+    if (!manifest.is_object()) {
+        f.error("E_MANIFEST_JSON", "manifest.json", "manifest.json must be a JSON object");
+        return;
+    }
+
+    // Root sanity. The withdrawn version 2 is read as 1 (spec § 3.1): every
+    // check sees version 1, the JSON Schema check included.
+    const Json* version = get(manifest, "qvf_version");
+    const Json* checked_manifest = &manifest;
+    Json v1_manifest;
+    if (version && version->is_number() && version->as_double() == 2.0) {
+        f.warning("W_VERSION_WITHDRAWN", "/qvf_version",
+                  "qvf_version 2 was withdrawn: the archive is checked as version 1, "
+                  "which producers must write (spec § 3.1)");
+        v1_manifest = manifest;
+        v1_manifest.set("qvf_version", 1);
+        checked_manifest = &v1_manifest;
+    } else if (!version || !version->is_number() || version->as_double() != 1.0) {
+        f.error("E_VERSION", "/qvf_version",
+                "qvf_version must be 1, got " + (version ? show(*version) : "nothing"));
+    }
+    const Json* src = get(manifest, "source");
+    if (src && !src->is_object()) {
+        f.error("E_SOURCE", "/source", "source must be a JSON object");
+        src = nullptr;
+    }
+    for (const char* key : {"program", "version", "calculation"}) {
+        if (!src || !src->contains(key))
+            f.error("E_SOURCE", "/source", std::string("source.") + key + " is missing");
+    }
+    auto non_empty = [&](const char* key) {
+        const Json* v = src ? get(*src, key) : nullptr;
+        return v && truthy(*v);
+    };
+    if (!non_empty("program") || !non_empty("version"))
+        f.error("E_SOURCE", "/source", "source.program and source.version must be non-empty");
+    for (const auto& e : root_consistency_errors(manifest))
+        f.error("E_ROOT_INCONSISTENT", e.first, e.second);
+
+    // The JSON Schema, through the checker generated from it.
+    if (opts.schema_check) {
+        for (const schema::Error& e : schema::check_manifest(*checked_manifest))
+            f.error("E_SCHEMA", e.pointer.empty() ? "manifest.json" : e.pointer,
+                    (e.location.empty() ? "(root)" : e.location) + ": " + e.message);
+    } else {
+        f.warning("W_SCHEMA_SKIPPED", "manifest.json",
+                  "the JSON Schema check was disabled; structural schema check skipped");
+    }
+
+    // Declared units of {value, units} objects in provenance (spec § 4.3).
+    if (const Json* prov = get(manifest, "provenance")) {
+        if (prov->is_object())
+            for (const auto& kv : prov->items()) {
+                const Json& v = kv.second;
+                if (!v.is_object() || !v.contains("value") || !v.contains("units"))
+                    continue;
+                const Json& u = v.at("units");
+                if (!(u.is_string() && canonical_unit(u.as_string())))
+                    f.warning("W_UNIT_UNKNOWN",
+                              "/provenance/" + escape_pointer(kv.first) + "/units",
+                              "provenance." + kv.first + ".units " + show(u) +
+                                  " is not a unit name of spec § 4.3 or a legacy "
+                                  "spelling");
+            }
+    }
+
+    std::vector<const Json*> sections;
+    if (const Json* secs = get(manifest, "sections")) {
+        if (!secs->is_array())
+            f.error("E_SECTION_MALFORMED", "/sections", "sections must be an array");
+        else
+            for (const Json& s : secs->elements()) sections.push_back(&s);
+    }
+    std::set<std::string> section_ids;
+    std::map<std::string, std::string> kinds_by_id;  // first occurrence wins
+    std::vector<std::string> structure_ids;
+    // Section id -> kind ("" when not a string), for reference resolution
+    // (spec § 4.1, § 5.5). With duplicate ids the first section wins.
+    std::map<std::string, std::string> section_kinds;
+    for (const Json* s : sections) {
+        const Json* id = get(*s, "id");
+        if (id && id->is_string()) {
+            section_ids.insert(id->as_string());
+            const Json* k = get(*s, "kind");
+            if (k && k->is_string()) {
+                kinds_by_id.emplace(id->as_string(), k->as_string());
+                if (k->as_string() == "structure") structure_ids.push_back(id->as_string());
+            }
+            section_kinds.emplace(id->as_string(),
+                                  k && k->is_string() ? k->as_string() : std::string());
+        }
+    }
+    const std::string* only_structure =
+        structure_ids.size() == 1 ? &structure_ids.front() : nullptr;
+    std::map<std::string, int64_t> n_atoms_of;  // structure id -> atom count
+    std::map<std::string, int64_t> sum_z_of;    // structure id -> sum of atomic numbers
+    std::vector<DeferredSection> identity_sections;   // structure sections, checked last
+    std::map<std::string, bool> periodic_of;    // structure id -> any(pbc)
+    std::vector<DerivativeSection> derivative_sections;  // checked last
+    std::vector<DeferredSection> bonds_sections;         // standalone bonds, checked last
+    // Excited states (spec § 5.12): orbital rows of every wavefunction.gto,
+    // state indices of every excited_states payload, and the sections whose
+    // references are checked once every payload has been read.
+    std::map<std::string, MoRows> mo_rows_of;
+    for (const Json* s : sections) {
+        const Json* id = get(*s, "id");
+        const Json* k = get(*s, "kind");
+        if (id && id->is_string() && k && k->is_string() &&
+            k->as_string() == "wavefunction.gto" && !mo_rows_of.count(id->as_string()))
+            mo_rows_of.emplace(id->as_string(), mo_rows(get(*s, "members")));
+    }
+    std::map<std::string, StateIndices> state_indices_of;
+    std::vector<DeferredSection> nto_sections;
+    std::vector<DeferredSection> excited_sections, states_ref_spectra,
+        transition_densities;
+    std::map<std::string, Json> cells;          // structure id -> payload
+    std::vector<GridMember> grid_members;       // grid payloads, checked last
+    std::vector<PropertySection> property_sections;      // checked last
+    std::vector<BlochSection> bloch_sections;            // checked last
+    const Json* declared_ext = get(manifest, "extensions");
+    if (declared_ext && !declared_ext->is_object()) declared_ext = nullptr;
+    std::set<std::string> declared_paths;
+    std::set<std::string> seen_ids;
+
+    for (size_t i = 0; i < sections.size(); ++i) {
+        const Json& s = *sections[i];
+        const std::string here = section_pointer(i);
+        if (!s.is_object()) {
+            f.error("E_SECTION_MALFORMED", here,
+                    "section " + std::to_string(i) + " must be a JSON object");
+            continue;
+        }
+        std::string sid;
+        const Json* idj = get(s, "id");
+        if (!idj || !idj->is_string()) {
+            f.error("E_SECTION_MALFORMED", here,
+                    "section " + std::to_string(i) + ": id must be a string, got " +
+                        (idj ? show(*idj) : "nothing"));
+            sid = "<section " + std::to_string(i) + ">";
+        } else {
+            sid = idj->as_string();
+            if (seen_ids.count(sid))
+                f.error("E_SECTION_ID_DUPLICATE", here + "/id",
+                        "duplicate section id " + quote_str(sid));
+            seen_ids.insert(sid);
+            if (sid == "auto_open" || sid == "bookmarks" || sid == "camera" ||
+                sid == "crossfade")
+                f.error("E_RESERVED_ID", here + "/id",
+                        "section id " + quote_str(sid) +
+                            " is reserved (a viewer_defaults key, spec § 3.1, § 3.4)");
+        }
+
+        std::string kind;
+        const Json* kj = get(s, "kind");
+        if (!kj || !kj->is_string()) {
+            f.error("E_SECTION_MALFORMED", here,
+                    "section " + quote_str(sid) + ": kind must be a string, got " +
+                        (kj ? show(*kj) : "nothing"));
+        } else {
+            kind = kj->as_string();
+            if (!is_canonical_kind(kind) && !starts_with(kind, "x_"))
+                f.error("E_KIND_UNKNOWN", here + "/kind",
+                        "section " + quote_str(sid) + ": unknown non-vendor kind " +
+                            quote_str(kind));
+        }
+
+        // critical governance (spec § 7.4).
+        const Json* cj = get(s, "critical");
+        if (cj && truthy(*cj) && starts_with(kind, "x_")) {
+            std::string vendor = kind.substr(0, kind.find('.'));
+            if (!declared_ext || !declared_ext->contains(vendor))
+                f.error("E_CRITICAL_UNDECLARED", here + "/critical",
+                        "section " + quote_str(sid) + " is critical but its namespace " +
+                            quote_str(vendor) + " is not declared in root extensions");
+        }
+
+        const Json* members = get(s, "members");
+        if (!members || !members->is_object()) {
+            f.error("E_SECTION_MALFORMED", here,
+                    "section " + quote_str(sid) + ": members must be a JSON object");
+            members = nullptr;
+        }
+
+        std::map<std::string, Json> docs;  // parsed JSON members, by role
+        std::vector<uint8_t> overlap_bytes;  // a wavefunction.gto overlap member
+        bool have_overlap = false;
+        std::vector<uint8_t> energies_bytes;  // trajectory-family energies member
+        bool have_energies_bytes = false;
+        if (members) {
+            for (const auto& kv : members->items()) {
+                const std::string& role = kv.first;
+                const Json& m = kv.second;
+                const std::string mwhere = member_pointer(i, role);
+                const Json* pj = get(m, "path");
+                if (!pj || !pj->is_string()) {
+                    f.error("E_MEMBER_MALFORMED", mwhere,
+                            "section " + quote_str(sid) + " member " + quote_str(role) +
+                                ": malformed spec");
+                    continue;
+                }
+                const std::string& mpath = pj->as_string();
+                declared_paths.insert(mpath);
+                std::string why = path_problem(mpath);
+                if (!why.empty()) {
+                    f.error("E_MEMBER_PATH", mwhere,
+                            "member " + quote_str(mpath) + ": illegal path (" + why + ")");
+                    continue;
+                }
+                const ZipReader::Entry* e = zip.find(mpath);
+                if (!e) {
+                    f.error("E_MEMBER_MISSING", mwhere,
+                            "member " + quote_str(mpath) + " declared but not in archive");
+                    continue;
+                }
+                // Declared size against the central directory, before reading.
+                std::string size_msg;
+                if (const char* code = size_problem(m, *e, size_msg))
+                    f.error(code, mwhere, size_msg);
+                if (payloads_blocked || unsafe.count(mpath)) continue;
+                const Json* fj = get(m, "format");
+                const std::string fmt = fj && fj->is_string() ? fj->as_string() : "";
+                if (fmt == "json" && e->usize > lim.max_json_bytes) {
+                    f.error("E_JSON_TOO_LARGE", mwhere,
+                            "member " + quote_str(mpath) + ": " + std::to_string(e->usize) +
+                                " bytes, over the " + std::to_string(lim.max_json_bytes) +
+                                "-byte JSON cap");
+                    continue;
+                }
+                std::vector<uint8_t> bytes;
+                try {
+                    bytes = zip.read(mpath, lim.max_member_bytes);
+                } catch (const std::exception& ex) {
+                    f.error("E_ZIP_UNREADABLE", "entry:" + mpath,
+                            "ZIP entry " + quote_str(mpath) + " cannot be read: " + ex.what());
+                    continue;
+                }
+                if (const Json* hj = get(m, "sha256")) {
+                    if (!hj->is_string() || hj->as_string() != Sha256::hex_of(bytes))
+                        f.error("E_SHA256_MISMATCH", mwhere,
+                                "member " + quote_str(mpath) + ": sha256 mismatch");
+                }
+                if (fmt == "json") {
+                    Json doc;
+                    bool parsed = false;
+                    try {
+                        doc = Json::parse(std::string(bytes.begin(), bytes.end()),
+                                          lim.max_json_depth);
+                        parsed = true;
+                    } catch (const JsonDepthError&) {
+                        f.error("E_JSON_TOO_DEEP", mwhere,
+                                "member " + quote_str(mpath) + ": JSON nests deeper than " +
+                                    std::to_string(lim.max_json_depth) + " levels");
+                        continue;
+                    } catch (const std::exception& ex) {
+                        f.error("E_JSON_INVALID", mwhere,
+                                "member " + quote_str(mpath) + ": not valid JSON (" +
+                                    ex.what() + ")");
+                    }
+                    if (parsed && !valid_utf8(bytes)) {
+                        f.error("E_JSON_INVALID", mwhere,
+                                "member " + quote_str(mpath) +
+                                    ": not valid JSON (invalid UTF-8)");
+                        parsed = false;
+                    }
+                    if (parsed) {
+                        if (kind == "structure" && role == "structure") {
+                            for (const auto& msg : structure_payload_errors(sid, doc))
+                                f.error("E_STRUCTURE_PERIODICITY", mwhere, msg);
+                            const Json* atoms = get(doc, "atoms");
+                            if (atoms && atoms->is_array()) {
+                                n_atoms_of.emplace(sid,
+                                                   static_cast<int64_t>(atoms->size()));
+                                // Σ Z, when every atomic_number is a
+                                // non-negative integer (spec § 5.1).
+                                int64_t sum_z = 0;
+                                bool known = true;
+                                for (const Json& a : atoms->elements()) {
+                                    const Json* z = get(a, "atomic_number");
+                                    if (!is_int(z) || z->as_int() < 0 ||
+                                        sum_z > INT64_MAX - z->as_int()) {
+                                        known = false;
+                                        break;
+                                    }
+                                    sum_z += z->as_int();
+                                }
+                                if (known) sum_z_of.emplace(sid, sum_z);
+                            }
+                            if (doc.is_object()) cells.emplace(sid, doc);
+                            if (doc.is_object()) {
+                                const Json* pbc = get(doc, "pbc");
+                                bool periodic = false;
+                                if (pbc && pbc->is_array())
+                                    for (const Json& x : pbc->elements())
+                                        periodic = periodic || (x.is_bool() && x.as_bool());
+                                periodic_of.emplace(sid, periodic);
+                            }
+                        }
+                        if (is_grid_payload(kind, role) && doc.is_object())
+                            grid_members.push_back(GridMember{mwhere, sid, &s, doc});
+                        // The member's payload definition (spec § 5, § 6).
+                        const std::string_view def = gen::payload_def(kind, role);
+                        if (opts.schema_check && !def.empty())
+                            for (const schema::Error& e : schema::check_definition(def, doc))
+                                f.error("E_PAYLOAD_SCHEMA", mwhere,
+                                        "schema: " + mpath + ": " + e.location + ": " +
+                                            e.message);
+                        if (is_canonical_kind(kind))
+                            for (const auto& du : declared_units(kind, role, doc))
+                                if (!(du.second->is_string() &&
+                                      parse_unit(du.second->as_string())))
+                                    f.warning("W_UNIT_UNKNOWN", mwhere,
+                                              "member " + quote_str(mpath) +
+                                                  ": declared unit " + show(*du.second) +
+                                                  " at " + du.first +
+                                                  " is not a unit name of spec § 4.3");
+                        docs[role] = std::move(doc);
+                    }
+                } else if (fmt == "binary" && m.contains("dtype")) {
+                    const Json& dj = m.at("dtype");
+                    size_t itemsize = dj.is_string() ? dtype_itemsize(dj.as_string()) : 0;
+                    const Json* shape = get(m, "shape");
+                    bool shape_ok = true;
+                    if (shape) {
+                        shape_ok = shape->is_array();
+                        if (shape_ok)
+                            for (const Json& d : shape->elements())
+                                if (d.type() != Json::Type::Int || d.as_int() < 0)
+                                    shape_ok = false;
+                    }
+                    if (!itemsize) {
+                        f.error("E_DTYPE", mwhere,
+                                "member " + quote_str(mpath) + ": bad dtype " + show(dj));
+                    } else if (!shape_ok) {
+                        f.error("E_MEMBER_MALFORMED", mwhere,
+                                "member " + quote_str(mpath) +
+                                    ": shape must be a list of non-negative integers, "
+                                    "got " + show(*shape));
+                    } else {
+                        uint64_t n = 1;
+                        bool overflow = false;
+                        if (shape)
+                            for (const Json& d : shape->elements()) {
+                                uint64_t k = static_cast<uint64_t>(d.as_int());
+                                if (k && n > UINT64_MAX / k) overflow = true;
+                                else n *= k;
+                            }
+                        if (!overflow && n > UINT64_MAX / itemsize) overflow = true;
+                        uint64_t want = overflow ? 0 : n * itemsize;
+                        if (overflow || bytes.size() != want)
+                            f.error("E_BINARY_SIZE", mwhere,
+                                    "member " + quote_str(mpath) + ": byte length " +
+                                        std::to_string(bytes.size()) +
+                                        " != itemsize*prod(shape) " +
+                                        (overflow ? std::string("(overflow)")
+                                                  : std::to_string(want)));
+                        else if (kind == "wavefunction.gto" && role == "overlap") {
+                            overlap_bytes = bytes;
+                            have_overlap = true;
+                        }
+                    }
+                }
+                if (is_trajectory_kind(kind) && role == "energies" && fmt == "binary") {
+                    energies_bytes = bytes;
+                    have_energies_bytes = true;
+                }
+                if (kind == "run.record" && (role == "input" || role == "log") &&
+                    !valid_utf8(bytes))
+                    f.error("E_UTF8", mwhere,
+                            "member " + quote_str(mpath) + ": run.record " + role +
+                                " must decode as UTF-8");
+                if (kind == "preview" && fmt == "binary")
+                    for (const auto& e : preview_member_errors(sid, role, m, bytes))
+                        f.error(e.code, mwhere, e.message);
+            }
+        }
+
+        // 1-D spectra: one shared array length (spec § 5.4).
+        if (is_spectrum_1d(kind)) {
+            auto it = docs.find("spectrum");
+            for (const auto& msg :
+                 spectrum_payload_errors(sid, it != docs.end() ? &it->second : nullptr))
+                f.error("E_PAYLOAD_SCHEMA", member_pointer(i, "spectrum"), msg);
+        }
+
+        // Cross-references.
+        if (kind == "volume.difference") {
+            for (const char* op : {"operand_a", "operand_b"}) {
+                const Json* ref = get(s, op);
+                if (ref && !ref->is_null() &&
+                    (!ref->is_string() || !section_ids.count(ref->as_string())))
+                    f.error("E_REF_UNRESOLVED", here + "/" + op,
+                            "section " + quote_str(sid) + ": " + op + " " + show(*ref) +
+                                " does not resolve");
+            }
+        }
+        if (kind == "reaction.waypoints") {
+            const Json* ref = get(s, "trajectory_ref");
+            if (!ref || !ref->is_string() || !section_ids.count(ref->as_string()))
+                f.error("E_REF_UNRESOLVED", here + "/trajectory_ref",
+                        "section " + quote_str(sid) + ": trajectory_ref " +
+                            (ref ? show(*ref) : "nothing") + " does not resolve");
+            else if (section_kinds.at(ref->as_string()) != "trajectory")
+                f.error("E_REF_UNRESOLVED", here + "/trajectory_ref",
+                        "section " + quote_str(sid) + ": trajectory_ref " +
+                            show(*ref) + " names a section of kind " +
+                            quote_str(section_kinds.at(ref->as_string())) +
+                            ", not 'trajectory' (spec § 5.5)");
+        }
+        // Generic section references, on any kind (spec § 4.1).
+        static const struct {
+            const char* field;
+            const char* target;
+        } kSectionRefs[] = {{"structure_ref", "structure"}, {"run_ref", "run.record"}};
+        for (const auto& r : kSectionRefs) {
+            const Json* ref = get(s, r.field);
+            if (!ref || ref->is_null()) continue;
+            const std::string where = here + "/" + r.field;
+            if (!ref->is_string() || !section_kinds.count(ref->as_string()))
+                f.error("E_REF_UNRESOLVED", where,
+                        "section " + quote_str(sid) + ": " + r.field + " " + show(*ref) +
+                            " does not resolve");
+            else if (section_kinds.at(ref->as_string()) != r.target)
+                f.error("E_REF_UNRESOLVED", where,
+                        "section " + quote_str(sid) + ": " + r.field + " " + show(*ref) +
+                            " names a section of kind " +
+                            quote_str(section_kinds.at(ref->as_string())) + ", not " +
+                            quote_str(r.target) + " (spec § 4.1)");
+        }
+        if (kind == "bands" && members)
+            for (const auto& e : bands_shape_errors(sid, *members))
+                f.error("E_MEMBER_MALFORMED", member_pointer(i, e.first), e.second);
+        if (is_trajectory_kind(kind) && members) {
+            auto it = docs.find("metadata");
+            for (const auto& e : trajectory_errors(
+                     sid, kind, *members, it != docs.end() ? &it->second : nullptr,
+                     have_energies_bytes ? &energies_bytes : nullptr))
+                f.error("E_MEMBER_MALFORMED", member_pointer(i, e.first), e.second);
+        }
+        if (kind == "vibrations") {
+            if (const Json* ref = get(s, "hessian_ref")) {
+                auto it = ref->is_string() ? kinds_by_id.find(ref->as_string())
+                                           : kinds_by_id.end();
+                if (it == kinds_by_id.end() || it->second != "hessian")
+                    f.error("E_REF_UNRESOLVED", here + "/hessian_ref",
+                            "section " + quote_str(sid) + ": hessian_ref " + show(*ref) +
+                                " does not name a hessian section (spec § 5.5)");
+            }
+        }
+        if (kind == "job.spec") {
+            // The payload's structure_ref names a structure section (spec § 5.9).
+            auto it = docs.find("spec");
+            if (it != docs.end()) {
+                if (const Json* ref = get(it->second, "structure_ref")) {
+                    auto kind_it = ref->is_string() ? kinds_by_id.find(ref->as_string())
+                                                    : kinds_by_id.end();
+                    if (kind_it == kinds_by_id.end() || kind_it->second != "structure")
+                        f.error("E_REF_UNRESOLVED", member_pointer(i, "spec"),
+                                "section " + quote_str(sid) + ": spec.structure_ref " +
+                                    show(*ref) +
+                                    " does not name a structure section (spec § 5.9)");
+                }
+            }
+        }
+        if (kind == "forces" || kind == "hessian") {
+            auto it = docs.find("meta");
+            const bool has_meta = it != docs.end();
+            derivative_sections.push_back(DerivativeSection{
+                i, sid, kind, &s, members, has_meta, has_meta ? it->second : Json()});
+        }
+        if (kind == "bonds" && s.has("structure_ref")) {
+            auto it = docs.find("bonds");
+            const bool has_doc = it != docs.end();
+            bonds_sections.push_back(
+                DeferredSection{i, sid, &s, has_doc, has_doc ? it->second : Json()});
+        }
+        if (kind == "excited_states") {
+            auto it = docs.find("states");
+            const bool has_doc = it != docs.end();
+            if (!state_indices_of.count(sid))
+                state_indices_of.emplace(sid,
+                                         state_indices(has_doc ? &it->second : nullptr));
+            excited_sections.push_back(DeferredSection{
+                i, sid, &s, has_doc, has_doc ? it->second : Json()});
+        }
+        if (kind == "spectra.ir" || kind == "spectra.raman" || kind == "spectra.uvvis" ||
+            kind == "spectra.ecd" || kind == "spectra.vcd" || kind == "spectra.generic") {
+            auto it = docs.find("spectrum");
+            if (it != docs.end() && it->second.is_object() &&
+                it->second.contains("states_ref"))
+                states_ref_spectra.push_back(DeferredSection{i, sid, &s, true, it->second});
+        }
+        if (kind == "volume.transition_density")
+            transition_densities.push_back(DeferredSection{i, sid, &s, false, Json()});
+        for (const auto& e : volume_errors(sid, kind, members, docs, kinds_by_id))
+            f.error(e.code, member_pointer(i, e.role), e.message);
+        if (is_property_kind(kind)) {
+            auto it = docs.find("properties");
+            if (it != docs.end())
+                property_sections.push_back(PropertySection{i, sid, kind, &s, it->second});
+        }
+        if (kind == "wavefunction.bloch")
+            bloch_sections.push_back(BlochSection{i, sid, &s, members, docs});
+        if (kind == "atom_properties" && members)
+            for (const auto& e : atom_properties_meta_errors(sid, *members, docs))
+                f.error("E_MEMBER_MALFORMED", member_pointer(i, e.first), e.second);
+        if (kind == "wavefunction.gto" && members) {
+            auto meta = docs.find("mo_metadata");
+            if (meta != docs.end()) {
+                nto_sections.push_back(DeferredSection{i, sid, &s, true, meta->second});
+                for (const auto& msg : unrestricted_nto_errors(meta->second, members))
+                    f.error("E_MEMBER_MALFORMED", member_pointer(i, "mo_metadata"), msg);
+            }
+            for (const auto& e :
+                 wavefunction_errors(sid, *members, docs, get(manifest, "provenance")))
+                f.error(e.code, member_pointer(i, e.role), e.message);
+            auto basis = docs.find("basis");
+            for (const auto& msg : normalization_errors(
+                     sid, basis == docs.end() ? nullptr : &basis->second,
+                     get(*members, "overlap"), have_overlap ? &overlap_bytes : nullptr))
+                f.error("E_NORMALIZATION", member_pointer(i, "overlap"), msg);
+        }
+        if (kind == "reaction.scheme") {
+            auto it = docs.find("scheme");
+            if (it != docs.end() && it->second.is_object())
+                for (const auto& e : reaction_scheme_errors(sid, it->second, kinds_by_id))
+                    f.error(e.code, member_pointer(i, "scheme"), e.message);
+        }
+        if (kind == "run.record") {
+            // job_ref names a job.spec section (spec § 5.8).
+            if (const Json* ref = get(s, "job_ref")) {
+                auto it = ref->is_string() ? kinds_by_id.find(ref->as_string())
+                                           : kinds_by_id.end();
+                if (it == kinds_by_id.end() || it->second != "job.spec")
+                    f.error("E_REF_UNRESOLVED", here + "/job_ref",
+                            "section " + quote_str(sid) + ": job_ref " + show(*ref) +
+                                " does not name a job.spec section (spec § 5.8)");
+            }
+        }
+        if (kind == "structure")
+            identity_sections.push_back(DeferredSection{i, sid, &s, false, Json()});
+        if (kind == "run.record") {
+            auto it = docs.find("files");
+            if (it != docs.end() && it->second.is_object())
+                for (const auto& kv : it->second.items())
+                    if (!members || !members->contains(kv.first))
+                        f.error("E_FILES_INDEX", member_pointer(i, "files"),
+                                "section " + quote_str(sid) + ": files index names role " +
+                                    quote_str(kv.first) + " with no matching member");
+        }
+    }
+
+    // Chemical identity of the structures (spec § 5.1).
+    for (const auto& d : identity_sections) {
+        auto z = sum_z_of.find(d.sid);
+        for (const auto& e : identity_errors(d.sid, *d.section,
+                                             z != sum_z_of.end() ? &z->second : nullptr,
+                                             get(manifest, "provenance"),
+                                             structure_ids.size() == 1))
+            f.error(e.code, section_pointer(d.index) + "/" + e.field, e.message);
+    }
+
+    // forces / hessian: shapes against the structure, which may come later.
+    for (const auto& d : derivative_sections)
+        for (const auto& e : derivative_errors(d.sid, d.kind, *d.section, d.members,
+                                               d.has_meta ? &d.meta : nullptr,
+                                               n_atoms_of, kinds_by_id, only_structure))
+            f.error(e.code, member_pointer(d.index, e.role), e.message);
+
+    // Standalone bonds: atom indices against the structure they name, which
+    // may come later (spec § 5.1).
+    for (const auto& d : bonds_sections)
+        for (const auto& msg : bonds_errors(d.sid, *d.section, d.has_doc ? &d.doc : nullptr,
+                                            kinds_by_id, n_atoms_of))
+            f.error("E_MEMBER_MALFORMED", member_pointer(d.index, "bonds"), msg);
+
+    for (const auto& d : nto_sections)
+        for (const auto& e : nto_pair_errors(d, nto_sections, kinds_by_id, state_indices_of))
+            f.error(e.first.c_str(), member_pointer(d.index, "mo_metadata"), e.second);
+
+    // Excited states, the spectra that name them, and transition densities
+    // (spec § 5.2, § 5.4, § 5.12): the sections they name may come later.
+    for (const auto& d : excited_sections)
+        for (const auto& e : excited_states_errors(d.sid, *d.section,
+                                                   d.has_doc ? &d.doc : nullptr,
+                                                   kinds_by_id, mo_rows_of))
+            f.error(e.code,
+                    e.field.empty() ? member_pointer(d.index, "states")
+                                    : section_pointer(d.index) + "/" + e.field,
+                    e.message);
+    for (const auto& d : states_ref_spectra)
+        for (const auto& msg : spectrum_states_errors(d.sid, d.doc, kinds_by_id,
+                                                      state_indices_of))
+            f.error("E_REF_UNRESOLVED", member_pointer(d.index, "spectrum"), msg);
+    for (const auto& d : transition_densities)
+        for (const auto& e : transition_density_errors(d.sid, *d.section, kinds_by_id,
+                                                       state_indices_of))
+            f.error("E_REF_UNRESOLVED", section_pointer(d.index) + "/" + e.first, e.second);
+
+    // Grids: references and periodic spans against the structure (spec § 5.2).
+    for (const auto& g : grid_members)
+        for (const auto& e : grid_errors(g.sid, *g.section, g.grid, kinds_by_id, cells,
+                                         only_structure))
+            f.error(e.first, g.where, e.second);
+
+    // properties.*: rules JSON Schema cannot express (spec § 5.13); the Born
+    // charges are counted against a structure that may come later.
+    for (const auto& p : property_sections)
+        for (const auto& e : property_errors(p.sid, p.kind, *p.section, p.payload, manifest,
+                                             n_atoms_of, only_structure))
+            f.error(e.code, member_pointer(p.index, "properties"), e.message);
+
+    // wavefunction.bloch: shapes, and a periodic structure, which may come later.
+    for (const auto& b : bloch_sections)
+        for (const auto& e : bloch_errors(b.sid, *b.section, b.members, b.docs, kinds_by_id,
+                                          periodic_of))
+            f.error(e.code, section_pointer(b.index) + "/" + e.role, e.message);
+
+    // --- orphans: entries no manifest member references (spec § 2.1)
+    for (const auto& name : names) {
+        if (name != "manifest.json" && !(name.size() && name.back() == '/') &&
+            !declared_paths.count(name))
+            f.warning("W_ORPHAN_MEMBER", "entry:" + name,
+                      "ZIP entry " + quote_str(name) +
+                          " is not referenced by any manifest member (orphan; "
+                          "consumers ignore it)");
+    }
+}
+
+}  // namespace vld
+}  // namespace detail
+
+bool has_errors(const std::vector<Finding>& findings) {
+    for (const auto& f : findings)
+        if (f.severity == Finding::Severity::Error) return true;
+    return false;
+}
+
+struct QvfReader::Impl {
+    detail::ZipReader zip;     // container::ZipReader, over memory or a file
+    Limits limits;
+    Json manifest;
+    Impl(detail::ZipReader z, const Limits& lim)
+        : zip(std::move(z)), limits(lim) {
+        // Superseded manifest.json copies of an archive updated in place are
+        // not ambiguous: the last one is the manifest (spec § 2.3).
+        for (const std::string& name : zip.duplicates())
+            if (name != "manifest.json")
+                throw std::runtime_error("E_ZIP_DUPLICATE_ENTRY: duplicate ZIP entry name '" +
+                                         name + "'; refusing an ambiguous archive");
+        manifest = parse_json_entry("manifest.json");
+    }
+
+    // Read and parse a JSON entry under the JSON size and depth caps.
+    Json parse_json_entry(const std::string& path) const {
+        std::vector<uint8_t> b = read_json_bytes(path);
+        return Json::parse(std::string(b.begin(), b.end()), limits.max_json_depth);
+    }
+
+    std::vector<uint8_t> read_json_bytes(const std::string& path) const {
+        const detail::ZipReader::Entry* e = zip.find(path);
+        if (!e) throw std::runtime_error("zip: member not found: " + path);
+        if (e->usize > limits.max_json_bytes)
+            throw std::runtime_error("E_JSON_TOO_LARGE: " + path + " is " +
+                                     std::to_string(e->usize) + " bytes, over the " +
+                                     std::to_string(limits.max_json_bytes) +
+                                     "-byte JSON cap");
+        return zip.read(path, limits.max_json_bytes);
     }
 
     const Json& member_spec(const std::string& sid, const std::string& role) const {
@@ -2638,8 +16971,9 @@ struct QvfReader::Impl {
         throw std::runtime_error("section id not found: " + sid);
     }
 
+    // A member's bytes under every cap of `limits` (member, total, ratio).
     std::vector<uint8_t> read_spec(const Json& spec, bool verify) const {
-        std::vector<uint8_t> bytes = zip.read(spec.at("path").as_string());
+        std::vector<uint8_t> bytes = zip.read(spec.at("path").as_string(), limits);
         if (verify && spec.contains("sha256")) {
             std::string got = detail::Sha256::hex_of(bytes);
             if (got != spec.at("sha256").as_string())
@@ -2659,7 +16993,8 @@ std::vector<double> BinaryMember::as_doubles() const {
     for (size_t i = 0; i < out.size(); ++i) {
         uint64_t bits = 0;
         for (int b = 0; b < 8; ++b)
-            bits |= static_cast<uint64_t>(bytes[i * 8 + b]) << (8 * b);
+            bits |= static_cast<uint64_t>(bytes[i * 8 + static_cast<size_t>(b)])
+                    << (8 * b);
         std::memcpy(&out[i], &bits, 8);  // little-endian host assumed (spec § 2.2)
     }
     return out;
@@ -2670,19 +17005,55 @@ QvfReader::QvfReader(QvfReader&&) noexcept = default;
 QvfReader& QvfReader::operator=(QvfReader&&) noexcept = default;
 QvfReader::~QvfReader() = default;
 
-QvfReader QvfReader::from_bytes(std::vector<uint8_t> archive) {
-    return QvfReader(std::unique_ptr<Impl>(new Impl(std::move(archive))));
+// "little" is the only v1 byte order; refuse rather than guess (spec § 2.2).
+// (A schema violation, hence the E_SCHEMA prefix, as in the Python reader.)
+static QvfReader checked_byte_order(QvfReader reader) {
+    const Json* order = detail::vld::get(reader.manifest(), "byte_order");
+    if (order && !(order->is_string() && order->as_string() == "little"))
+        throw std::runtime_error("E_SCHEMA: byte_order " + detail::vld::show(*order) +
+                                 " is not 'little', the only byte order of QVF v1 "
+                                 "(spec § 2.2); refusing to guess");
+    return reader;
 }
 
-QvfReader QvfReader::open(const std::string& path) {
-    std::ifstream fh(path, std::ios::binary);
-    if (!fh) throw std::runtime_error("cannot open: " + path);
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(fh)),
-                               std::istreambuf_iterator<char>());
-    return from_bytes(std::move(bytes));
+QvfReader QvfReader::from_bytes(std::vector<uint8_t> archive, const Limits& limits) {
+    QvfReader reader = checked_byte_order(QvfReader(std::unique_ptr<Impl>(
+        new Impl(detail::ZipReader(std::move(archive)), limits))));
+    if (reader.manifest().is_object())
+        reader.typed_ =
+            std::make_shared<const Manifest>(Manifest::from_json(reader.manifest()));
+    return reader;
+}
+
+// Refuse a member whose declared `size` disagrees with its ZIP entry (spec
+// § 4.2), before reading it. Other problems of the spec are left to the read.
+static void check_declared_size(const detail::ZipReader& zip, const Json& spec) {
+    const Json* path = detail::vld::get(spec, "path");
+    if (!path || !path->is_string()) return;
+    const detail::ZipReader::Entry* e = zip.find(path->as_string());
+    if (!e) return;
+    std::string message;
+    if (const char* code = detail::vld::size_problem(spec, *e, message))
+        throw std::runtime_error(std::string(code) + ": " + message);
+}
+
+// The archive file stays open; entries are read from it on demand.
+QvfReader QvfReader::open(const std::string& path, const Limits& limits) {
+    QvfReader reader = checked_byte_order(
+        QvfReader(std::unique_ptr<Impl>(new Impl(detail::ZipReader::open(path), limits))));
+    if (reader.manifest().is_object())
+        reader.typed_ =
+            std::make_shared<const Manifest>(Manifest::from_json(reader.manifest()));
+    return reader;
 }
 
 const Json& QvfReader::manifest() const { return impl_->manifest; }
+
+const Manifest& QvfReader::typed_manifest() const {
+    if (!typed_) throw std::runtime_error("manifest.json is not a JSON object");
+    return *typed_;
+}
+
 const Json& QvfReader::sections() const { return impl_->manifest.at("sections"); }
 
 bool QvfReader::has_section(const std::string& id) const {
@@ -2704,13 +17075,21 @@ const Json& QvfReader::section(const std::string& id) const {
 std::vector<uint8_t> QvfReader::read_member_bytes(const std::string& sid,
                                                   const std::string& role,
                                                   bool verify) const {
-    return impl_->read_spec(impl_->member_spec(sid, role), verify);
+    const Json& spec = impl_->member_spec(sid, role);
+    check_declared_size(impl_->zip, spec);
+    return impl_->read_spec(spec, verify);
 }
 
 Json QvfReader::read_json_member(const std::string& sid, const std::string& role,
                                  bool verify) const {
-    std::vector<uint8_t> b = read_member_bytes(sid, role, verify);
-    return Json::parse(std::string(b.begin(), b.end()));
+    const Json& spec = impl_->member_spec(sid, role);
+    check_declared_size(impl_->zip, spec);
+    const detail::ZipReader::Entry* e = impl_->zip.find(spec.at("path").as_string());
+    if (e && e->usize > impl_->limits.max_json_bytes)
+        throw std::runtime_error("E_JSON_TOO_LARGE: " + spec.at("path").as_string() +
+                                 " is over the JSON size cap");
+    std::vector<uint8_t> b = impl_->read_spec(spec, verify);
+    return Json::parse(std::string(b.begin(), b.end()), impl_->limits.max_json_depth);
 }
 
 BinaryMember QvfReader::read_binary_member(const std::string& sid,
@@ -2724,54 +17103,65 @@ BinaryMember QvfReader::read_binary_member(const std::string& sid,
         for (size_t i = 0; i < sh.size(); ++i)
             bm.shape.push_back(sh.at(i).as_int());
     }
+    check_declared_size(impl_->zip, spec);
     bm.bytes = impl_->read_spec(spec, verify);
     return bm;
 }
 
+std::vector<Finding> QvfReader::validate_findings(const Limits& limits,
+                                                 const ValidationOptions& options) const {
+    std::vector<Finding> out;
+    detail::vld::run_validation(impl_->zip, limits, options, out);
+    return out;
+}
+
+std::vector<Finding> QvfReader::validate_bytes(std::vector<uint8_t> archive,
+                                               const Limits& limits,
+                                               const ValidationOptions& options) {
+    std::vector<Finding> out;
+    std::unique_ptr<detail::ZipReader> zip;
+    try {
+        zip.reset(new detail::ZipReader(std::move(archive)));
+    } catch (const std::exception& ex) {
+        out.push_back(Finding{Finding::Severity::Error, "E_ZIP_UNREADABLE", "archive",
+                              std::string("not a readable zip: ") + ex.what()});
+        return out;
+    }
+    detail::vld::run_validation(*zip, limits, options, out);
+    return out;
+}
+
+// Reads the archive from the file on demand rather than loading it whole.
+std::vector<Finding> QvfReader::validate_file(const std::string& path,
+                                              const Limits& limits,
+                                              const ValidationOptions& options) {
+    {
+        std::ifstream probe(path, std::ios::binary);
+        if (!probe)
+            return {Finding{Finding::Severity::Error, "E_ZIP_UNREADABLE", "archive",
+                            "cannot open file: " + path}};
+    }
+    std::vector<Finding> out;
+    std::unique_ptr<detail::ZipReader> zip;
+    try {
+        zip.reset(new detail::ZipReader(detail::ZipReader::open(path)));
+    } catch (const std::exception& ex) {
+        out.push_back(Finding{Finding::Severity::Error, "E_ZIP_UNREADABLE", "archive",
+                              std::string("not a readable zip: ") + ex.what()});
+        return out;
+    }
+    detail::vld::run_validation(*zip, limits, options, out);
+    return out;
+}
+
 bool QvfReader::validate(std::vector<std::string>& errors) const {
-    const Json& m = impl_->manifest;
-    if (!m.contains("qvf_version") || m.at("qvf_version").as_int() != 1)
-        errors.push_back("qvf_version must be 1");
-    if (!m.contains("source"))
-        errors.push_back("missing source");
-    if (!m.contains("sections")) {
-        errors.push_back("missing sections");
-        return errors.empty();
+    bool ok = true;
+    for (const auto& f : validate_findings()) {
+        if (f.severity != Finding::Severity::Error) continue;
+        errors.push_back(f.code + ": " + f.message);
+        ok = false;
     }
-    const Json& secs = m.at("sections");
-    for (size_t i = 0; i < secs.size(); ++i) {
-        const Json& s = secs.at(i);
-        std::string sid = s.contains("id") ? s.at("id").as_string() : "<no-id>";
-        if (!s.contains("members")) continue;
-        const Json& members = s.at("members");
-        for (const auto& kv : members.items()) {
-            const Json& spec = kv.second;
-            std::string path = spec.contains("path") ? spec.at("path").as_string()
-                                                     : "";
-            std::vector<uint8_t> bytes;
-            try {
-                bytes = impl_->read_spec(spec, /*verify=*/true);
-            } catch (const std::exception& e) {
-                errors.push_back("section '" + sid + "' member '" + kv.first +
-                                 "': " + e.what());
-                continue;
-            }
-            if (spec.contains("format") &&
-                spec.at("format").as_string() == "binary" && spec.contains("dtype")) {
-                size_t itemsize = dtype_itemsize(spec.at("dtype").as_string());
-                size_t n = 1;
-                if (spec.contains("shape")) {
-                    const Json& sh = spec.at("shape");
-                    for (size_t k = 0; k < sh.size(); ++k)
-                        n *= static_cast<size_t>(sh.at(k).as_int());
-                }
-                if (itemsize && bytes.size() != itemsize * n)
-                    errors.push_back("section '" + sid + "' member '" + kv.first +
-                                     "': byte length != itemsize*prod(shape)");
-            }
-        }
-    }
-    return errors.empty();
+    return ok;
 }
 
 }  // namespace qvf

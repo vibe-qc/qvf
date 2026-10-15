@@ -1,0 +1,10 @@
+{
+  "archive": "preview_signature_mismatch.qvf",
+  "description": "A preview thumbnail whose media_type is image/png but whose bytes begin with the JPEG marker FF D8 FF instead of the PNG signature (spec \u00a7 5.15).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

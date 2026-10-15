@@ -1,0 +1,95 @@
+{
+  "archive": "trajectory.qvf",
+  "description": "trajectory: a 4-frame H2O optimization; coords [n_frames, n_atoms, 3] in Angstrom, metadata energies in Hartree, plus reaction.waypoints annotations referencing it by trajectory_ref.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "reaction.waypoints",
+    "structure",
+    "trajectory"
+  ],
+  "checks": [
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "kind"
+      ],
+      "equals": "optimization"
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "symbols",
+        1
+      ],
+      "equals": "H"
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "atomic_numbers",
+        0
+      ],
+      "equals": 8
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "energies",
+        3
+      ],
+      "equals": -74.9659,
+      "tol": 1e-09
+    },
+    {
+      "section": "opt",
+      "member": "metadata",
+      "json_pointer": [
+        "precision"
+      ],
+      "equals": "float64"
+    },
+    {
+      "section": "opt",
+      "member": "coords",
+      "binary_index": [
+        0,
+        1,
+        1
+      ],
+      "equals": 0.7872,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "trajectory_ref"
+      ],
+      "equals": "opt"
+    },
+    {
+      "section": "opt_marks",
+      "member": "waypoints",
+      "json_pointer": [
+        "waypoints",
+        1,
+        "frame_index"
+      ],
+      "equals": 3
+    },
+    {
+      "section": "opt_marks",
+      "member": "waypoints",
+      "json_pointer": [
+        "waypoints",
+        1,
+        "kind"
+      ],
+      "equals": "product"
+    }
+  ]
+}

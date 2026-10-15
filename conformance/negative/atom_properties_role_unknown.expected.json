@@ -1,0 +1,10 @@
+{
+  "archive": "atom_properties_role_unknown.qvf",
+  "description": "An atom_properties role that is neither in the role list nor a custom.<name> role (spec \u00a7 5.7). Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

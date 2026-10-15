@@ -1,0 +1,143 @@
+{
+  "archive": "provenance_full.qvf",
+  "description": "A settled (converged) archive whose provenance uses every typed field: software (one item with a url, one with a vendor key), a 40-character git_commit, n_threads, n_mpi_ranks, n_gpus, and the two UTC time stamps (one with a fractional second) that agree with wall_seconds and with the run.record. The job.spec that asked for the run is preserved; its n_cores is a hint and differs from what the run used (spec \u00a7 3.2, \u00a7 5.9).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "job.spec",
+    "run.record",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "converged"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        0,
+        "name"
+      ],
+      "equals": "my-code"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        1,
+        "url"
+      ],
+      "equals": "https://example.org/integral-lib"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        2,
+        "x_build"
+      ],
+      "equals": "release"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "git_commit"
+      ],
+      "equals": "3e8a1c5f7b2d49608a1b3c5d7e9f0a2b4c6d8e1f"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_threads"
+      ],
+      "equals": 8
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_mpi_ranks"
+      ],
+      "equals": 4
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_gpus"
+      ],
+      "equals": 2
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "started_utc"
+      ],
+      "equals": "2026-10-07T12:00:00Z"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "finished_utc"
+      ],
+      "equals": "2026-10-07T12:07:31.25Z"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "wall_seconds"
+      ],
+      "equals": 451.25,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_electrons"
+      ],
+      "equals": 10
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "scf_energy",
+        "value"
+      ],
+      "equals": -76.3,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "started_utc"
+      ],
+      "equals": "2026-10-07T12:00:00Z"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "structure_ref"
+      ],
+      "equals": "structure"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "resources",
+        "n_cores"
+      ],
+      "equals": 64
+    },
+    {
+      "section": "run_record",
+      "member": "log",
+      "decode": "utf8",
+      "contains": "SCF converged in 9 iterations"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@qvf/core",
+  "version": "0.4.0",
+  "description": "Reader and validator for QVF (Quantum Visualization Format) archives, in pure TypeScript for Node and browsers.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "vibe-qc authors <project@vibe-qc.com>",
+  "homepage": "https://vibe-qc.com/docs/qvf/",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json",
+    "gen-kinds": "node scripts/gen-kinds.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "conformance": "npm run build && node scripts/conformance.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

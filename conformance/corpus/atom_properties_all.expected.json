@@ -1,0 +1,78 @@
+{
+  "archive": "atom_properties_all.qvf",
+  "description": "atom_properties with all five roles of the schema's role list (mulliken_charge, loewdin_charge, hirshfeld_charge, iao_charge, spin_population), each float64 [n_atoms]; illustrative values for the OH radical.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "iao_charge",
+        "dtype"
+      ],
+      "equals": "float64"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "hirshfeld_charge",
+        "shape"
+      ],
+      "equals": [
+        2
+      ]
+    },
+    {
+      "section": "atom_properties",
+      "member": "mulliken_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.29,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "loewdin_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.18,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "hirshfeld_charge",
+      "binary_index": [
+        1
+      ],
+      "equals": 0.12,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "iao_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.35,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "spin_population",
+      "binary_index": [
+        0
+      ],
+      "equals": 1.05,
+      "tol": 1e-12
+    }
+  ]
+}

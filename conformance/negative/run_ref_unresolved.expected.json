@@ -1,0 +1,10 @@
+{
+  "archive": "run_ref_unresolved.qvf",
+  "description": "A section whose run_ref names a section that does not exist (spec \u00a7 4.1).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

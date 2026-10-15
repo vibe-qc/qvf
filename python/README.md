@@ -17,6 +17,10 @@ w.add_spectrum("spectra.ir", frequencies=[1595.0], intensities=[67.0])
 w.write("h2o.qvf")
 ```
 
+From a checkout of the toolkit, `pip install <checkout>/python` installs the
+top-level modules `qvf_writer` and `qvf_reader` (with `qvf_kinds`,
+`qvf_model` and `qvf_units`) and the `qvf-validate` command.
+
 Validate anything you write (semantic checks always run; install the `validate`
 extra for full JSON-Schema conformance):
 

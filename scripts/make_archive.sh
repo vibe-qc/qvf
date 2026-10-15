@@ -59,6 +59,7 @@ fi
 NAME="qvf-writer-${VERSION}"
 # Check the actual archived bytes; never silently repair or mutate source.
 python3 "${STAGE_DIR}/source/scripts/amalgamate.py" --check
+python3 "${STAGE_DIR}/source/scripts/gen_kinds.py" --check
 cmp "${STAGE_DIR}/source/spec/qvf_manifest.schema.json" \
     "${STAGE_DIR}/source/python/qvf_manifest.schema.json"
 mv "${STAGE_DIR}/source" "${STAGE_DIR}/${NAME}"

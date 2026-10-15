@@ -1,0 +1,10 @@
+{
+  "archive": "path_backslash.qvf",
+  "description": "Member path 'structure\\\\structure.json' uses a backslash (spec \u00a7 2.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_PATH",
+      "severity": "error"
+    }
+  ]
+}

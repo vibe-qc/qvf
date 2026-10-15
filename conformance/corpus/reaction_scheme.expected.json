@@ -1,0 +1,284 @@
+{
+  "archive": "reaction_scheme.qvf",
+  "description": "A sketch saved as QVF. Eight species, each a structure section with its chemical identity on the section object (label as the compound number, name, charge, multiplicity, SMILES, InChI, InChIKey): a radical (the chlorine atom, multiplicity 2) and two ions (oxonium +1, chloride -1). A reaction.scheme relates them in three steps: a forward step with a reagent drawn at the arrow, conditions and a yield; an equilibrium; and a retrosynthetic step whose target is its product and whose precursors are its reactants, one with coefficient 0.5. A preview section, first in the manifest, carries a PNG thumbnail and an SVG image with their media_type, and a vendor section stores its drawing as an opaque member with a media_type (spec \u00a7 4.2, \u00a7 5.1, \u00a7 5.14, \u00a7 5.15, \u00a7 7.3).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "preview",
+    "reaction.scheme",
+    "structure",
+    "x_conformance.drawing"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "kind"
+      ],
+      "equals": "preview"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "members",
+        "thumbnail",
+        "media_type"
+      ],
+      "equals": "image/png"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "members",
+        "thumbnail",
+        "size"
+      ],
+      "equals": 105
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "members",
+        "image",
+        "media_type"
+      ],
+      "equals": "image/svg+xml"
+    },
+    {
+      "section": "preview",
+      "member": "image",
+      "decode": "utf8",
+      "contains": "<svg"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "id"
+      ],
+      "equals": "structure_s1"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "label"
+      ],
+      "equals": "1"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "name"
+      ],
+      "equals": "methane"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "inchikey"
+      ],
+      "equals": "VNWKTOKETHGBQD-UHFFFAOYSA-N"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "multiplicity"
+      ],
+      "equals": 2
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "smiles"
+      ],
+      "equals": "[Cl]"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        7,
+        "charge"
+      ],
+      "equals": 1
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        7,
+        "inchi"
+      ],
+      "equals": "InChI=1S/H2O/h1H2/p+1"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        8,
+        "charge"
+      ],
+      "equals": -1
+    },
+    {
+      "section": "structure_s3",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "symbol"
+      ],
+      "equals": "Cl"
+    },
+    {
+      "section": "structure_s3",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "position",
+        2
+      ],
+      "equals": 1.781,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        9,
+        "kind"
+      ],
+      "equals": "reaction.scheme"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        9,
+        "label"
+      ],
+      "equals": "Radical chlorination of methane"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "reactants",
+        1,
+        "structure_ref"
+      ],
+      "equals": "structure_s2"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "reagents",
+        0,
+        "structure_ref"
+      ],
+      "equals": "structure_s5"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "conditions"
+      ],
+      "equals": [
+        "h\u03bd",
+        "25 \u00b0C"
+      ]
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "yield_percent"
+      ],
+      "equals": 61.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        1,
+        "arrow"
+      ],
+      "equals": "equilibrium"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        2,
+        "arrow"
+      ],
+      "equals": "retrosynthetic"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        2,
+        "products",
+        0,
+        "structure_ref"
+      ],
+      "equals": "structure_s3"
+    },
+    {
+      "section": "scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        2,
+        "reactants",
+        1,
+        "coefficient"
+      ],
+      "equals": 0.5,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "extensions",
+        "x_conformance",
+        "version"
+      ],
+      "equals": "1"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        10,
+        "members",
+        "drawing",
+        "media_type"
+      ],
+      "equals": "image/svg+xml"
+    },
+    {
+      "section": "x_conformance_drawing",
+      "member": "drawing",
+      "decode": "utf8",
+      "contains": "CH\u2084 + Cl\u2082"
+    }
+  ]
+}

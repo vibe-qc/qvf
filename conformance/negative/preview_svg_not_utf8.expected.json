@@ -1,0 +1,10 @@
+{
+  "archive": "preview_svg_not_utf8.qvf",
+  "description": "A preview image of media_type image/svg+xml whose bytes do not decode as UTF-8 (spec \u00a7 5.15).",
+  "expect": [
+    {
+      "code": "E_UTF8",
+      "severity": "error"
+    }
+  ]
+}
