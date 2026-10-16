@@ -1,0 +1,10 @@
+{
+  "archive": "source_empty.qvf",
+  "description": "source.program is empty.",
+  "expect": [
+    {
+      "code": "E_SOURCE",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+{
+  "archive": "basis_ao.qvf",
+  "description": "basis.ao for two components of a Cartesian (pure: false) d primitive, alpha = 1.2 bohr^-2: d_xx and d_xy, each named by cartesian_powers with angular_momentum [2, 0] (Appendix A.3). Data are N * x^lx y^ly z^lz exp(-alpha r^2) with the axial N of Appendix A.1.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "basis.ao",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "ao_metadata",
+        "cartesian_powers"
+      ],
+      "equals": [
+        2,
+        0,
+        0
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "ao_metadata",
+        "cartesian_powers"
+      ],
+      "equals": [
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "ao_metadata",
+        "angular_momentum"
+      ],
+      "equals": [
+        2,
+        0
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "ao_metadata",
+        "ao_index"
+      ],
+      "equals": 1
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "ao_metadata",
+        "exponent"
+      ],
+      "equals": 1.2,
+      "tol": 1e-12
+    },
+    {
+      "section": "ao_xy",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 7
+    },
+    {
+      "section": "ao_xy",
+      "member": "data",
+      "binary_index": [
+        4,
+        4,
+        3
+      ],
+      "equals": 0.343596488237381,
+      "tol": 1e-06
+    },
+    {
+      "section": "ao_xy",
+      "member": "data",
+      "binary_index": [
+        2,
+        4,
+        3
+      ],
+      "equals": -0.343596488237381,
+      "tol": 1e-06
+    },
+    {
+      "section": "ao_xx",
+      "member": "data",
+      "binary_index": [
+        5,
+        3,
+        3
+      ],
+      "equals": 0.5792663097381592,
+      "tol": 1e-06
+    },
+    {
+      "section": "ao_xx",
+      "member": "data",
+      "binary_index": [
+        3,
+        5,
+        3
+      ],
+      "equals": 0.0,
+      "tol": 1e-06
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The QVF type for freedesktop.org shared-mime-info (QVF spec § 2.4, File
+  identification). Install it as $XDG_DATA_HOME/mime/packages/qvf.xml (or
+  /usr/share/mime/packages/qvf.xml) and run update-mime-database on the
+  parent mime directory. Keep it identical in every application.
+
+  License: Apache-2.0.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.vibe-qc.qvf+zip">
+    <comment>QVF quantum-chemistry archive</comment>
+    <acronym>QVF</acronym>
+    <expanded-acronym>Quantum Visualization Format</expanded-acronym>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="x-office-document"/>
+    <glob pattern="*.qvf"/>
+  </mime-type>
+</mime-info>

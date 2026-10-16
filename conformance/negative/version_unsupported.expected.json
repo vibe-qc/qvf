@@ -1,0 +1,10 @@
+{
+  "archive": "version_unsupported.qvf",
+  "description": "qvf_version 3, an unknown major version.",
+  "expect": [
+    {
+      "code": "E_VERSION",
+      "severity": "error"
+    }
+  ]
+}

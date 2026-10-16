@@ -1,0 +1,10 @@
+{
+  "archive": "trajectory_lattice_without_pbc.qvf",
+  "description": "A trajectory with a lattice member (rows, Angstrom) whose metadata has no pbc; pbc is REQUIRED when lattice is present (spec \u00a7 5.5).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

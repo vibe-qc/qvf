@@ -1,0 +1,10 @@
+{
+  "archive": "sha256_mismatch.qvf",
+  "description": "A member whose bytes do not match its sha256.",
+  "expect": [
+    {
+      "code": "E_SHA256_MISMATCH",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,179 @@
+"""QVF archive inspection, validation and explicit-output maintenance."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+import sys
+import zipfile
+
+from . import __version__, validate
+from .reader import Reader
+from . import operations
+
+
+def _json(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _parser():
+    parser = argparse.ArgumentParser(prog="qvf", description=__doc__)
+    parser.add_argument("--version", action="version", version=__version__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("validate", help="validate cumulatively through a selected stage")
+    command.add_argument("archive")
+    command.add_argument("--level", choices=[name.lower() for name in validate.Level.__members__], default="all")
+    command.add_argument("--json", action="store_true")
+    for name, help_text in (("info", "show sections, kinds and member sizes"),
+                            ("cat", "print the manifest or one JSON member")):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("archive")
+        if name == "info":
+            command.add_argument("--json", action="store_true")
+        else:
+            command.add_argument("section", nargs="?")
+            command.add_argument("member", nargs="?")
+    command = commands.add_parser("extract", help="verify and extract one declared member")
+    command.add_argument("archive")
+    command.add_argument("section")
+    command.add_argument("member")
+    command.add_argument("-o", "--output", required=True, help="new output file (never overwritten)")
+    command = commands.add_parser("diff", help="compare decoded content, independent of ZIP layout")
+    command.add_argument("left")
+    command.add_argument("right")
+    command.add_argument("--atol", type=float, default=0.0)
+    command.add_argument("--rtol", type=float, default=0.0)
+    command.add_argument("--ignore-metadata", action="store_true", help="ignore root metadata (UUID/timestamps/authors)")
+    command.add_argument("--max-differences", type=int, default=20)
+    command.add_argument("--json", action="store_true")
+    command = commands.add_parser("repack", help="copy current members to a new archive, dropping orphans")
+    command.add_argument("archive")
+    command.add_argument("-o", "--output", required=True)
+    command.add_argument("--compression", choices=("preserve", "store", "deflate"), default="preserve")
+    command = commands.add_parser("scrub", help="report and remove selected personal content into a new archive")
+    command.add_argument("archive")
+    command.add_argument("-o", "--output")
+    command.add_argument("--dry-run", action="store_true", help="report changes without writing")
+    command.add_argument("--path-pattern", action="append", default=[], metavar="REGEX")
+    command.add_argument("--user-pattern", action="append", default=[], metavar="REGEX")
+    command.add_argument("--replacement", default="[redacted]", help="literal replacement for every pattern match")
+    command = commands.add_parser("conformance", help="run an explicit positive corpus and optional siblings")
+    command.add_argument("corpus")
+    command.add_argument("--negative", metavar="DIR")
+    command.add_argument("--no-negative", action="store_true")
+    command.add_argument("--legacy", metavar="DIR")
+    command.add_argument("--no-legacy", action="store_true")
+    command = commands.add_parser("convert", help="convert selected XYZ/extXYZ geometry or a scalar cube through QVF")
+    command.add_argument("input")
+    command.add_argument("-o", "--output", required=True)
+    command.add_argument("--from", dest="input_format", choices=("qvf", "xyz", "extxyz", "cube"), required=True)
+    command.add_argument("--to", dest="output_format", choices=("qvf", "xyz", "extxyz", "cube"), required=True)
+    command.add_argument("--section", help="QVF section to export")
+    command.add_argument("--kind", help="scalar volume kind asserted on cube import (default volume.generic)")
+    command.add_argument("--periodic", nargs=3, choices=("true", "false"), help="cube import periodic axes")
+    command.add_argument("--no-endpoint", action="store_true", help="cube import spans n voxels rather than n-1")
+    commands.add_parser("schema", help="print the packaged normative JSON Schema")
+    return parser
+
+
+def _execute(args):
+    if args.command == "schema":
+        print(Path(validate._SCHEMA_PATH).read_text(encoding="utf-8"), end="")
+    elif args.command == "validate":
+        report = validate.run(args.archive, level=args.level)
+        if args.json:
+            _json(report)
+        else:
+            print(f"{args.level}: {'OK' if report['ok'] else 'FAILED'} ({report['n_sections']} sections)")
+            for finding in report["findings"]:
+                print(f"{finding['severity']} {finding['code']} {finding['where']}: {finding['message']}")
+        return 0 if report["ok"] else 1
+    elif args.command in ("info", "cat"):
+        with Reader(args.archive) as reader:
+            if args.command == "cat":
+                if (args.section is None) != (args.member is None):
+                    raise ValueError("cat requires both SECTION and MEMBER, or neither for the manifest")
+                _json(reader.raw_manifest if args.section is None else reader.json(args.section, args.member))
+            else:
+                sections = []
+                for section in reader.sections:
+                    members = []
+                    for role, member in (section.members or {}).items():
+                        info = reader._zip.getinfo(member.path)
+                        members.append(dict(member.to_json(), role=role, size=info.file_size,
+                                            compressed_size=info.compress_size))
+                    sections.append({"id": section.id, "kind": section.kind, "members": members})
+                value = {"qvf_version": reader.raw_manifest.get("qvf_version"),
+                         "source": reader.raw_manifest.get("source"), "sections": sections}
+                if args.json:
+                    _json(value)
+                else:
+                    print(f"QVF {value['qvf_version']} | {len(sections)} sections | {value['source']}")
+                    for section in sections:
+                        print(f"  {section['id']} [{section['kind']}]")
+                        for member in section["members"]:
+                            tensor = f" {member['dtype']}{member.get('shape', [])}" if "dtype" in member else ""
+                            print(f"    {member['role']}: {member['path']} ({member['format']}{tensor}, {member['size']} bytes)")
+    elif args.command == "extract":
+        operations.extract(args.archive, args.section, args.member, args.output)
+        print(f"Extracted {args.section}/{args.member} to {args.output}")
+    elif args.command == "diff":
+        result = operations.diff(args.left, args.right, atol=args.atol, rtol=args.rtol,
+                                 ignore_metadata=args.ignore_metadata, max_differences=args.max_differences)
+        if args.json:
+            _json(result)
+        else:
+            print("Equal" if result["equal"] else f"Different ({result['difference_count']} differences)")
+            for item in result["differences"]:
+                print(f"  {item['where']}: {item['message']}")
+            if result["truncated"]:
+                print("  additional differences omitted; raise --max-differences to display more")
+        return 0 if result["equal"] else 1
+    elif args.command == "repack":
+        methods = {"preserve": None, "store": zipfile.ZIP_STORED, "deflate": zipfile.ZIP_DEFLATED}
+        operations.repack(args.archive, args.output, compression=methods[args.compression])
+        print(f"Repacked to {args.output}")
+    elif args.command == "scrub":
+        if args.dry_run and args.output:
+            raise ValueError("--dry-run and --output are mutually exclusive")
+        _json(operations.scrub(args.archive, args.output, dry_run=args.dry_run,
+                              patterns=args.path_pattern + args.user_pattern, replacement=args.replacement))
+    elif args.command == "convert":
+        from . import convert
+        cube_options = args.kind is not None or args.periodic is not None or args.no_endpoint
+        if args.input_format != "cube" and cube_options:
+            raise ValueError("--kind, --periodic and --no-endpoint apply only to cube import")
+        if args.input_format == "qvf" and args.output_format in ("xyz", "extxyz", "cube"):
+            if args.output_format == "cube":
+                result = convert.export_cube(args.input, args.output, section=args.section)
+            else:
+                result = convert.export_xyz(args.input, args.output, section=args.section,
+                                            extended=args.output_format == "extxyz")
+        elif args.output_format == "qvf" and args.input_format != "qvf":
+            if args.section is not None:
+                raise ValueError("--section applies only to QVF export")
+            if args.input_format == "cube":
+                result = convert.import_cube(args.input, args.output, kind=args.kind or "volume.generic",
+                    periodic=tuple(v == "true" for v in args.periodic) if args.periodic else (False,) * 3,
+                    includes_endpoint=not args.no_endpoint)
+            else:
+                result = convert.import_xyz(args.input, args.output)
+        else:
+            raise ValueError("conversion must have QVF as exactly one endpoint")
+        _json(result)
+    elif args.command == "conformance":
+        from .conformance import run
+        return run(args.corpus, args.negative, negative=not args.no_negative,
+                   legacy_dir=args.legacy, legacy=False if args.no_legacy else (True if args.legacy else None))
+    return 0
+
+
+def main(argv=None):
+    """Console entry point: 0 success/equal, 1 failed/different, 2 usage/I/O."""
+    args = _parser().parse_args(argv)
+    try:
+        return _execute(args)
+    except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, RuntimeError, re.error) as exc:
+        print(f"qvf: {exc}", file=sys.stderr)
+        return 2

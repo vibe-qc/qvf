@@ -1,0 +1,10 @@
+{
+  "archive": "volume_series_axis_length.qvf",
+  "description": "A volume.series whose data holds 3 slabs but whose axis has 2 values; the axis needs one value per slab (spec \u00a7 5.2).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

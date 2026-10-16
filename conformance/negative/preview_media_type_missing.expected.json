@@ -1,0 +1,10 @@
+{
+  "archive": "preview_media_type_missing.qvf",
+  "description": "A preview thumbnail without media_type; preview members must say what their bytes are (spec \u00a7 5.15). Only a validator that runs the JSON Schema reports it.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

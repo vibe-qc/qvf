@@ -1,0 +1,93 @@
+{
+  "archive": "fermi_surface.qvf",
+  "description": "Fermi surface: E(k) - E_F in eV on a 4x4x4 Gamma-centred mesh (float32 [nk1, nk2, nk3, n_bands]); the mesh payload carries shape, shift, the real-space cell (rows, Angstrom) and the reciprocal lattice (rows, 1/Angstrom, 2*pi included).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "fermi_surface",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 4
+    },
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "shift",
+        2
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "symmetry_expanded"
+      ],
+      "equals": true
+    },
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "reciprocal_lattice",
+        1,
+        1
+      ],
+      "equals": 1.8705523391424788,
+      "tol": 1e-12
+    },
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "lattice_vectors",
+        2,
+        2
+      ],
+      "equals": 3.359,
+      "tol": 1e-12
+    },
+    {
+      "section": "fermi_surface",
+      "member": "mesh",
+      "json_pointer": [
+        "band_indices",
+        1
+      ],
+      "equals": 3
+    },
+    {
+      "section": "fermi_surface",
+      "member": "energies",
+      "binary_index": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "equals": -3.0,
+      "tol": 1e-06
+    },
+    {
+      "section": "fermi_surface",
+      "member": "energies",
+      "binary_index": [
+        1,
+        2,
+        3,
+        1
+      ],
+      "equals": 4.49912166595459,
+      "tol": 1e-06
+    }
+  ]
+}

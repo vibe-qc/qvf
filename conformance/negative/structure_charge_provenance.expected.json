@@ -1,0 +1,10 @@
+{
+  "archive": "structure_charge_provenance.qvf",
+  "description": "The archive's only structure section states charge 0 and multiplicity 1 while provenance states charge 1 and multiplicity 2; with one structure the two describe the same species and must agree (spec \u00a7 5.1).",
+  "expect": [
+    {
+      "code": "E_ROOT_INCONSISTENT",
+      "severity": "error"
+    }
+  ]
+}

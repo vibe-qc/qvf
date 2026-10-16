@@ -1,0 +1,10 @@
+{
+  "archive": "member_malformed.qvf",
+  "description": "A member spec without a path.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

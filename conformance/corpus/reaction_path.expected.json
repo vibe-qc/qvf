@@ -1,0 +1,81 @@
+{
+  "archive": "reaction_path.qvf",
+  "description": "reaction.path (molecular, no lattice member): HCN -> HNC with reactant / transition_state / product waypoints (energy_eh in Hartree) and a reaction coordinate.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "reaction.path",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "kind"
+      ],
+      "equals": "irc"
+    },
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "waypoints",
+        1,
+        "kind"
+      ],
+      "equals": "transition_state"
+    },
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "waypoints",
+        1,
+        "frame_index"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "waypoints",
+        1,
+        "energy_eh"
+      ],
+      "equals": -93.115,
+      "tol": 1e-09
+    },
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "reaction_coordinate",
+        4
+      ],
+      "equals": 2.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "rxn",
+      "member": "metadata",
+      "json_pointer": [
+        "energies",
+        0
+      ],
+      "equals": -93.19,
+      "tol": 1e-09
+    },
+    {
+      "section": "rxn",
+      "member": "coords",
+      "binary_index": [
+        2,
+        2,
+        0
+      ],
+      "equals": 1.1,
+      "tol": 1e-12
+    }
+  ]
+}

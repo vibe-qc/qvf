@@ -57,8 +57,9 @@ public:
         for (int i = 0; i < 8; ++i) {
             for (int j = 0; j < 4; ++j) {
                 uint8_t byte = static_cast<uint8_t>((h_[i] >> (24 - 8 * j)) & 0xff);
-                out[i * 8 + j * 2] = HEX[byte >> 4];
-                out[i * 8 + j * 2 + 1] = HEX[byte & 0x0f];
+                const size_t o = static_cast<size_t>(i * 8 + j * 2);
+                out[o] = HEX[byte >> 4];
+                out[o + 1] = HEX[byte & 0x0f];
             }
         }
         return out;

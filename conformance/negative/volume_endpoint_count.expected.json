@@ -1,0 +1,10 @@
+{
+  "archive": "volume_endpoint_count.qvf",
+  "description": "A periodic volume.density grid with the CHGCAR-style point count (voxel_vectors[a] x shape[a] is the 4 \u00c5 cell) that declares includes_endpoint true, under which voxel_vectors[a] x (shape[a] - 1) must span the cell: the silent cube/CHGCAR mix-up the endpoint rule exists to catch (spec \u00a7 5.2).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

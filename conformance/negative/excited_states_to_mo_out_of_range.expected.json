@@ -1,0 +1,10 @@
+{
+  "archive": "excited_states_to_mo_out_of_range.qvf",
+  "description": "An excited state whose contribution has to_mo 2, but the wavefunction.gto that wavefunction_ref names has 2 orbital rows (0 and 1) in mo_coefficients (spec \u00a7 5.12).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

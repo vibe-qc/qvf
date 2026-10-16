@@ -1,0 +1,14 @@
+{
+  "archive": "unit_unknown.qvf",
+  "description": "A volume.density grid whose units object declares 'electrons_per_bohr3', which is not a unit name of spec \u00a7 4.3. Every validator warns (W_UNIT_UNKNOWN); one with a JSON Schema engine also rejects the payload (E_PAYLOAD_SCHEMA), while one without accepts the archive with the warning.",
+  "expect": [
+    {
+      "code": "W_UNIT_UNKNOWN",
+      "severity": "warning"
+    },
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

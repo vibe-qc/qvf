@@ -1,0 +1,10 @@
+{
+  "archive": "bonds_structure_ref_wrong_kind.qvf",
+  "description": "A standalone bonds section whose structure_ref names a job.spec section instead of a structure section (spec \u00a7 4.1, \u00a7 5.1).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "nto_unrestricted_weights.qvf",
+  "description": "Unrestricted NTO defect: weights; spec \u00a7 5.3.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

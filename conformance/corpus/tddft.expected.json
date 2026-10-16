@@ -1,0 +1,394 @@
+{
+  "archive": "tddft.qvf",
+  "description": "Water TD-DFT: an excited_states table of three singlet states (B1, A2, A1) with excitation energies in eV and total energies in hartree, oscillator strengths whose transition dipoles (atomic units) satisfy f = (2/3) dE |mu|^2, zero rotatory strengths, magnetic transition dipoles, and orbital contributions indexing the 7-orbital ground-state wavefunction that wavefunction_ref names. State 1 names its hole NTO section (nto_ref; the particle section carries the same state_ref and state_index with nto_role particle, occupations are the pair weights) and its volume.transition_density (density_ref; the volume names the state back with excited_states_ref and state_index). The spectra.uvvis stick spectrum has one line per state at its excitation energy with the oscillator strength as intensity, and its peaks name states by state_index through states_ref (spec \u00a7 5.2, \u00a7 5.3, \u00a7 5.4, \u00a7 5.12).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "excited_states",
+    "spectra.uvvis",
+    "structure",
+    "volume.transition_density",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "kind"
+      ],
+      "equals": "excited_states"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "wavefunction_ref"
+      ],
+      "equals": "wf"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        5,
+        "structure_ref"
+      ],
+      "equals": "structure"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "excited_states_ref"
+      ],
+      "equals": "excited_states"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "state_index"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "meta",
+        "n_states"
+      ],
+      "equals": 3
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "meta",
+        "method"
+      ],
+      "equals": "tddft"
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "index"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "excitation_energy",
+        "value"
+      ],
+      "equals": 7.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "excitation_energy",
+        "units"
+      ],
+      "equals": "ev"
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        2,
+        "total_energy",
+        "value"
+      ],
+      "equals": -74.95100257656979,
+      "tol": 1e-10
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "oscillator_strength"
+      ],
+      "equals": 0.0521,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "transition_dipole",
+        0
+      ],
+      "equals": 0.5360730379750306,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        2,
+        "transition_dipole",
+        2
+      ],
+      "equals": 0.5920904131308062,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        1,
+        "oscillator_strength"
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        1,
+        "transition_magnetic_dipole",
+        2
+      ],
+      "equals": 0.3517,
+      "tol": 1e-12
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        1,
+        "symmetry"
+      ],
+      "equals": "A2"
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "contributions",
+        0
+      ],
+      "equals": {
+        "from_mo": 4,
+        "to_mo": 5,
+        "weight": 0.99
+      }
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        2,
+        "contributions",
+        1,
+        "to_mo"
+      ],
+      "equals": 6
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "nto_ref"
+      ],
+      "equals": "nto_s1_hole"
+    },
+    {
+      "section": "excited_states",
+      "member": "states",
+      "json_pointer": [
+        "states",
+        0,
+        "density_ref"
+      ],
+      "equals": "tden_s1"
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients",
+      "binary_index": [
+        6,
+        6
+      ],
+      "equals": -0.7071067811865475,
+      "tol": 1e-12
+    },
+    {
+      "section": "nto_s1_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "orbital_kind"
+      ],
+      "equals": "nto"
+    },
+    {
+      "section": "nto_s1_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "nto_role"
+      ],
+      "equals": "hole"
+    },
+    {
+      "section": "nto_s1_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "nto_role"
+      ],
+      "equals": "particle"
+    },
+    {
+      "section": "nto_s1_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "state_ref"
+      ],
+      "equals": "excited_states"
+    },
+    {
+      "section": "nto_s1_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "state_index"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "nto_s1_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupation_semantics"
+      ],
+      "equals": "transition_weight"
+    },
+    {
+      "section": "nto_s1_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupations",
+        0
+      ],
+      "equals": 0.99,
+      "tol": 1e-12
+    },
+    {
+      "section": "nto_s1_hole",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        4
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "nto_s1_particle",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        6
+      ],
+      "equals": 0.7071067811865475,
+      "tol": 1e-12
+    },
+    {
+      "section": "tden_s1",
+      "member": "data",
+      "binary_index": [
+        3,
+        5,
+        4
+      ],
+      "equals": -0.033988140523433685,
+      "tol": 1e-06
+    },
+    {
+      "section": "tden_s1",
+      "member": "data",
+      "binary_index": [
+        5,
+        2,
+        3
+      ],
+      "equals": 0.018874669447541237,
+      "tol": 1e-06
+    },
+    {
+      "section": "tden_s1",
+      "member": "data",
+      "binary_index": [
+        0,
+        7,
+        2
+      ],
+      "equals": -7.809051021467894e-05,
+      "tol": 1e-06
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "states_ref"
+      ],
+      "equals": "excited_states"
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "frequencies"
+      ],
+      "equals": [
+        7.4,
+        9.2,
+        9.85
+      ]
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "intensities",
+        2
+      ],
+      "equals": 0.0846,
+      "tol": 1e-12
+    },
+    {
+      "section": "spectra_uvvis",
+      "member": "spectrum",
+      "json_pointer": [
+        "peaks",
+        2,
+        "assignment",
+        "state_index"
+      ],
+      "equals": 3
+    }
+  ]
+}

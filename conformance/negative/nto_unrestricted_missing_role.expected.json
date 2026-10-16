@@ -1,0 +1,10 @@
+{
+  "archive": "nto_unrestricted_missing_role.qvf",
+  "description": "Unrestricted NTO defect: missing_role; spec \u00a7 5.3.",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

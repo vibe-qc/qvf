@@ -1,0 +1,10 @@
+{
+  "archive": "provenance_started_utc_not_utc.qvf",
+  "description": "A provenance started_utc with a +02:00 offset instead of the trailing Z of the UTC form YYYY-MM-DDThh:mm:ssZ (spec \u00a7 3.2). Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "archive": "volume_vector.qvf",
+  "description": "volume.vector: the gradient of a model H2 electron density, float32 [nx, ny, nz, 3] on an anisotropic 4x5x6 grid in bohr; the last axis holds the x, y and z components, and the grid shape is the leading three extents of data.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.vector"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "data",
+        "shape"
+      ],
+      "equals": [
+        4,
+        5,
+        6,
+        3
+      ]
+    },
+    {
+      "section": "grad_rho",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 4
+    },
+    {
+      "section": "grad_rho",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 5
+    },
+    {
+      "section": "grad_rho",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 6
+    },
+    {
+      "section": "grad_rho",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.2000000000000002,
+      "tol": 1e-12
+    },
+    {
+      "section": "grad_rho",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.8,
+      "tol": 1e-12
+    },
+    {
+      "section": "grad_rho",
+      "member": "data",
+      "binary_index": [
+        1,
+        1,
+        2,
+        0
+      ],
+      "equals": 0.44220778346061707,
+      "tol": 1e-06
+    },
+    {
+      "section": "grad_rho",
+      "member": "data",
+      "binary_index": [
+        2,
+        3,
+        4,
+        1
+      ],
+      "equals": -0.5901748538017273,
+      "tol": 1e-06
+    },
+    {
+      "section": "grad_rho",
+      "member": "data",
+      "binary_index": [
+        0,
+        4,
+        1,
+        2
+      ],
+      "equals": 0.03359924629330635,
+      "tol": 1e-06
+    },
+    {
+      "section": "grad_rho",
+      "member": "data",
+      "binary_index": [
+        3,
+        0,
+        5,
+        2
+      ],
+      "equals": -0.022452209144830704,
+      "tol": 1e-06
+    }
+  ]
+}

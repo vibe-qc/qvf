@@ -1,0 +1,214 @@
+{
+  "archive": "atom_properties_extended.qvf",
+  "description": "atom_properties beyond the first five roles: three more charge schemes (cm5_charge, chelpg_charge, resp_charge), valence and bonded_valence, fukui_plus / fukui_minus / fukui_zero with dual_descriptor = fukui_plus - fukui_minus, atomic_energy_eh, atomic_volume_bohr3, nmr_shielding_iso_ppm, the vector roles magnetic_moment (collinear, on z) and force_eh_bohr (float64 [n_atoms, 3]), and the custom role custom.born_charge_mean described by the meta member; illustrative values for the OH radical.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "atom_properties",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "magnetic_moment",
+        "shape"
+      ],
+      "equals": [
+        2,
+        3
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "force_eh_bohr",
+        "dtype"
+      ],
+      "equals": "float64"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "cm5_charge",
+        "shape"
+      ],
+      "equals": [
+        2
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "custom.born_charge_mean",
+        "shape"
+      ],
+      "equals": [
+        2
+      ]
+    },
+    {
+      "section": "atom_properties",
+      "member": "cm5_charge",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.31,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "resp_charge",
+      "binary_index": [
+        1
+      ],
+      "equals": 0.41,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "valence",
+      "binary_index": [
+        0
+      ],
+      "equals": 1.92,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "bonded_valence",
+      "binary_index": [
+        1
+      ],
+      "equals": 0.97,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "fukui_plus",
+      "binary_index": [
+        0
+      ],
+      "equals": 0.62,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "fukui_zero",
+      "binary_index": [
+        0
+      ],
+      "equals": 0.715,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "dual_descriptor",
+      "binary_index": [
+        0
+      ],
+      "equals": -0.19,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "dual_descriptor",
+      "binary_index": [
+        1
+      ],
+      "equals": 0.19,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "atomic_energy_eh",
+      "binary_index": [
+        0
+      ],
+      "equals": -75.18,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "atomic_volume_bohr3",
+      "binary_index": [
+        1
+      ],
+      "equals": 21.8,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "nmr_shielding_iso_ppm",
+      "binary_index": [
+        0
+      ],
+      "equals": 370.1,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "magnetic_moment",
+      "binary_index": [
+        0,
+        2
+      ],
+      "equals": 0.93,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "magnetic_moment",
+      "binary_index": [
+        1,
+        0
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "force_eh_bohr",
+      "binary_index": [
+        1,
+        2
+      ],
+      "equals": -0.004,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "custom.born_charge_mean",
+      "binary_index": [
+        1
+      ],
+      "equals": 0.52,
+      "tol": 1e-12
+    },
+    {
+      "section": "atom_properties",
+      "member": "meta",
+      "json_pointer": [
+        "custom.born_charge_mean",
+        "units"
+      ],
+      "equals": "e"
+    },
+    {
+      "section": "atom_properties",
+      "member": "meta",
+      "json_pointer": [
+        "custom.born_charge_mean",
+        "kind"
+      ],
+      "equals": "scalar"
+    }
+  ]
+}

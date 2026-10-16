@@ -1,0 +1,10 @@
+{
+  "archive": "provenance_git_commit_not_hex.qvf",
+  "description": "A provenance git_commit of 12 characters, one of which ('g') is not a hexadecimal digit (spec \u00a7 3.2). Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

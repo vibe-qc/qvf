@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_ref_wrong_kind.qvf",
+  "description": "A reaction.scheme step whose product names an existing section of kind bonds; every participant must name a structure section (spec \u00a7 5.14).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

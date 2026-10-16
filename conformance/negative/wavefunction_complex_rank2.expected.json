@@ -1,0 +1,10 @@
+{
+  "archive": "wavefunction_complex_rank2.qvf",
+  "description": "A wavefunction.gto whose mo_metadata says complex: true while its mo_coefficients member is the real rank-2 [2, 2], without the trailing [re, im] axis (spec \u00a7 5.3).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

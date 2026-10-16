@@ -1,0 +1,10 @@
+{
+  "archive": "bloch_weights_sum.qvf",
+  "description": "A wavefunction.bloch kpoints payload whose two weights sum to 0.75; the weights must sum to 1 within 1e-6 (spec \u00a7 5.3.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

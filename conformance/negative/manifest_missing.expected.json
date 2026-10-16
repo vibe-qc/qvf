@@ -1,0 +1,10 @@
+{
+  "archive": "manifest_missing.qvf",
+  "description": "A ZIP archive without manifest.json.",
+  "expect": [
+    {
+      "code": "E_MANIFEST_MISSING",
+      "severity": "error"
+    }
+  ]
+}

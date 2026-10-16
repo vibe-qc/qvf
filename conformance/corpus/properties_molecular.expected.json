@@ -1,0 +1,181 @@
+{
+  "archive": "properties_molecular.qvf",
+  "description": "Water with the electric properties of a three-point-charge model (O -0.8 e, H +0.4 e): the root dipole_moment and the dipole of the properties.electric section state one dipole (spec \u00a7 5.13 requires them to agree within 1e-6 debye); the Buckingham quadrupole (debye\u00b7\u00c5, traceless, symmetric) is taken about the centre of mass, and the static polarizability (atomic units) is diagonal.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "properties.electric",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "dipole_moment",
+        "total_debye"
+      ],
+      "equals": 2.253663649932,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "dipole_moment",
+        "vector_debye",
+        2
+      ],
+      "equals": -2.253663649932,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "kind"
+      ],
+      "equals": "properties.electric"
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "origin"
+      ],
+      "equals": "center_of_mass"
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "dipole",
+        "vector",
+        2
+      ],
+      "equals": -2.253663649932,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "dipole",
+        "total"
+      ],
+      "equals": 2.253663649932,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "dipole",
+        "units"
+      ],
+      "equals": "debye"
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "convention"
+      ],
+      "equals": "buckingham"
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "traceless"
+      ],
+      "equals": true
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "matrix",
+        0,
+        0
+      ],
+      "equals": -1.6145419736850657,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "matrix",
+        2,
+        2
+      ],
+      "equals": -0.07562756268006904,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "matrix",
+        1,
+        2
+      ],
+      "equals": -1.3343747526325595e-17,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "quadrupole",
+        "matrix",
+        2,
+        1
+      ],
+      "equals": -1.3343747526325595e-17,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "polarizability",
+        "matrix",
+        1,
+        1
+      ],
+      "equals": 9.15,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "polarizability",
+        "frequency_ev"
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "polarizability",
+        "isotropic"
+      ],
+      "equals": 9.08,
+      "tol": 1e-12
+    },
+    {
+      "section": "electric",
+      "member": "properties",
+      "json_pointer": [
+        "units",
+        "dipole"
+      ],
+      "equals": "debye"
+    }
+  ]
+}

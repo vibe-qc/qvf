@@ -1,0 +1,213 @@
+{
+  "archive": "forces_hessian.qvf",
+  "description": "Water with energy derivatives: forces.gradient is the energy gradient dE/dR (hartree/bohr; forces are its negative) as float64 [n_atoms, 3] with no stress; hessian.matrix is the [3N, 3N] Cartesian Hessian (hartree/bohr^2, index 3*atom + xyz, symmetric) with atom masses in its meta; the vibrations section names it through hessian_ref. The root energies block restates provenance.scf_energy (RHF) and thermochemistry.zpve_eh, as spec \u00a7 3.6 requires.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "forces",
+    "hessian",
+    "structure",
+    "vibrations"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "gradient",
+        "shape"
+      ],
+      "equals": [
+        3,
+        3
+      ]
+    },
+    {
+      "section": "forces",
+      "member": "gradient",
+      "binary_index": [
+        1,
+        1
+      ],
+      "equals": 0.0016444102444729293,
+      "tol": 1e-12
+    },
+    {
+      "section": "forces",
+      "member": "gradient",
+      "binary_index": [
+        0,
+        2
+      ],
+      "equals": 0.0025474025578007746,
+      "tol": 1e-12
+    },
+    {
+      "section": "forces",
+      "member": "meta",
+      "json_pointer": [
+        "convention"
+      ],
+      "equals": "gradient"
+    },
+    {
+      "section": "forces",
+      "member": "meta",
+      "json_pointer": [
+        "structure_ref"
+      ],
+      "equals": "structure"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "members",
+        "matrix",
+        "shape"
+      ],
+      "equals": [
+        9,
+        9
+      ]
+    },
+    {
+      "section": "hessian",
+      "member": "matrix",
+      "binary_index": [
+        4,
+        4
+      ],
+      "equals": 0.38501022261148066,
+      "tol": 1e-12
+    },
+    {
+      "section": "hessian",
+      "member": "matrix",
+      "binary_index": [
+        1,
+        4
+      ],
+      "equals": -0.32501022261148066,
+      "tol": 1e-12
+    },
+    {
+      "section": "hessian",
+      "member": "matrix",
+      "binary_index": [
+        4,
+        1
+      ],
+      "equals": -0.32501022261148066,
+      "tol": 1e-12
+    },
+    {
+      "section": "hessian",
+      "member": "meta",
+      "json_pointer": [
+        "atom_masses_amu",
+        0
+      ],
+      "equals": 15.999,
+      "tol": 1e-12
+    },
+    {
+      "section": "hessian",
+      "member": "meta",
+      "json_pointer": [
+        "mass_weighted"
+      ],
+      "equals": false
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "hessian_ref"
+      ],
+      "equals": "hessian"
+    },
+    {
+      "section": "vibrations",
+      "member": "metadata",
+      "json_pointer": [
+        "frequencies",
+        2
+      ],
+      "equals": 4038.763127169234,
+      "tol": 1e-06
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "total",
+        "value"
+      ],
+      "equals": -74.9659011,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "total",
+        "units"
+      ],
+      "equals": "hartree"
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "method"
+      ],
+      "equals": "rhf"
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "by_method",
+        0,
+        "total",
+        "value"
+      ],
+      "equals": -74.9659011,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "components",
+        "nuclear_repulsion",
+        "value"
+      ],
+      "equals": 9.189533762765002,
+      "tol": 1e-09
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "scf_energy",
+        "value"
+      ],
+      "equals": -74.9659011,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "thermochemistry",
+        "zpve_eh"
+      ],
+      "equals": 0.020337421614663433,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "energies",
+        "components",
+        "zpve",
+        "value"
+      ],
+      "equals": 0.020337421614663433,
+      "tol": 1e-12
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "orphan_member.qvf",
+  "description": "A ZIP entry no manifest member references (the by-product of an in-place update): a warning only, the archive stays valid.",
+  "expect": [
+    {
+      "code": "W_ORPHAN_MEMBER",
+      "severity": "warning"
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "archive": "volume_spin_zero.qvf",
+  "description": "64 cubed float64 zero spin density: valid despite DEFLATE ratio >1000.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.spin"
+  ],
+  "checks": [
+    {
+      "section": "spin",
+      "member": "grid",
+      "json_pointer": [
+        "shape"
+      ],
+      "equals": [
+        64,
+        64,
+        64
+      ]
+    },
+    {
+      "section": "spin",
+      "member": "data",
+      "binary_index": [
+        63,
+        63,
+        63
+      ],
+      "equals": 0.0,
+      "tol": 0.0
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "archive": "nto_unrestricted_empty_beta.qvf",
+  "description": "Unrestricted NTO hole/particle sections with two alpha rows and 0 beta rows. Weights pair per spin; their combined sum is 1.0. Full TDDFT/RPA sums need not be one (spec \u00a7 5.3).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "excited_states",
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "spin"
+      ],
+      "equals": "unrestricted"
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "nto_role"
+      ],
+      "equals": "hole"
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupation_semantics"
+      ],
+      "equals": "transition_weight"
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "occupations"
+      ],
+      "equals": [
+        0.8,
+        0.2
+      ]
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "occupations"
+      ],
+      "equals": []
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "n_mo"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "n_mo"
+      ],
+      "equals": 0
+    },
+    {
+      "section": "nto_hole",
+      "member": "mo_coefficients_alpha",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "spin"
+      ],
+      "equals": "unrestricted"
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "nto_role"
+      ],
+      "equals": "particle"
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupation_semantics"
+      ],
+      "equals": "transition_weight"
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "occupations"
+      ],
+      "equals": [
+        0.8,
+        0.2
+      ]
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "occupations"
+      ],
+      "equals": []
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "alpha",
+        "n_mo"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "beta",
+        "n_mo"
+      ],
+      "equals": 0
+    },
+    {
+      "section": "nto_particle",
+      "member": "mo_coefficients_alpha",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0
+    }
+  ]
+}

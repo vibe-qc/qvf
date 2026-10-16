@@ -1,0 +1,198 @@
+{
+  "archive": "wavefunction_cartesian.qvf",
+  "description": "wavefunction.gto with a Cartesian (pure: false) d shell: the Appendix A.1 normalization contract in numbers. The vendor section x_conformance.overlap_diagonal stores the self-overlap of each AO, computed from the stored exponents and coefficients with the format's N_i: 1 for the axial components and 1/3 for d_xy, d_xz and d_yz. A consumer recomputes them from basis.json to verify its normalization.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "wavefunction.gto",
+    "x_conformance.overlap_diagonal"
+  ],
+  "checks": [
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "pure"
+      ],
+      "equals": false
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 7
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "l"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "pure"
+      ],
+      "equals": false
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "exponents",
+        0
+      ],
+      "equals": 2.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "exponents",
+        1
+      ],
+      "equals": 0.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "coefficients",
+        0
+      ],
+      "equals": 0.5458083641626852,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        1,
+        "coefficients",
+        1
+      ],
+      "equals": 0.5954273063592929,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients",
+      "binary_index": [
+        2,
+        2
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        0
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        1
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        2
+      ],
+      "equals": 0.3333333333333333,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        3
+      ],
+      "equals": 0.3333333333333333,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        4
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        5
+      ],
+      "equals": 0.3333333333333333,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "self_overlap",
+        6
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "ao_labels",
+        2
+      ],
+      "equals": "d_xy"
+    },
+    {
+      "section": "overlap_check",
+      "member": "payload",
+      "json_pointer": [
+        "cartesian_powers",
+        2
+      ],
+      "equals": [
+        1,
+        1,
+        0
+      ]
+    }
+  ]
+}

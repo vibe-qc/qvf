@@ -1,0 +1,10 @@
+{
+  "archive": "bonds_atom_out_of_range.qvf",
+  "description": "A standalone bonds section whose structure_ref names the second structure, H2 with atoms 0 and 1, and whose second pair joins atoms 1 and 2. Atom 2 exists in the first structure, water, so a validator that counted the atoms of the first structure instead of the referenced one would accept it (spec \u00a7 5.1).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}
