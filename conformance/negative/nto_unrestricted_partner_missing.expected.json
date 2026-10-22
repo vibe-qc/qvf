@@ -1,0 +1,10 @@
+{
+  "archive": "nto_unrestricted_partner_missing.qvf",
+  "description": "Unrestricted NTO defect: partner_missing; spec \u00a7 5.3.",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

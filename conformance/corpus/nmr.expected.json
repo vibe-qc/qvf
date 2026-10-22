@@ -1,0 +1,73 @@
+{
+  "archive": "nmr.qvf",
+  "description": "Typed spectra.nmr ($defs/NmrSpectrumPayload) of methanol: 1H chemical shifts (ppm vs TMS), one shielding tensor (ppm, Cartesian rows) and J couplings (Hz); synthetic values.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "spectra.nmr",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "isotope"
+      ],
+      "equals": "1H"
+    },
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "solvent"
+      ],
+      "equals": "chloroform"
+    },
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "chemical_shifts",
+        1,
+        "isotropic_shift_ppm"
+      ],
+      "equals": 3.41,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "chemical_shifts",
+        0,
+        "asymmetry"
+      ],
+      "equals": 0.21,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "shielding_tensors",
+        0,
+        "tensor",
+        1,
+        1
+      ],
+      "equals": 42.21,
+      "tol": 1e-09
+    },
+    {
+      "section": "spectra_nmr",
+      "member": "spectrum",
+      "json_pointer": [
+        "j_couplings",
+        1,
+        "value_hz"
+      ],
+      "equals": -10.8,
+      "tol": 1e-09
+    }
+  ]
+}

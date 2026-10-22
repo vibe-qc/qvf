@@ -57,10 +57,14 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
   exit 2
 fi
 NAME="qvf-writer-${VERSION}"
-# Check the actual archived bytes; never silently repair or mutate source.
-python3 "${STAGE_DIR}/source/scripts/amalgamate.py" --check
+# Check the actual archived bytes; do not add imported-module bytecode to
+# this committed inventory while checking the generated files.
+python3 -B "${STAGE_DIR}/source/scripts/amalgamate.py" --check
+python3 -B "${STAGE_DIR}/source/scripts/gen_kinds.py" --check
 cmp "${STAGE_DIR}/source/spec/qvf_manifest.schema.json" \
     "${STAGE_DIR}/source/python/qvf_manifest.schema.json"
+cmp "${STAGE_DIR}/source/spec/qvf_manifest.schema.json" \
+    "${STAGE_DIR}/source/python/qvf/schema/qvf_manifest.schema.json"
 mv "${STAGE_DIR}/source" "${STAGE_DIR}/${NAME}"
 mkdir -p "${DIST_DIR}"
 DIST_DIR="$(cd "${DIST_DIR}" && pwd)"

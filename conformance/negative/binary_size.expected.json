@@ -1,0 +1,10 @@
+{
+  "archive": "binary_size.qvf",
+  "description": "A float64 [3] member that stores 16 bytes instead of 24.",
+  "expect": [
+    {
+      "code": "E_BINARY_SIZE",
+      "severity": "error"
+    }
+  ]
+}

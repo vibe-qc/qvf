@@ -34,12 +34,20 @@ int main(int argc, char** argv) {
     std::cout << "wrote " << path << " via qvf_single.hpp\n";
 
     // Read it back through the reader that ships in the same single header.
-    QvfReader reader = QvfReader::open(path);
-    std::vector<std::string> errors;
-    bool ok = reader.validate(errors);
-    Json st = reader.read_json_member("structure", "structure");
-    std::cout << "read back " << reader.sections().size() << " sections, "
+    Reader reader = Reader::open(path);
+    const auto report = reader.validate();
+    const bool ok = report.ok;
+    const Section* section = reader.section("structure");
+    if (!section) return 1;
+    Json st = reader.json(*section, "structure");
+    std::cout << "read back " << report.n_sections << " sections, "
               << "first atom " << st.at("atoms").at(0).at("symbol").as_string()
               << ", valid=" << (ok ? "yes" : "no") << "\n";
-    return ok ? 0 : 1;
+    const auto typed = reader.get<kinds::Structure>("structure");
+    if (typed.structure.atoms.size() != 3) return 1;
+    Writer copy({"single-header-demo", "1.0", "typed-copy"});
+    for (const auto& s : *reader.manifest().sections) kinds::copy_section(reader, s, copy);
+    Reader roundtrip = Reader::from_bytes(copy.to_bytes());
+    std::cout << "typed copy valid=" << (roundtrip.validate().ok ? "yes" : "no") << "\n";
+    return ok && roundtrip.validate().ok ? 0 : 1;
 }

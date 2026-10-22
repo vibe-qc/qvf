@@ -1,0 +1,10 @@
+{
+  "archive": "electric_dipole_inconsistent.qvf",
+  "description": "A properties.electric dipole of 1.5 debye next to a root dipole_moment of 1.85 debye; the two state one dipole and must agree within 1e-6 debye (spec \u00a7 5.13).",
+  "expect": [
+    {
+      "code": "E_ROOT_INCONSISTENT",
+      "severity": "error"
+    }
+  ]
+}

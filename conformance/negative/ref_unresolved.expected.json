@@ -1,0 +1,10 @@
+{
+  "archive": "ref_unresolved.qvf",
+  "description": "reaction.waypoints.trajectory_ref names a section that does not exist.",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

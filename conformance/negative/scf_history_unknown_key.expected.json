@@ -1,0 +1,10 @@
+{
+  "archive": "scf_history_unknown_key.qvf",
+  "description": "An scf_history iteration that names its energy 'energy' instead of 'energy_eh': the strict payload rejects the unknown key and misses the required one (spec \u00a7 5.7).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

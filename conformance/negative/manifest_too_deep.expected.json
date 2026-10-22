@@ -1,0 +1,10 @@
+{
+  "archive": "manifest_too_deep.qvf",
+  "description": "manifest.json nests 72 levels deep (70 arrays inside provenance), over the depth cap of 64.",
+  "expect": [
+    {
+      "code": "E_JSON_TOO_DEEP",
+      "severity": "error"
+    }
+  ]
+}

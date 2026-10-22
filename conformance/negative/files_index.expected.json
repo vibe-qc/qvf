@@ -1,0 +1,10 @@
+{
+  "archive": "files_index.qvf",
+  "description": "A run.record files index naming a role with no member.",
+  "expect": [
+    {
+      "code": "E_FILES_INDEX",
+      "severity": "error"
+    }
+  ]
+}

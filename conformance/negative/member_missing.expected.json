@@ -1,0 +1,10 @@
+{
+  "archive": "member_missing.qvf",
+  "description": "A declared member path absent from the ZIP.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MISSING",
+      "severity": "error"
+    }
+  ]
+}

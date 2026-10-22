@@ -1,0 +1,10 @@
+{
+  "archive": "hessian_not_square.qvf",
+  "description": "A hessian matrix of shape [9, 6]; it must be the square [3N, 3N] (spec \u00a7 5.11).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

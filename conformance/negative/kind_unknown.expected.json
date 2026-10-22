@@ -1,0 +1,10 @@
+{
+  "archive": "kind_unknown.qvf",
+  "description": "A non-vendor kind that is not canonical.",
+  "expect": [
+    {
+      "code": "E_KIND_UNKNOWN",
+      "severity": "error"
+    }
+  ]
+}

@@ -3,13 +3,15 @@
 // Just enough JSON to build QVF manifests and member payloads: null, bool,
 // integer, double, string, ordered object, and array. Objects preserve
 // insertion order. Numbers emit as round-trippable JSON (integers without a
-// decimal point; doubles via %.17g). This is deliberately minimal — it is a
-// *writer*, not a parser.
+// decimal point; doubles via %.17g). The small recursive-descent parser used by
+// the reader bounds its nesting depth (JsonDepthError), so untrusted input
+// cannot exhaust the stack.
 //
 // License: Apache-2.0.
 #ifndef QVF_JSON_HPP
 #define QVF_JSON_HPP
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +23,14 @@
 #include <vector>
 
 namespace qvf {
+
+// Thrown by Json::parse when a document nests arrays/objects deeper than the
+// caller's limit (spec § 6: E_JSON_TOO_DEEP). Distinct from the plain
+// std::runtime_error thrown for malformed JSON.
+class JsonDepthError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Json {
 public:
@@ -34,6 +44,10 @@ public:
     Json(long long v) : type_(Type::Int), int_(v) {}
     Json(unsigned v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
     Json(unsigned long v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
+    // size_t is `unsigned long long` on LLP64 (64-bit Windows), and so is
+    // uint64_t on macOS; without this overload Json(size_t) / Json(uint64_t)
+    // is an ambiguous call there.
+    Json(unsigned long long v) : type_(Type::Int), int_(static_cast<int64_t>(v)) {}
     Json(double v) : type_(Type::Double), dbl_(v) {}
     Json(const char* s) : type_(Type::String), str_(s) {}
     Json(std::string s) : type_(Type::String), str_(std::move(s)) {}
@@ -88,6 +102,19 @@ public:
         if (type_ != Type::Object) return false;
         for (const auto& kv : obj_) if (kv.first == key) return true;
         return false;
+    }
+    // Remove every member named `key` (a parsed object may repeat a key).
+    // Returns true if anything was removed; a no-op returning false on a
+    // non-object, including a Raw fragment.
+    bool erase(const std::string& key) {
+        if (type_ != Type::Object) return false;
+        const size_t before = obj_.size();
+        obj_.erase(std::remove_if(obj_.begin(), obj_.end(),
+                                  [&key](const std::pair<std::string, Json>& kv) {
+                                      return kv.first == key;
+                                  }),
+                   obj_.end());
+        return obj_.size() != before;
     }
 
     Type type() const { return type_; }
@@ -162,10 +189,16 @@ public:
     const Json& operator[](const std::string& key) const { return at(key); }
     const Json& operator[](size_t i) const { return at(i); }
 
-    // Parse a UTF-8 JSON document. Throws std::runtime_error on malformed input.
-    static Json parse(const std::string& text) {
+    // Default nesting limit of parse(): the spec § 6 reference value.
+    static constexpr size_t kDefaultMaxDepth = 64;
+
+    // Parse a UTF-8 JSON document. Throws std::runtime_error on malformed input
+    // and JsonDepthError when arrays/objects nest deeper than `max_depth`
+    // (a top-level `[]` is depth 1; scalars are depth 0).
+    static Json parse(const std::string& text,
+                      size_t max_depth = kDefaultMaxDepth) {
         size_t pos = 0;
-        Json v = parse_value(text, pos);
+        Json v = parse_value(text, pos, 0, max_depth);
         skip_ws(text, pos);
         if (pos != text.size())
             throw std::runtime_error("qvf::Json::parse: trailing content");
@@ -179,12 +212,18 @@ private:
                (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
             ++p;
     }
-    static Json parse_value(const std::string& s, size_t& p) {
+    static Json parse_value(const std::string& s, size_t& p, size_t depth,
+                            size_t max_depth) {
         skip_ws(s, p);
         if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: unexpected end");
         char c = s[p];
-        if (c == '{') return parse_object(s, p);
-        if (c == '[') return parse_array(s, p);
+        if (c == '{' || c == '[') {
+            if (depth + 1 > max_depth)
+                throw JsonDepthError("qvf::Json::parse: nesting deeper than " +
+                                     std::to_string(max_depth) + " levels");
+            return c == '{' ? parse_object(s, p, depth + 1, max_depth)
+                            : parse_array(s, p, depth + 1, max_depth);
+        }
         if (c == '"') return Json(parse_string(s, p));
         if (c == 't' || c == 'f') return parse_bool(s, p);
         if (c == 'n') { expect(s, p, "null"); return Json(nullptr); }
@@ -219,18 +258,19 @@ private:
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
                     case 'u': {
-                        if (p + 4 > s.size())
-                            throw std::runtime_error("qvf::Json::parse: bad \\u");
-                        unsigned cp = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = s[p++];
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= unsigned(h - '0');
-                            else if (h >= 'a' && h <= 'f') cp |= unsigned(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') cp |= unsigned(h - 'A' + 10);
-                            else throw std::runtime_error("qvf::Json::parse: bad hex");
+                        unsigned cp = parse_hex4(s, p);
+                        // A high surrogate followed by an escaped low surrogate
+                        // is one code point; a lone surrogate stands for itself.
+                        if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= s.size() &&
+                            s[p] == '\\' && s[p + 1] == 'u') {
+                            size_t q = p + 2;
+                            const unsigned lo = parse_hex4(s, q);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                p = q;
+                            }
                         }
-                        encode_utf8(out, cp);  // surrogate pairs left as-is (rare in QVF)
+                        encode_utf8(out, cp);
                         break;
                     }
                     default: throw std::runtime_error("qvf::Json::parse: bad escape");
@@ -241,13 +281,32 @@ private:
         }
         throw std::runtime_error("qvf::Json::parse: unterminated string");
     }
+    // Four hex digits of a \u escape at s[p], advancing p.
+    static unsigned parse_hex4(const std::string& s, size_t& p) {
+        if (p + 4 > s.size()) throw std::runtime_error("qvf::Json::parse: bad \\u");
+        unsigned cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            char h = s[p++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9') cp |= unsigned(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= unsigned(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= unsigned(h - 'A' + 10);
+            else throw std::runtime_error("qvf::Json::parse: bad hex");
+        }
+        return cp;
+    }
     static void encode_utf8(std::string& out, unsigned cp) {
         if (cp < 0x80) out.push_back(static_cast<char>(cp));
         else if (cp < 0x800) {
             out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
+        } else if (cp < 0x10000) {
             out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
         }
@@ -272,13 +331,14 @@ private:
             return Json(std::stod(num));
         }
     }
-    static Json parse_array(const std::string& s, size_t& p) {
+    static Json parse_array(const std::string& s, size_t& p, size_t depth,
+                            size_t max_depth) {
         ++p;  // '['
         Json a = array();
         skip_ws(s, p);
         if (p < s.size() && s[p] == ']') { ++p; return a; }
         while (true) {
-            a.arr_.push_back(parse_value(s, p));
+            a.arr_.push_back(parse_value(s, p, depth, max_depth));
             skip_ws(s, p);
             if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: bad array");
             if (s[p] == ',') { ++p; continue; }
@@ -287,7 +347,8 @@ private:
         }
         return a;
     }
-    static Json parse_object(const std::string& s, size_t& p) {
+    static Json parse_object(const std::string& s, size_t& p, size_t depth,
+                             size_t max_depth) {
         ++p;  // '{'
         Json o = object();
         skip_ws(s, p);
@@ -301,7 +362,7 @@ private:
             if (p >= s.size() || s[p] != ':')
                 throw std::runtime_error("qvf::Json::parse: expected :");
             ++p;
-            o.obj_.emplace_back(key, parse_value(s, p));
+            o.obj_.emplace_back(key, parse_value(s, p, depth, max_depth));
             skip_ws(s, p);
             if (p >= s.size()) throw std::runtime_error("qvf::Json::parse: bad object");
             if (s[p] == ',') { ++p; continue; }
@@ -319,7 +380,8 @@ private:
 
     static void emit_string(std::string& out, const std::string& s) {
         out.push_back('"');
-        for (unsigned char c : s) {
+        for (char ch : s) {
+            const unsigned char c = static_cast<unsigned char>(ch);
             switch (c) {
                 case '"': out += "\\\""; break;
                 case '\\': out += "\\\\"; break;
@@ -355,7 +417,7 @@ private:
     void newline(std::string& out, int indent, int depth) const {
         if (indent <= 0) return;
         out.push_back('\n');
-        out.append(static_cast<size_t>(indent) * depth, ' ');
+        out.append(static_cast<size_t>(indent) * static_cast<size_t>(depth), ' ');
     }
 
     void dump_to(std::string& out, int indent, int depth) const {

@@ -1,0 +1,10 @@
+{
+  "archive": "entry_size_understated.qvf",
+  "description": "A member whose ZIP headers declare 1 KiB uncompressed while its data inflates to 8 KiB: a reader must not inflate past the declared size, so the entry is unreadable.",
+  "expect": [
+    {
+      "code": "E_ZIP_UNREADABLE",
+      "severity": "error"
+    }
+  ]
+}

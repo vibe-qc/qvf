@@ -1,0 +1,10 @@
+{
+  "archive": "reserved_id_bookmarks.qvf",
+  "description": "A section id 'bookmarks', a reserved viewer_defaults key (spec \u00a7 3.1).",
+  "expect": [
+    {
+      "code": "E_RESERVED_ID",
+      "severity": "error"
+    }
+  ]
+}

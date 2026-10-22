@@ -1,0 +1,92 @@
+{
+  "archive": "volume_laplacian.qvf",
+  "description": "volume.laplacian: the Laplacian of a model two-centre density in e/bohr^5 (float32, 5x4x6 grid in bohr), negative near the nuclei and positive farther out; the grid declares no units.data, because e/bohr^5 has no unit name.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.laplacian"
+  ],
+  "checks": [
+    {
+      "section": "lap",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 5
+    },
+    {
+      "section": "lap",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 4
+    },
+    {
+      "section": "lap",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 6
+    },
+    {
+      "section": "lap",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -1.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "lap",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 0.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "lap",
+      "member": "data",
+      "binary_index": [
+        2,
+        1,
+        1
+      ],
+      "equals": -4.446335315704346,
+      "tol": 1e-06
+    },
+    {
+      "section": "lap",
+      "member": "data",
+      "binary_index": [
+        2,
+        2,
+        4
+      ],
+      "equals": -7.160510063171387,
+      "tol": 1e-06
+    },
+    {
+      "section": "lap",
+      "member": "data",
+      "binary_index": [
+        0,
+        0,
+        0
+      ],
+      "equals": 0.1525738388299942,
+      "tol": 1e-06
+    }
+  ]
+}

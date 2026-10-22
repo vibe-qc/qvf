@@ -1,0 +1,203 @@
+{
+  "archive": "md_periodic.qvf",
+  "description": "A toy NPT molecular-dynamics run of one water molecule: coords float32 [n_frames, n_atoms, 3] in Angstrom with metadata.precision 'float32'; a per-frame lattice [n_frames, 3, 3] in the structure convention (rows, Angstrom; not the columns in bohr of reaction.path) with pbc; velocities in Angstrom/fs, the energy gradient in hartree/bohr, times in fs, binary energies in hartree that restate metadata.energies, cell volumes in Angstrom^3 and temperatures in kelvin; ensemble npt and timestep_fs 0.5.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "trajectory"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "coords",
+        "dtype"
+      ],
+      "equals": "float32"
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "precision"
+      ],
+      "equals": "float32"
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "kind"
+      ],
+      "equals": "md"
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "ensemble"
+      ],
+      "equals": "npt"
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "timestep_fs"
+      ],
+      "equals": 0.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "pbc"
+      ],
+      "equals": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "section": "md",
+      "member": "coords",
+      "binary_index": [
+        4,
+        1,
+        2
+      ],
+      "equals": 4.052800178527832,
+      "tol": 1e-06
+    },
+    {
+      "section": "md",
+      "member": "coords",
+      "binary_index": [
+        2,
+        2,
+        0
+      ],
+      "equals": 4.513000011444092,
+      "tol": 1e-06
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "lattice",
+        "shape"
+      ],
+      "equals": [
+        5,
+        3,
+        3
+      ]
+    },
+    {
+      "section": "md",
+      "member": "lattice",
+      "binary_index": [
+        3,
+        1,
+        0
+      ],
+      "equals": 0.3,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "lattice",
+      "binary_index": [
+        3,
+        0,
+        1
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "lattice",
+      "binary_index": [
+        4,
+        2,
+        2
+      ],
+      "equals": 9.2736,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "velocities",
+      "binary_index": [
+        2,
+        1,
+        0
+      ],
+      "equals": -0.015,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "gradient",
+      "binary_index": [
+        3,
+        0,
+        2
+      ],
+      "equals": 0.007,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "times",
+      "binary_index": [
+        3
+      ],
+      "equals": 1.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "energies",
+      "binary_index": [
+        2
+      ],
+      "equals": -76.4121,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "metadata",
+      "json_pointer": [
+        "energies",
+        2
+      ],
+      "equals": -76.4121,
+      "tol": 1e-12
+    },
+    {
+      "section": "md",
+      "member": "cell_volumes",
+      "binary_index": [
+        4
+      ],
+      "equals": 771.7085739417599,
+      "tol": 1e-09
+    },
+    {
+      "section": "md",
+      "member": "temperatures",
+      "binary_index": [
+        1
+      ],
+      "equals": 304.2,
+      "tol": 1e-12
+    }
+  ]
+}

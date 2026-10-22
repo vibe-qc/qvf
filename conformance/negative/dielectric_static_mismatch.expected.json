@@ -1,0 +1,10 @@
+{
+  "archive": "dielectric_static_mismatch.qvf",
+  "description": "A properties.dielectric whose static tensor has 7.5 on the diagonal while electronic + ionic is 7.2; static must equal their sum within 1e-6 (spec \u00a7 5.13).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "byte_order_big.qvf",
+  "description": "A root byte_order of 'big': 'little' is the only byte order of QVF v1 (spec \u00a7 2.2), and the JSON Schema rejects any other value. Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive, while the reference readers refuse to open it.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

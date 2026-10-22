@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/@QVF_PC_PREFIX_RELATIVE@
+libdir=@QVF_PC_LIBDIR@
+includedir=@QVF_PC_INCLUDEDIR@
+
+Name: qvf
+Description: QVF archive reader, writer and validator with C and C++ APIs
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lqvf
+Cflags: -I${includedir}@QVF_PC_DEFINES@

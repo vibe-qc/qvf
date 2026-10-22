@@ -1,0 +1,10 @@
+{
+  "archive": "member_size_mismatch.qvf",
+  "description": "The structure member declares a size 8 bytes larger than the uncompressed size its ZIP entry records; sha256 and payload are otherwise correct. A validator compares size with the central directory before reading the member (spec \u00a7 4.2).",
+  "expect": [
+    {
+      "code": "E_BINARY_SIZE",
+      "severity": "error"
+    }
+  ]
+}

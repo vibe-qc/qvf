@@ -1,0 +1,14 @@
+{
+  "archive": "atom_properties_custom_no_meta.qvf",
+  "description": "An atom_properties section with a custom.flux role and no meta member: a custom role is allowed only with a meta member that describes it (spec \u00a7 5.7). A validator with a JSON Schema engine also reports E_SCHEMA.",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    },
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

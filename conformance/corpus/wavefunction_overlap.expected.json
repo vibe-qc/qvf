@@ -1,0 +1,263 @@
+{
+  "archive": "wavefunction_overlap.qvf",
+  "description": "wavefunction.gto with an AO overlap member, so that the Appendix A.1 normalization contract is checked by every validator: CO with spherical s, p and d shells on C and a spherical s and a Cartesian (pure: false) d shell on O. The overlap diagonal is 1 for every spherical AO and for d_xx, d_yy and d_zz, 1/3 for d_xy, d_xz and d_yz, and for the O s shell, whose contraction is deliberately not normalized, its axial self-overlap 0.660580261291. AO order: C s, C p(m=-1), C p(m=0), C p(m=+1), C d(m=-2), C d(m=-1), C d(m=0), C d(m=+1), C d(m=+2), O s, O d_xx, O d_xy, O d_xz, O d_yy, O d_yz, O d_zz. The MOs are the Lowdin orbitals S^(-1/2), orthonormal in this metric, and the density matrix is that of the seven lowest, doubly occupied (tr(P S) = 14 = basis.n_electrons); illustrative numbers, not a converged calculation.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 16
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "pure"
+      ],
+      "equals": true
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "shells",
+        4,
+        "pure"
+      ],
+      "equals": false
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "overlap",
+        "shape"
+      ],
+      "equals": [
+        16,
+        16
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "density_matrix",
+        "shape"
+      ],
+      "equals": [
+        16,
+        16
+      ]
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0000000000000002,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        1,
+        1
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        2,
+        2
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        3,
+        3
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        4,
+        4
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        5,
+        5
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        6,
+        6
+      ],
+      "equals": 1.0000000000000002,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        7,
+        7
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        8,
+        8
+      ],
+      "equals": 1.0000000000000002,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        9,
+        9
+      ],
+      "equals": 0.6605802612907266,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        10,
+        10
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        11,
+        11
+      ],
+      "equals": 0.33333333333333337,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        12,
+        12
+      ],
+      "equals": 0.33333333333333337,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        13,
+        13
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        14,
+        14
+      ],
+      "equals": 0.33333333333333337,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        15,
+        15
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        0,
+        9
+      ],
+      "equals": 0.07176726847062775,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        9,
+        0
+      ],
+      "equals": 0.07176726847062775,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0702459084810931,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "density_matrix",
+      "binary_index": [
+        9,
+        9
+      ],
+      "equals": 0.022394261380780562,
+      "tol": 1e-12
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "excited_states_index_duplicate.qvf",
+  "description": "An excited_states payload whose third state repeats index 2; state indices are unique and ascending (spec \u00a7 5.12).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QVF reader smoke test</title>
+  <!--
+    Browser smoke test for @qvf/core: pick a .qvf file and see its sections and
+    the validation findings. No bundler: the built ESM in ../dist is loaded
+    directly, and the import map tells the browser where fflate lives.
+
+      cd js && npm ci && npm run build
+      npx --yes http-server .          # or: python3 -m http.server   (from js/)
+      open http://localhost:8080/examples/browser.html
+
+    Optional: ?url=PATH_OR_URL loads that file at startup instead of a pick.
+    Checksums use WebCrypto, which browsers expose on https:, localhost and file:.
+  -->
+  <script type="importmap">
+    { "imports": { "fflate": "../node_modules/fflate/esm/browser.js" } }
+  </script>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 56rem; padding: 0 1rem; }
+    pre { background: #f4f4f6; padding: 1rem; overflow-x: auto; white-space: pre-wrap; }
+    .error { color: #b00020; }
+    .warning { color: #8a5a00; }
+    .ok { color: #1b6e2d; }
+  </style>
+</head>
+<body>
+  <h1>QVF reader smoke test</h1>
+  <p><input type="file" id="file" accept=".qvf,.zip" aria-label="Choose a .qvf file"></p>
+  <p id="verdict" aria-live="polite"></p>
+  <h2>Sections</h2>
+  <pre id="sections">Choose a .qvf file.</pre>
+  <h2>Validation findings</h2>
+  <pre id="findings"></pre>
+
+  <script type="module">
+    import { QvfReader, validate } from "../dist/index.js";
+
+    const $ = (id) => document.getElementById(id);
+
+    async function show(bytes, name) {
+      $("verdict").className = "";
+      $("verdict").textContent = `Reading ${name} (${bytes.length} bytes)...`;
+      let sectionsText;
+      try {
+        const reader = QvfReader.fromBytes(bytes);
+        const src = reader.manifest.source ?? {};
+        const lines = [`source: ${src.program} ${src.version} (${src.calculation})`];
+        for (const s of reader.sections) {
+          const roles = Object.keys(s.members).join(", ");
+          lines.push(`${s.id}  [${s.kind}]${s.label ? `  ${s.label}` : ""}  members: ${roles}`);
+        }
+        sectionsText = lines.join("\n");
+      } catch (err) {
+        sectionsText = `cannot open: ${err.message}`;
+      }
+      $("sections").textContent = sectionsText;
+
+      const report = await validate(bytes);
+      $("findings").textContent = report.findings.length === 0
+        ? "(none)"
+        : report.findings.map((f) => `${f.severity.toUpperCase()}  ${f.code}  ${f.where}\n    ${f.message}`).join("\n");
+      $("verdict").className = report.ok ? "ok" : "error";
+      $("verdict").textContent = `${name}: ${report.ok ? "valid" : "INVALID"}, ${report.nSections} sections, ${report.findings.length} findings`;
+      document.title = `QVF reader smoke test: ${report.ok ? "ok" : "invalid"}`;
+    }
+
+    $("file").addEventListener("change", async (event) => {
+      const file = event.target.files[0];
+      if (file) await show(new Uint8Array(await file.arrayBuffer()), file.name);
+    });
+
+    const url = new URLSearchParams(location.search).get("url");
+    if (url) {
+      const response = await fetch(url);
+      await show(new Uint8Array(await response.arrayBuffer()), url.split("/").pop());
+    }
+  </script>
+</body>
+</html>

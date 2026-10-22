@@ -1,0 +1,10 @@
+{
+  "archive": "unit_contradicts_fixed.qvf",
+  "description": "A volume.density grid that declares units.origin 'angstrom', a unit name that contradicts the bohr spec \u00a7 4.3 fixes for the grid origin. Only a validator with a JSON Schema engine detects this; one without accepts the archive.",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

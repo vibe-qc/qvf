@@ -1,0 +1,293 @@
+{
+  "archive": "job_spec_full.qvf",
+  "description": "job.spec with every optional field of the payload: a periodic job whose structure_ref names the second of two structures (the slab, not the bulk reference), with solvation, dispersion, relativistic, scf, geometry and resources blocks (resources are hints). The provenance of this pending archive describes the step that prepared it: software (with a url), git_commit, thread and rank counts, and the two time stamps (spec \u00a7 3.2, \u00a7 5.9).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "job.spec",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "provenance",
+        "run_status"
+      ],
+      "equals": "pending"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        0,
+        "name"
+      ],
+      "equals": "job-builder"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        0,
+        "url"
+      ],
+      "equals": "https://example.org/job-builder"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "software",
+        1,
+        "version"
+      ],
+      "equals": "2.9.0"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "git_commit"
+      ],
+      "equals": "3e8a1c5f7b2d"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_threads"
+      ],
+      "equals": 8
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_mpi_ranks"
+      ],
+      "equals": 4
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "started_utc"
+      ],
+      "equals": "2026-10-07T09:00:00Z"
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "finished_utc"
+      ],
+      "equals": "2026-10-07T09:00:02Z"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "job_type"
+      ],
+      "equals": "periodic"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "structure_ref"
+      ],
+      "equals": "mgo_slab"
+    },
+    {
+      "section": "mgo_slab",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        0,
+        0
+      ],
+      "equals": 4.3,
+      "tol": 1e-12
+    },
+    {
+      "section": "mgo_slab",
+      "member": "structure",
+      "json_pointer": [
+        "pbc",
+        2
+      ],
+      "equals": false
+    },
+    {
+      "section": "mgo_reference",
+      "member": "structure",
+      "json_pointer": [
+        "lattice_vectors",
+        0,
+        0
+      ],
+      "equals": 4.212,
+      "tol": 1e-12
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "solvation",
+        "model"
+      ],
+      "equals": "cpcm"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "solvation",
+        "solvent"
+      ],
+      "equals": "water"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "solvation",
+        "epsilon"
+      ],
+      "equals": 78.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "dispersion"
+      ],
+      "equals": "d3bj"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "relativistic"
+      ],
+      "equals": "x2c"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "scf",
+        "convergence"
+      ],
+      "equals": 1e-08,
+      "tol": 1e-20
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "scf",
+        "max_iterations"
+      ],
+      "equals": 100
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "scf",
+        "guess"
+      ],
+      "equals": "sad"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "scf",
+        "damping"
+      ],
+      "equals": 0.3,
+      "tol": 1e-12
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "geometry",
+        "convergence"
+      ],
+      "equals": 0.00045,
+      "tol": 1e-15
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "geometry",
+        "max_steps"
+      ],
+      "equals": 50
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "geometry",
+        "coordinates"
+      ],
+      "equals": "redundant"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "resources",
+        "n_cores"
+      ],
+      "equals": 16
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "resources",
+        "memory_mb"
+      ],
+      "equals": 32000
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "resources",
+        "walltime_s"
+      ],
+      "equals": 86400.0,
+      "tol": 1e-09
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "kpoints",
+        2
+      ],
+      "equals": 1
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "tasks",
+        0
+      ],
+      "equals": "optimize"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "options",
+        "cutoff_ha"
+      ],
+      "equals": 300.0,
+      "tol": 1e-09
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "manifest_json_invalid.qvf",
+  "description": "manifest.json is truncated, invalid JSON.",
+  "expect": [
+    {
+      "code": "E_MANIFEST_JSON",
+      "severity": "error"
+    }
+  ]
+}

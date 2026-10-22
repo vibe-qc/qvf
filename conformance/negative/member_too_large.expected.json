@@ -1,0 +1,13 @@
+{
+  "archive": "member_too_large.qvf",
+  "description": "A 4 KiB member over the per-member size cap (lowered to 2 KiB here; the reference value is 8 GiB).",
+  "limits": {
+    "max_member_bytes": 2048
+  },
+  "expect": [
+    {
+      "code": "E_MEMBER_TOO_LARGE",
+      "severity": "error"
+    }
+  ]
+}
