@@ -50,7 +50,20 @@ def test_archive_excludes_checkout_state_and_preserves_corpus(repo):
         files = {m.name.split("/", 1)[1]: archive.extractfile(m).read()
                  for m in archive.getmembers() if m.isfile()}
     assert set(files) == expected
-    assert len([p for p in files if p.endswith(".qvf")]) == 12
+    qvf = [p for p in files if p.endswith(".qvf")]
+    corpus = [p for p in qvf if p.startswith("conformance/corpus/")]
+    assert corpus and len(corpus) == len(
+        [p for p in files
+         if p.startswith("conformance/corpus/") and p.endswith(".expected.json")])
+    negative = [p for p in qvf if p.startswith("conformance/negative/")]
+    assert negative and len(negative) == len(
+        [p for p in files
+         if p.startswith("conformance/negative/") and p.endswith(".expected.json")])
+    legacy = [p for p in qvf if p.startswith("conformance/legacy/")]
+    assert legacy and len(legacy) == len(
+        [p for p in files
+         if p.startswith("conformance/legacy/") and p.endswith(".expected.json")])
+    assert len(qvf) == len(corpus) + len(negative) + len(legacy)
     assert not any(sentinel.encode() in b for b in files.values())
     for path, data in files.items():
         assert data == subprocess.check_output(["git", "-C", str(repo), "show", "HEAD:" + path])

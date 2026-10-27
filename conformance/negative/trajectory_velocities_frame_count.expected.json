@@ -1,0 +1,10 @@
+{
+  "archive": "trajectory_velocities_frame_count.qvf",
+  "description": "Trajectory velocities of shape [3, 3, 3] for coords of 2 frames; every per-frame member has the leading extent of coords (spec \u00a7 5.5).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

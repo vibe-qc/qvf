@@ -1,0 +1,54 @@
+# Doxygen configuration of the QVF C++ and C API reference (WP-64).
+# License: Apache-2.0.
+#
+# `mkdocs build` runs this through scripts/mkdocs_hooks.py, which adds
+# PROJECT_NUMBER, OUTPUT_DIRECTORY and INPUT_FILTER and publishes the HTML
+# under api/cpp-reference/ of the site. To run it alone from the repository
+# root (paths below are relative to it):
+#
+#   ( cat cpp/Doxyfile; echo 'OUTPUT_DIRECTORY = build/doxygen';
+#     echo 'INPUT_FILTER = "python3 scripts/doxygen_filter.py"' ) | doxygen -
+#
+# The headers document declarations with plain comments; the input filter
+# hands them to Doxygen as documentation comments without changing a file.
+
+PROJECT_NAME           = "QVF C++ and C API"
+PROJECT_BRIEF          = "Streaming writer, lazy reader, validator and editor; C ABI 1"
+INPUT                  = cpp/include/qvf
+FILE_PATTERNS          = *.h *.hpp
+RECURSIVE              = YES
+STRIP_FROM_PATH        = cpp/include
+STRIP_FROM_INC_PATH    = cpp/include
+FULL_PATH_NAMES        = YES
+EXCLUDE_SYMBOLS        = detail detail::* *::detail *::detail::* model_detail model_detail::* *::model_detail *::model_detail::*
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = NO
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+SORT_MEMBER_DOCS       = NO
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = QVF_API= __cplusplus
+
+SOURCE_BROWSER         = YES
+VERBATIM_HEADERS       = YES
+FILTER_SOURCE_FILES    = NO
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_TREEVIEW      = YES
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+TIMESTAMP              = NO
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO

@@ -1,0 +1,10 @@
+{
+  "archive": "bonds_structure_ref_unresolved.qvf",
+  "description": "A standalone bonds section whose structure_ref names no section of the archive (spec \u00a7 4.1, \u00a7 5.1).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

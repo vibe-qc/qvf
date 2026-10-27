@@ -1,0 +1,78 @@
+# Static documentation site over docs/ (WP-64). Build locally with
+#   python3 -m pip install -r scripts/requirements-docs.txt
+#   mkdocs build --strict
+# The site lands in site/ (ignored). scripts/mkdocs_hooks.py adds the
+# top-level documents below to the site and points links to other repository
+# files at the public source tree. Publishing is a release decision.
+site_name: QVF
+site_description: The QVF quantum-chemistry archive format and its toolkit
+site_url: https://vibe-qc.com/docs/qvf/
+repo_url: https://github.com/vibe-qc/qvf
+edit_uri: ""
+copyright: QVF is Apache-2.0; see LICENSE and NOTICE.
+docs_dir: docs
+site_dir: site
+theme:
+  name: readthedocs
+  navigation_depth: 3
+markdown_extensions:
+  - tables
+  - fenced_code
+  - toc:
+      permalink: true
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [python]
+          options:
+            docstring_style: null
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: true
+            heading_level: 2
+            members_order: source
+            filters: ["!^_"]
+            show_signature_annotations: true
+            separate_signature: true
+hooks:
+  - scripts/mkdocs_hooks.py
+validation:
+  omitted_files: warn
+  absolute_links: info
+  unrecognized_links: warn
+nav:
+  - Home: index.md
+  - Format:
+      - Specification: spec/qvf-format-spec.md
+      - Kind catalogue: kinds.md
+      - Media type registration draft: iana-media-type-registration.md
+      - Conformance: conformance.md
+  - Guides:
+      - Getting started: getting_started.md
+      - Library guide: library_guide.md
+      - Integration guide: integration_guide.md
+      - Command line: cli.md
+      - Converters: converters.md
+      - PySCF adapter: adapters/pyscf.md
+      - PySCF to QVF tutorial: tutorials/pyscf-to-qvf.md
+      - C ABI: c_api.md
+      - Fortran binding: fortran.md
+      - Family workflow: family_workflow.md
+      - ORCA integration: orca_integration.md
+  - API reference:
+      - Python: api/python.md
+      - C++ and C: api/cpp.md
+  - Design:
+      - Library design: library_design.md
+      - Format review: format_review.md
+      - Roadmap: roadmap.md
+      - Work packages: work_packages.md
+  - Project:
+      - Governance: governance.md
+      - Changelog: changelog.md
+      - Contributing: contributing.md
+      - Python package release: python-release.md
+      - Security: security.md

@@ -1,0 +1,10 @@
+{
+  "archive": "wavefunction_n_electrons.qvf",
+  "description": "A wavefunction.gto basis whose n_electrons is 3 while the mo_metadata occupations sum to 2; the two must agree (spec \u00a7 5.3).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

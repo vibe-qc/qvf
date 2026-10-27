@@ -1,0 +1,115 @@
+{
+  "archive": "viewer_hints.qvf",
+  "description": "An all-electron silicon cell that opens at a saved view (spec \u00a7 3.4): the camera hint (the shape of a bookmark's camera), a crossfade between two densities starting at blend 0.25 (0 shows a, 1 shows b), and an energy_window of [-15, 10] eV relative to the Fermi level on the bands and the DOS, whose Si 1s states 1835 eV below it would otherwise squeeze the valence region into a few pixels. The hints are specified in the spec only, so a malformed one never fails an archive; these are well-formed.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "bands",
+    "dos.total",
+    "structure",
+    "volume.density"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "viewer_defaults",
+        "camera"
+      ],
+      "equals": {
+        "position": [
+          0.0,
+          -12.0,
+          4.0
+        ],
+        "focal_point": [
+          1.9,
+          1.9,
+          1.9
+        ],
+        "view_up": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "view_angle": 30.0
+      }
+    },
+    {
+      "manifest_pointer": [
+        "viewer_defaults",
+        "crossfade",
+        "a"
+      ],
+      "equals": "rho_a"
+    },
+    {
+      "manifest_pointer": [
+        "viewer_defaults",
+        "crossfade",
+        "blend"
+      ],
+      "equals": 0.25,
+      "tol": 1e-12
+    },
+    {
+      "manifest_pointer": [
+        "viewer_defaults",
+        "bands",
+        "energy_window"
+      ],
+      "equals": [
+        -15.0,
+        10.0
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "viewer_defaults",
+        "dos",
+        "energy_window",
+        0
+      ],
+      "equals": -15.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "bands",
+      "member": "kpath",
+      "json_pointer": [
+        "fermi"
+      ],
+      "equals": -4.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "bands",
+      "member": "eigenvalues",
+      "binary_index": [
+        0,
+        3,
+        0
+      ],
+      "equals": -1839.2,
+      "tol": 1e-09
+    },
+    {
+      "section": "dos",
+      "member": "energies",
+      "binary_index": [
+        1
+      ],
+      "equals": -1834.7,
+      "tol": 1e-09
+    },
+    {
+      "section": "rho_b",
+      "member": "data",
+      "binary_index": [
+        1,
+        2,
+        3
+      ],
+      "equals": 0.37978607416152954,
+      "tol": 1e-06
+    }
+  ]
+}

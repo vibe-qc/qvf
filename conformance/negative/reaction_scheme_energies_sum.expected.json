@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_energies_sum.qvf",
+  "description": "Step r1 water_a -> water_b states an energy delta of 0.02 hartree, but its terms -1 x -74.96 + 1 x -74.95 sum to 0.01 (spec \u00a7 5.14, Reaction energies).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

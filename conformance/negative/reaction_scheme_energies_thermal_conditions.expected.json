@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_energies_thermal_conditions.qvf",
+  "description": "A Gibbs free energy delta without temperature_k and pressure_atm. Only a validator that runs the JSON Schema reports it (spec \u00a7 5.14, Reaction energies).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

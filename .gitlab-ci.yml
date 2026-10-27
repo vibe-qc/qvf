@@ -7,10 +7,9 @@ workflow:
   auto_cancel:
     on_new_commit: conservative
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    # Ordinary development uses focused local checks, not the release matrix.
     - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $QVF_FULL_VALIDATION == "1"'
     - when: never
 
 # The reference writer/reader, and the packaging invariants that keep the
@@ -29,6 +28,9 @@ python-tests:
     - docker
   variables:
     PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+    OMP_NUM_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
   cache:
     - key: pip-qvf-python313
       paths:
@@ -38,36 +40,95 @@ python-tests:
     - apt-get install -y --no-install-recommends git
   script:
     - python .githooks/test_privacy_hook.py -q
-    - pip install -e "python/[validate]" pytest
+    # Exercise the optional adapter at its accepted minimum version.
+    - pip install --only-binary=pyscf -e "python/[numpy,validate,pyscf]" "pyscf==2.14.0" pytest
     - python -m pytest python/tests -q
 
-# The corpus is the format's real contract: 12 archives, each with an
-# expected-result file naming the sections and values a conformant consumer
-# must decode. A consumer in any language can implement the same loop.
+# python/tests/test_conformance.py exercises the positive, negative and legacy
+# corpora as part of python-tests; a separate job repeats the same reader work.
 
-conformance:
-  stage: test
-  image: python:3.13-slim-bookworm
-  tags:
-    - docker
-  script:
-    - pip install -e "python/[validate]"
-    - python conformance/run_conformance.py
-
-# Zero external dependencies -- only the C++17 standard library.
+# Zero external dependencies -- only the C++17 standard library. Warnings are
+# errors here and in .github/workflows/ci.yml, which also covers clang, macOS and
+# MSVC. Keep the two files in sync when a check is added or changed.
 
 cpp-tests:
   stage: test
   image: debian:12-slim
   tags:
     - docker
+  variables:
+    CXXFLAGS: "-Wall -Wextra -Werror"
   before_script:
     - apt-get update
-    - apt-get install -y --no-install-recommends g++ cmake ninja-build
+    - apt-get install -y --no-install-recommends g++ gfortran cmake ninja-build python3 python3-venv
   script:
-    - cmake -S cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release
-    - cmake --build build-cpp
+    - python3 -m venv /tmp/qvf-c-api-venv
+    - /tmp/qvf-c-api-venv/bin/pip install "python/[numpy,validate]"
+    - cmake -S cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release -DQVF_FORTRAN=ON -DPython3_EXECUTABLE=/tmp/qvf-c-api-venv/bin/python "-DCMAKE_Fortran_FLAGS=-fcheck=all -Wall -Wextra -Werror"
+    - cmake --build build-cpp --parallel 2
     - ctest --test-dir build-cpp --output-on-failure
+    # CTest includes qvf_conformance and qvf_conformance_no_schema.
+    - /tmp/qvf-c-api-venv/bin/python scripts/check_c_api_examples.py --writer build-cpp/write_all_kinds_c --reader build-cpp/read_qvf_c --output /tmp/qvf-c-api-roundtrip
+
+# The same build and tests under AddressSanitizer + UndefinedBehaviorSanitizer,
+# then the C++ reader over every conformance archive. -fno-sanitize-recover makes
+# an UBSan finding fail the job instead of only printing a diagnostic.
+#
+# This job needs a sanitizer runtime from LLVM 18 or newer: older runtimes
+# (Debian 12's clang 14 among them) crash at process start with a bare
+# SIGSEGV and no report on hosts whose kernel uses high ASLR entropy
+# (vm.mmap_rnd_bits=32), and only on some runs, so the corpus loop failed on a
+# different archive every pipeline. Debian 13 ships clang 19. The runtime
+# package is versioned after the installed clang, so it is resolved at run
+# time. If LeakSanitizer ever cannot run under the runner's seccomp profile,
+# set ASAN_OPTIONS=detect_leaks=0 for this job.
+
+cpp-sanitizers:
+  stage: test
+  image: debian:13-slim
+  tags:
+    - docker
+  variables:
+    CC: clang
+    CXX: clang++
+    CFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+    CXXFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+    UBSAN_OPTIONS: print_stacktrace=1
+  before_script:
+    - apt-get update
+    # libclang-rt-<N>-dev carries the sanitizer runtimes (only a Recommends of
+    # clang); g++ supplies the libstdc++ headers clang compiles against.
+    - apt-get install -y --no-install-recommends clang g++ cmake ninja-build
+    - apt-get install -y --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+  script:
+    - cmake -S cpp -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    - cmake --build build-san --parallel 2
+    - ctest --test-dir build-san --output-on-failure
+    # ctest also ran the conformance runner (qvf_conformance) under the
+    # sanitizers; this reads every positive archive, zip64.qvf and
+    # data_descriptor.qvf included.
+    - |
+      status=0
+      for f in conformance/corpus/*.qvf; do
+        echo "== $f"
+        ./build-san/read_qvf "$f" || status=1
+      done
+      exit $status
+
+# The JavaScript reader (js/, @qvf/core) is an independent implementation;
+# its test suite runs the positive and negative conformance corpora.
+
+js-tests:
+  stage: test
+  image: node:22-slim
+  tags:
+    - docker
+  script:
+    - cd js
+    - npm ci
+    # npm test builds/typechecks src once; scripts have a separate TS project.
+    - npm test
+    - npx tsc -p tsconfig.scripts.json
 
 # The single-header amalgamation is generated; a stale copy is a silent
 # divergence from the sources an adopter would otherwise vendor.
@@ -79,3 +140,7 @@ amalgamation-current:
     - docker
   script:
     - python scripts/amalgamate.py --check
+    # The tables generated from the schema (C++, TypeScript, Python) must match
+    # it: python scripts/gen_kinds.py regenerates them.
+    - python scripts/gen_kinds.py --check
+    - python scripts/gen_fortran.py --check

@@ -1,0 +1,59 @@
+{
+  "archive": "bonds_structure_ref.qvf",
+  "description": "Two structures, water and then hydrogen, and two standalone bonds sections. bonds_h2 names its structure with structure_ref, so its indices address the two hydrogen atoms; bonds_water has none, so its indices address the archive's first structure, water, whose atom 2 the second pair names (spec \u00a7 4.1, \u00a7 5.1).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "bonds",
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "id"
+      ],
+      "equals": "bonds_water"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "structure_ref"
+      ],
+      "equals": "structure_h2"
+    },
+    {
+      "section": "bonds_water",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        1,
+        "j"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "bonds_h2",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        0,
+        "j"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "structure_h2",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "position",
+        2
+      ],
+      "equals": 0.74,
+      "tol": 1e-12
+    }
+  ]
+}

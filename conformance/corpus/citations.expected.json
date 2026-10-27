@@ -1,0 +1,29 @@
+{
+  "archive": "citations.qvf",
+  "description": "citations: BibTeX as an opaque binary member (no dtype or shape) that decodes as UTF-8, including a non-ASCII author name.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "citations",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "citations",
+      "member": "references",
+      "decode": "utf8",
+      "contains": "@article{Hohenberg1964,"
+    },
+    {
+      "section": "citations",
+      "member": "references",
+      "decode": "utf8",
+      "contains": "Schr\u00f6dinger, E."
+    },
+    {
+      "section": "citations",
+      "member": "references",
+      "decode": "utf8",
+      "equals": "@article{Hohenberg1964,\n  author  = {Hohenberg, P. and Kohn, W.},\n  title   = {Inhomogeneous Electron Gas},\n  journal = {Phys. Rev.},\n  volume  = {136},\n  pages   = {B864--B871},\n  year    = {1964}\n}\n\n@article{Schroedinger1926,\n  author  = {Schr\u00f6dinger, E.},\n  title   = {Quantisierung als Eigenwertproblem},\n  journal = {Annalen der Physik},\n  volume  = {79},\n  pages   = {361--376},\n  year    = {1926}\n}\n"
+    }
+  ]
+}

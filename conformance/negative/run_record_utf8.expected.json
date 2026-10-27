@@ -1,0 +1,10 @@
+{
+  "archive": "run_record_utf8.qvf",
+  "description": "A run.record log that does not decode as UTF-8.",
+  "expect": [
+    {
+      "code": "E_UTF8",
+      "severity": "error"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "excited_states_nto_ref_wrong_kind.qvf",
+  "description": "An excited state whose nto_ref names an existing section of kind structure instead of a wavefunction.gto section holding its natural transition orbitals (spec \u00a7 5.12).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

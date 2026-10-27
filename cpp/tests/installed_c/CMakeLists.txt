@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(qvf_installed_c LANGUAGES C)
+find_package(qvf CONFIG REQUIRED)
+add_executable(qvf_installed_c main.c)
+target_link_libraries(qvf_installed_c PRIVATE qvf::qvf)
+enable_testing()
+add_test(NAME qvf_installed_c COMMAND qvf_installed_c)

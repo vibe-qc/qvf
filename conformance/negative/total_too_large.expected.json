@@ -1,0 +1,13 @@
+{
+  "archive": "total_too_large.qvf",
+  "description": "Members that are each under the member cap but together expand past the total cap (lowered to 4 KiB here; the reference value is 64 GiB).",
+  "limits": {
+    "max_total_bytes": 4096
+  },
+  "expect": [
+    {
+      "code": "E_TOTAL_TOO_LARGE",
+      "severity": "error"
+    }
+  ]
+}

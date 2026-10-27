@@ -1,0 +1,10 @@
+{
+  "archive": "trajectory_float32_without_precision.qvf",
+  "description": "Trajectory coords stored as float32 while the metadata sets no precision; float32 coords require metadata.precision 'float32' (spec \u00a7 5.5).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

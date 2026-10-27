@@ -1,0 +1,102 @@
+{
+  "archive": "reaction_scheme_energies.qvf",
+  "description": "2 H2 + O2 -> 2 H2O with energy and Gibbs free energy deltas at 298.15 K and 1 atm: each delta is the sum of the signed coefficients (-2, -1, +2) times the absolute values of its terms, all from one method. The water term names its run.record with run_ref; the others name the parsed output files with source (spec \u00a7 5.14, Reaction energies).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "reaction.scheme",
+    "run.record",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "version"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "deltas",
+        "energy",
+        "value_eh"
+      ],
+      "equals": -0.15449999999999697,
+      "tol": 1e-12
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "deltas",
+        "gibbs_free_energy",
+        "kcal_mol"
+      ],
+      "equals": -68.71228740299424,
+      "tol": 1e-09
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "temperature_k"
+      ],
+      "equals": 298.15
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "terms",
+        0,
+        "coefficient"
+      ],
+      "equals": -2
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "terms",
+        2,
+        "run_ref"
+      ],
+      "equals": "run_water"
+    },
+    {
+      "section": "reaction_scheme",
+      "member": "scheme",
+      "json_pointer": [
+        "steps",
+        0,
+        "energies",
+        "terms",
+        1,
+        "source",
+        "parser"
+      ],
+      "equals": "democode-text/1"
+    }
+  ]
+}

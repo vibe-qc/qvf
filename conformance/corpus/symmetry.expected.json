@@ -1,0 +1,85 @@
+{
+  "archive": "symmetry.qvf",
+  "description": "structure.symmetry ($defs/SymmetryPayload) of CsCl in Pm-3m (No. 221): Hall symbol, point group in Schoenflies and Hermann-Mauguin notation, all 48 operations on fractional coordinates, Wyckoff letters and equivalent atoms.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "structure.symmetry"
+  ],
+  "checks": [
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "spacegroup_number"
+      ],
+      "equals": 221
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "international"
+      ],
+      "equals": "Pm-3m"
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "hall"
+      ],
+      "equals": "-P 4 2 3"
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "hermann_mauguin"
+      ],
+      "equals": "m-3m"
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "operations",
+        0,
+        "rotation",
+        1,
+        1
+      ],
+      "equals": 1
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "operations",
+        47,
+        "translation",
+        2
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "wyckoffs",
+        1
+      ],
+      "equals": "b"
+    },
+    {
+      "section": "symmetry",
+      "member": "data",
+      "json_pointer": [
+        "symprec"
+      ],
+      "equals": 1e-05,
+      "tol": 1e-12
+    }
+  ]
+}

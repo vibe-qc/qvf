@@ -1,0 +1,99 @@
+name: Python package release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Published Python package tag (python-v0.7.0rc1)'
+        required: true
+        type: string
+      publish:
+        description: 'Upload checked distributions to PyPI (otherwise build only)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-package-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - name: Check tag spelling
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^python-v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]]
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify package version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, tomllib
+          metadata = tomllib.loads(pathlib.Path('python/pyproject.toml').read_text())
+          assert metadata['project']['name'] == 'qvf-writer'
+          assert 'python-v' + metadata['project']['version'] == os.environ['RELEASE_TAG']
+          PY
+      - name: Build sdist and wheel from sdist
+        run: |
+          python -m pip install build twine
+          python -m build python --outdir dist
+          python -m twine check --strict dist/*
+      - name: Test installed base package without optional dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/qvf-base"
+          "$RUNNER_TEMP/qvf-base/bin/python" -m pip install --no-deps dist/*.whl
+          cp scripts/smoke_python_package.py "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/qvf-base/bin/python" -I smoke_python_package.py
+          "$RUNNER_TEMP/qvf-base/bin/qvf" --help
+      - name: Test installed PySCF tutorial
+        run: |
+          python -m venv "$RUNNER_TEMP/qvf-adapter"
+          wheel=$(realpath dist/*.whl)
+          "$RUNNER_TEMP/qvf-adapter/bin/python" -m pip install "$wheel[pyscf,validate]" "pyscf==2.14.0"
+          cp python/examples/pyscf_to_qvf.py "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/qvf-adapter/bin/python" -I pyscf_to_qvf.py h2.qvf
+          "$RUNNER_TEMP/qvf-adapter/bin/qvf" validate h2.qvf
+          "$RUNNER_TEMP/qvf-adapter/bin/qvf-validate" h2.qvf
+          "$RUNNER_TEMP/qvf-adapter/bin/python" -m pip check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: ${{ inputs.publish }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/qvf-writer/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist
+      - name: Publish to PyPI with attestations
+        uses: pypa/gh-action-pypi-publish@release/v1

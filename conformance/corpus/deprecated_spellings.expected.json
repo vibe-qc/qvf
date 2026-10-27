@@ -1,0 +1,74 @@
+{
+  "archive": "deprecated_spellings.qvf",
+  "description": "The deprecated spellings a producer wrote before the canonical carriers existed, which remain valid with no finding: localized orbitals whose mo_metadata carries iao_charges (canonical: the iao_charge member of atom_properties) beside localization_reference_basis; the hole and electron natural transition orbitals of a state with excitation_index and excitation_energy_ev (canonical: state_ref with state_index, and the state's excitation_energy in excited_states); and a semiempirical job.spec with basis \"\", the deprecated spelling of null (spec \u00a7 5.3, \u00a7 5.9).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "job.spec",
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf_localized_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "iao_charges"
+      ],
+      "equals": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "section": "wf_localized_ibo",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "localization_reference_basis"
+      ],
+      "equals": "mini"
+    },
+    {
+      "section": "wf_nto_S1_hole",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "excitation_index"
+      ],
+      "equals": 1
+    },
+    {
+      "section": "wf_nto_S1_electron",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "excitation_energy_ev"
+      ],
+      "equals": 12.85,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf_nto_S1_electron",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupation_semantics"
+      ],
+      "equals": "transition_weight"
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "basis"
+      ],
+      "equals": ""
+    },
+    {
+      "section": "job_spec",
+      "member": "spec",
+      "json_pointer": [
+        "functional"
+      ],
+      "equals": null
+    }
+  ]
+}

@@ -43,7 +43,8 @@ int main(int argc, char** argv) {
     wf.mo_coefficients.rows = n_ao;
     wf.mo_coefficients.cols = n_ao;
     wf.mo_coefficients.data.assign(n_ao * n_ao, 0.0);
-    for (int i = 0; i < n_ao; ++i) wf.mo_coefficients.data[i * n_ao + i] = 1.0;
+    for (int i = 0; i < n_ao; ++i)
+        wf.mo_coefficients.data[static_cast<size_t>(i * n_ao + i)] = 1.0;
     wf.energies = {-20.24, -1.27, -0.62, -0.45, -0.39, 0.60, 0.74};
     wf.occupations = {2, 2, 2, 2, 2, 0, 0};
     w.add_wavefunction_gto(wf);
@@ -71,7 +72,7 @@ int main(int argc, char** argv) {
         .set("multiplicity", 1).set("n_electrons", 10).set("scf_converged", true)
         .set("n_scf_iterations", 3);
     Json e = Json::object();
-    e.set("value", -74.9630).set("units", "Eh");
+    e.set("value", -74.9630).set("units", "hartree");
     prov.set("scf_energy", e);
     w.set_provenance(prov);
 

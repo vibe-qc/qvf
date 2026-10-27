@@ -1,0 +1,10 @@
+{
+  "archive": "json_invalid.qvf",
+  "description": "A JSON member that is not valid JSON.",
+  "expect": [
+    {
+      "code": "E_JSON_INVALID",
+      "severity": "error"
+    }
+  ]
+}

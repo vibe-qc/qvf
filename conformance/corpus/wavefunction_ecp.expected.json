@@ -1,0 +1,206 @@
+{
+  "archive": "wavefunction_ecp.qvf",
+  "description": "wavefunction.gto with an effective core potential: NaH, the ECP on Na replacing 10 core electrons, so basis.n_electrons = 11 + 1 - 10 = 2, which the occupations and provenance.n_electrons restate. The ECP has a local part (local: true, l = 2, the highest l of the centre) and s and p semi-local channels, each U(r) = sum c r^(n - 2) exp(-a r^2) with the radial powers n in powers. The section also carries symmetry_labels, the AO overlap matrix (whose diagonal is 1: every shell is contraction-normalized) and the density matrix of the doubly occupied orbital. The MOs are the Lowdin orbitals S^(-1/2); every number is illustrative, not a converged calculation.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "n_electrons"
+      ],
+      "equals": 2
+    },
+    {
+      "manifest_pointer": [
+        "provenance",
+        "n_electrons"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "center"
+      ],
+      "equals": 0
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "n_core_electrons"
+      ],
+      "equals": 10
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "label"
+      ],
+      "equals": "toy-ECP10"
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        0,
+        "local"
+      ],
+      "equals": true
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        0,
+        "l"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        1,
+        "l"
+      ],
+      "equals": 0
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        1,
+        "powers"
+      ],
+      "equals": [
+        0,
+        2
+      ]
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        1,
+        "coefficients",
+        0
+      ],
+      "equals": 11.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "basis",
+      "json_pointer": [
+        "ecp",
+        0,
+        "projectors",
+        2,
+        "exponents",
+        0
+      ],
+      "equals": 1.7,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "occupations",
+        0
+      ],
+      "equals": 2.0
+    },
+    {
+      "section": "wf",
+      "member": "mo_metadata",
+      "json_pointer": [
+        "symmetry_labels",
+        1
+      ],
+      "equals": "pi"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "overlap",
+        "shape"
+      ],
+      "equals": [
+        5,
+        5
+      ]
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        0,
+        4
+      ],
+      "equals": 0.2274679218130587,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "overlap",
+      "binary_index": [
+        1,
+        2
+      ],
+      "equals": 0.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "wf",
+      "member": "density_matrix",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 2.0876038456356167,
+      "tol": 1e-12
+    }
+  ]
+}

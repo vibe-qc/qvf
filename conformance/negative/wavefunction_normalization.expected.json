@@ -1,0 +1,10 @@
+{
+  "archive": "wavefunction_normalization.qvf",
+  "description": "A wavefunction.gto overlap member whose d_xy diagonal is 1, three times the 1/3 that Appendix A.1 gives for the stored Cartesian d shell: the overlap of a producer that normalized each Cartesian component on its own (spec \u00a7 5.3, Appendix A.1).",
+  "expect": [
+    {
+      "code": "E_NORMALIZATION",
+      "severity": "error"
+    }
+  ]
+}

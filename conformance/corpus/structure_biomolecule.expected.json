@@ -1,0 +1,112 @@
+{
+  "archive": "structure_biomolecule.qvf",
+  "description": "Chain A residues SER 10 and GLY 10A, distinct because their insertion codes differ, and a HETATM water. SER 10 OG has alternate locations A (occupancy 0.6) and B (0.4) as two atoms; the CA without alt_loc belongs to both conformers (spec \u00a7 5.1, Biomolecular atom identity).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "residues",
+        0,
+        "seq"
+      ],
+      "equals": 10
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "residues",
+        1,
+        "seq"
+      ],
+      "equals": 10
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "residues",
+        1,
+        "insertion_code"
+      ],
+      "equals": "A"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        3,
+        "insertion_code"
+      ],
+      "equals": "A"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "alt_loc"
+      ],
+      "equals": "A"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        2,
+        "alt_loc"
+      ],
+      "equals": "B"
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        1,
+        "occupancy"
+      ],
+      "equals": 0.6,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        2,
+        "occupancy"
+      ],
+      "equals": 0.4,
+      "tol": 1e-12
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        2,
+        "hetero"
+      ],
+      "equals": false
+    },
+    {
+      "section": "structure",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        4,
+        "hetero"
+      ],
+      "equals": true
+    }
+  ]
+}

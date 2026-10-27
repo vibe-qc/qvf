@@ -1,0 +1,10 @@
+{
+  "archive": "not_a_zip.qvf",
+  "description": "Not a ZIP archive at all.",
+  "expect": [
+    {
+      "code": "E_ZIP_UNREADABLE",
+      "severity": "error"
+    }
+  ]
+}

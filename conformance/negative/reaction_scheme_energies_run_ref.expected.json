@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_energies_run_ref.qvf",
+  "description": "A term's run_ref names the structure section water_b instead of a run.record section (spec \u00a7 5.14, Reaction energies).",
+  "expect": [
+    {
+      "code": "E_REF_UNRESOLVED",
+      "severity": "error"
+    }
+  ]
+}

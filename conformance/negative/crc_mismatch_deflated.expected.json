@@ -1,0 +1,10 @@
+{
+  "archive": "crc_mismatch_deflated.qvf",
+  "description": "A member without SHA-256 whose valid payload has a wrong ZIP CRC-32.",
+  "expect": [
+    {
+      "code": "E_ZIP_UNREADABLE",
+      "severity": "error"
+    }
+  ]
+}

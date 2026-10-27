@@ -1,0 +1,196 @@
+# Continuous integration for the public GitHub mirror.
+#
+# .gitlab-ci.yml is the in-house Linux pipeline. This workflow runs the same
+# checks and widens them to macOS, Windows (MSVC) and more Python versions.
+# When a check is added or changed, change both files.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push or PR update cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The reference Python writer/reader and the packaging invariants.
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the oldest supported (requires-python), 3.14 the newest.
+        # If the runner image ever lacks 3.14, use 3.13 here and say so.
+        # Test the support boundaries; GitLab also checks Python 3.13.
+        python-version: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+      - name: Privacy hook self-test
+        run: python .githooks/test_privacy_hook.py -q
+      - name: Install
+        run: pip install -e "python/[numpy,validate]" pytest
+      # Keep the oldest Python endpoint free of the optional chemistry engine.
+      # Match GitLab's adapter coverage at the accepted minimum PySCF version.
+      - name: Install PySCF adapter dependencies
+        if: matrix.python-version == '3.14'
+        run: pip install --only-binary=pyscf -e "python/[pyscf]" "pyscf==2.14.0"
+      - name: Tests
+        run: python -m pytest python/tests -q
+
+  # test_conformance.py includes the positive, negative and legacy corpora;
+  # no second Python environment/job is needed for the same reference runner.
+
+  # Zero-dependency C++17 library: build and test on every platform with
+  # warnings as errors. Warning flags go in through CXXFLAGS (not
+  # -DCMAKE_CXX_FLAGS) so CMake keeps its own MSVC defaults such as /EHsc.
+  cpp:
+    name: cpp (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-gcc
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            cxxflags: -Wall -Wextra -Werror
+          - name: ubuntu-clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+            cxxflags: -Wall -Wextra -Werror
+          - name: macos-clang
+            os: macos-latest
+            cxxflags: -Wall -Wextra -Werror
+          - name: windows-msvc
+            os: windows-latest
+            cxxflags: /W4 /WX
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CXXFLAGS: ${{ matrix.cxxflags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python validator and array checks
+        run: pip install "python/[numpy,validate]"
+      - name: Install optional Fortran compiler
+        if: matrix.name == 'ubuntu-gcc'
+        run: sudo apt-get update && sudo apt-get install -y gfortran
+      - name: Configure
+        if: matrix.name != 'ubuntu-gcc'
+        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure with Fortran checks
+        if: matrix.name == 'ubuntu-gcc'
+        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DQVF_FORTRAN=ON -DPython3_EXECUTABLE="$(command -v python)" "-DCMAKE_Fortran_FLAGS=-fcheck=all -Wall -Wextra -Werror"
+      # --config / -C matter for multi-config generators (Visual Studio) and
+      # are ignored by single-config ones.
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Python validates the C API examples
+        shell: bash
+        run: |
+          bindir=build
+          [ -f "$bindir/write_all_kinds_c" ] || bindir=build/Release
+          python scripts/check_c_api_examples.py --writer "$bindir/write_all_kinds_c" --reader "$bindir/read_qvf_c" --output "$RUNNER_TEMP/qvf-c-api-roundtrip"
+      # CTest already includes both conformance modes (with/without schema).
+
+  # The same C++ build and tests under AddressSanitizer + UndefinedBehavior-
+  # Sanitizer, then the C++ reader over every conformance archive.
+  # -fno-sanitize-recover makes an UBSan finding fail the job rather than only
+  # print a diagnostic.
+  sanitizers:
+    name: sanitizers (clang, ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+      CFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g
+      CXXFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      # ctest also ran the conformance runner (qvf_conformance) under the
+      # sanitizers; this reads every positive archive, zip64.qvf and
+      # data_descriptor.qvf included.
+      - name: Read every conformance archive
+        run: |
+          status=0
+          for f in conformance/corpus/*.qvf; do
+            echo "== $f"
+            ./build/read_qvf "$f" || status=1
+          done
+          exit $status
+
+  # cpp/qvf_single.hpp is generated; a stale copy silently diverges from the
+  # sources an adopter would otherwise vendor.
+  js:
+    name: JavaScript reader (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest/newest supported versions; GitLab covers Node 22.
+        node: ['20', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - run: npm ci
+        working-directory: js
+      # npm test builds/typechecks src once; scripts have a separate TS project.
+      - run: npm test
+        working-directory: js
+      - run: npx tsc -p tsconfig.scripts.json
+        working-directory: js
+
+  amalgamation:
+    name: amalgamation up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check
+        run: python scripts/amalgamate.py --check
+      # The tables generated from the schema (C++, TypeScript, Python) must
+      # match it: python scripts/gen_kinds.py regenerates them.
+      - name: Generated tables up to date
+        run: python scripts/gen_kinds.py --check
+      - name: Fortran C ABI bindings up to date
+        run: python scripts/gen_fortran.py --check

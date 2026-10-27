@@ -1,0 +1,10 @@
+{
+  "archive": "payload_mo_metadata_shape.qvf",
+  "description": "An unrestricted mo_metadata that carries the restricted shape (top-level energies and occupations) instead of alpha and beta objects ($defs/MoMetadataPayload, spec \u00a7 5.3).",
+  "expect": [
+    {
+      "code": "E_PAYLOAD_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

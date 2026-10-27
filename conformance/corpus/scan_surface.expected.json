@@ -1,0 +1,79 @@
+{
+  "archive": "scan_surface.qvf",
+  "description": "scan.surface: a relaxed 3x2 scan; axis values in bohr / rad, energies [nA, nB] in Hartree, relaxed geometries [nA*nB, n_atoms, 3] in Angstrom.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "scan.surface",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "scan",
+      "member": "metadata",
+      "json_pointer": [
+        "axis_a",
+        "label"
+      ],
+      "equals": "r(O-H1)"
+    },
+    {
+      "section": "scan",
+      "member": "metadata",
+      "json_pointer": [
+        "axis_a",
+        "unit"
+      ],
+      "equals": "bohr"
+    },
+    {
+      "section": "scan",
+      "member": "metadata",
+      "json_pointer": [
+        "axis_b",
+        "atoms",
+        1
+      ],
+      "equals": 0
+    },
+    {
+      "section": "scan",
+      "member": "metadata",
+      "json_pointer": [
+        "atoms",
+        0,
+        "symbol"
+      ],
+      "equals": "O"
+    },
+    {
+      "section": "scan",
+      "member": "axis_a",
+      "binary_index": [
+        2
+      ],
+      "equals": 1.9,
+      "tol": 1e-12
+    },
+    {
+      "section": "scan",
+      "member": "energies",
+      "binary_index": [
+        1,
+        1
+      ],
+      "equals": -74.9659,
+      "tol": 1e-12
+    },
+    {
+      "section": "scan",
+      "member": "geometries",
+      "binary_index": [
+        5,
+        2,
+        1
+      ],
+      "equals": -0.7572,
+      "tol": 1e-12
+    }
+  ]
+}

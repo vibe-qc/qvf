@@ -1,0 +1,67 @@
+{
+  "archive": "bonds.qvf",
+  "description": "Standalone bonds section ($defs/BondsPayload) for formaldehyde: a double C=O bond, a single C-H bond, and a pair that omits `order`, which means a single bond.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "bonds",
+    "structure"
+  ],
+  "checks": [
+    {
+      "section": "bonds",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        0,
+        "order"
+      ],
+      "equals": 2.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "bonds",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        1,
+        "j"
+      ],
+      "equals": 2
+    },
+    {
+      "section": "bonds",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs",
+        2
+      ],
+      "equals": {
+        "i": 0,
+        "j": 3
+      }
+    },
+    {
+      "section": "bonds",
+      "member": "bonds",
+      "json_pointer": [
+        "pairs"
+      ],
+      "equals": [
+        {
+          "i": 0,
+          "j": 1,
+          "order": 2.0
+        },
+        {
+          "i": 0,
+          "j": 2,
+          "order": 1.0
+        },
+        {
+          "i": 0,
+          "j": 3
+        }
+      ]
+    }
+  ]
+}

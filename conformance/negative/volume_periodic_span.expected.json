@@ -1,0 +1,10 @@
+{
+  "archive": "volume_periodic_span.qvf",
+  "description": "A volume.density grid periodic on all three axes of a 4 \u00c5 cubic cell, CHGCAR style (includes_endpoint false), whose third voxel vector times shape[2] is 7.6 bohr instead of the 7.5589 bohr of lattice row 2: a periodic grid must span its cell within 1e-6 relative (spec \u00a7 5.2).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

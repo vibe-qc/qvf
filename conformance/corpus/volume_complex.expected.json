@@ -1,0 +1,132 @@
+{
+  "archive": "volume_complex.qvf",
+  "description": "volume.complex: the hydrogen 2p orbital with m = +1, (x + i y) exp(-r/2) / (8 sqrt(pi)), float64 [nx, ny, nz, 2] with the last axis [re, im], on a 6x5x4 grid in bohr.",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure",
+    "volume.complex"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "data",
+        "shape"
+      ],
+      "equals": [
+        6,
+        5,
+        4,
+        2
+      ]
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "members",
+        "data",
+        "dtype"
+      ],
+      "equals": "float64"
+    },
+    {
+      "section": "psi_2p1",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        0
+      ],
+      "equals": 6
+    },
+    {
+      "section": "psi_2p1",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        1
+      ],
+      "equals": 5
+    },
+    {
+      "section": "psi_2p1",
+      "member": "grid",
+      "json_pointer": [
+        "shape",
+        2
+      ],
+      "equals": 4
+    },
+    {
+      "section": "psi_2p1",
+      "member": "grid",
+      "json_pointer": [
+        "origin",
+        0
+      ],
+      "equals": -3.75,
+      "tol": 1e-12
+    },
+    {
+      "section": "psi_2p1",
+      "member": "grid",
+      "json_pointer": [
+        "voxel_vectors",
+        1,
+        1
+      ],
+      "equals": 1.5,
+      "tol": 1e-12
+    },
+    {
+      "section": "psi_2p1",
+      "member": "data",
+      "binary_index": [
+        1,
+        3,
+        2,
+        0
+      ],
+      "equals": -0.03900763868051024,
+      "tol": 1e-12
+    },
+    {
+      "section": "psi_2p1",
+      "member": "data",
+      "binary_index": [
+        1,
+        3,
+        2,
+        1
+      ],
+      "equals": 0.026005092453673495,
+      "tol": 1e-12
+    },
+    {
+      "section": "psi_2p1",
+      "member": "data",
+      "binary_index": [
+        4,
+        0,
+        1,
+        0
+      ],
+      "equals": 0.023447097025247537,
+      "tol": 1e-12
+    },
+    {
+      "section": "psi_2p1",
+      "member": "data",
+      "binary_index": [
+        4,
+        0,
+        1,
+        1
+      ],
+      "equals": -0.03126279603366338,
+      "tol": 1e-12
+    }
+  ]
+}

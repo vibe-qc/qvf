@@ -1,0 +1,10 @@
+{
+  "archive": "atom_properties_custom_meta_entry_missing.qvf",
+  "description": "An atom_properties section whose meta member describes custom.flux but not custom.other: every custom role needs its own entry (spec \u00a7 5.7).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

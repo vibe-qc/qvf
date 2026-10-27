@@ -1,0 +1,10 @@
+{
+  "archive": "atom_properties_vector_shape.qvf",
+  "description": "An atom_properties magnetic_moment of shape [n_atoms] instead of [n_atoms, 3]; a vector role is float64 [n_atoms, 3] ($defs/AtomVectorBinary, spec \u00a7 5.7). Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

@@ -74,15 +74,10 @@ For spherical shells and the axial Cartesian components this coincides with
 unit normalization; for mixed Cartesian components it deliberately does not
 (see the Cartesian caveat below).
 
-Integral engines — libint, libcint, and the storage conventions many codes
-(including GBW-style formats) inherit — keep coefficients **pre-multiplied by
-`N_i`**, i.e. the stored number is `c_i · N_i`, multiplying an *un-normalized*
-primitive. If you write those numbers verbatim, every rendered orbital comes out
-quantitatively wrong (worst for tight and high-`l` shells) while still *looking*
-plausible.
-
-Both reference writers handle this for you — set the flag and pass your
-engine-native coefficients:
+If the source array stores coefficients **pre-multiplied by `N_i`**, the
+stored number is `c_i · N_i`, multiplying an un-normalized primitive.
+Writing those numbers verbatim would apply the normalization twice. Both
+reference writers handle this particular convention with a flag:
 
 ```cpp
 WavefunctionGTO wf;
@@ -92,9 +87,13 @@ wf.mo_coefficients = { n_mo, n_ao, coeff_data };  // row-major, rows are MOs
 w.add_wavefunction_gto(wf);
 ```
 
-If ORCA's in-memory coefficients are already on `N_i`-normalized primitives,
-leave the flag `false`. When unsure, verify: evaluate the HOMO of H₂O/STO-3G on
-a grid and integrate |ψ|² — it must come out ≈ 1 per spin.
+If the extracted coefficients already apply to `N_i`-normalized primitives,
+leave the flag `false`. Confirm the convention of the actual source array;
+the name “GBW” or “engine-native” does not establish it. Other normalizations
+need their own conversion; libcint's radial/angular split is one example.
+Compare pointwise AO and MO values with the source program, as well as
+checking normalization. An orbital's integral alone cannot detect a
+permuted or sign-flipped spherical component.
 
 If you emit Cartesian (`pure: false`) shells, re-read spec Appendix A.1 first:
 `N_i` is one factor per shell derived from the total `l`, so mixed components
@@ -107,8 +106,36 @@ per-component normalization error.
 QVF's in-shell AO order is fixed (spec Appendix A.2): spherical shells are
 ordered `m = −l … +l`; Cartesian shells use libint lexicographic order. If
 ORCA's internal ordering differs for a given `l` (e.g. a different `p` or `d`
-sequence), permute the coefficient **rows** into QVF order before writing.
-Getting this wrong rotates orbitals within a shell.
+sequence), permute the coefficient **columns** in the QVF `[n_mo, n_ao]`
+array. A source `[n_ao, n_mo]` array also needs a transpose. Apply the
+corresponding change on both AO axes of overlap and density matrices.
+Spherical signs and scale must match Appendix A.2 as well as the order;
+otherwise the stored coefficients describe different orbitals.
+
+### Write the overlap matrix
+
+ORCA computes the AO overlap matrix anyway. Permute it into QVF AO order and
+write it as the `overlap` member (`WavefunctionGTO::overlap`, or
+`qvf_set_wavefunction_overlap` from C). Every QVF validator then compares its
+diagonal with the self-overlaps spec Appendix A.1 gives for the coefficients in
+`basis.json`: a missing `N_i` divide, a wrong AO order or a per-component
+normalized Cartesian shell fails with `E_NORMALIZATION` before any orbital is
+drawn.
+
+### Effective core potentials
+
+Calculations with the def2 basis sets put effective core potentials on the
+elements beyond krypton (def2-ECP), and ORCA lets an input assign others. A
+wavefunction from such a run describes only the valence electrons, so a
+consumer needs to know which cores are missing. Write one `basis.ecp` entry per
+ECP atom (spec § 5.3): `center`, `n_core_electrons` (28 for iodine with
+def2-ECP), `label` (for example `"def2-ECP"`), and, when the potential itself
+should be evaluable, its `projectors`: the local part (`local: true`, labelled
+with the highest `l`) and the semi-local channels, each as the terms
+`c r^(n−2) exp(−α r²)` of the usual tabulation (`powers` holds the `n`). Also
+write `n_electrons` (`Σ Z − Σ n_core_electrons − charge`) on the basis, which
+the occupations must sum to, and keep `provenance.n_electrons` equal to it.
+From C, `qvf_set_wavefunction_ecp_json` takes the entries as a JSON array.
 
 ## Spectra
 
@@ -123,9 +150,37 @@ ir.intensities = /* km/mol */;
 w.add_spectrum("spectra.ir", ir);
 ```
 
-`spectra.nmr` is object-shaped (isotope, reference, per-nucleus shifts and
-optional tensors) — build it as a `qvf::Json` and use the JSON overload of
-`add_spectrum`.
+The two arrays must have the same length (spec § 5.4). `frequencies` holds the
+x axis in the kind's spec § 4.3 unit — cm⁻¹ for IR, eV for UV/Vis — even where
+the values are energies. If you write another unit (UV/Vis in nm, say), or a
+kind § 4.3 gives no unit (Raman, ECD, VCD), build the payload as a `qvf::Json`
+and declare it with `x_units` / `y_units`; the same object carries optional
+`peaks`, `broadening`, and the `raman` / `uvvis` blocks (`$defs/SpectrumPayload`).
+
+`spectra.nmr` is object-shaped — build it as a `qvf::Json` and use the JSON
+overload of `add_spectrum`. Its fields are typed by `$defs/NmrSpectrumPayload`
+(spec § 5.4): `isotope`, `reference`, `solvent`; `chemical_shifts` entries
+`{atom_index, symbol?, isotropic_shift_ppm, anisotropy_ppm?, asymmetry?}`;
+`shielding_tensors` entries `{atom_index, tensor (3×3, ppm), isotropic_ppm}`;
+and `j_couplings` entries `{i, j, value_hz, isotope_i?, isotope_j?}`. Shifts
+are in ppm relative to `reference`, couplings in Hz, and atom indices are
+0-based.
+
+```cpp
+Json nmr = Json::object();
+Json shifts = Json::array();
+Json cs = Json::object();
+cs.set("atom_index", 1).set("symbol", "H").set("isotropic_shift_ppm", 4.6);
+shifts.push_back(cs);
+Json couplings = Json::array();
+Json jc = Json::object();
+jc.set("i", 1).set("j", 2).set("value_hz", 7.2)
+  .set("isotope_i", "1H").set("isotope_j", "1H");
+couplings.push_back(jc);
+nmr.set("isotope", "1H").set("reference", "TMS").set("solvent", "chloroform")
+   .set("chemical_shifts", shifts).set("j_couplings", couplings);
+w.add_spectrum("spectra.nmr", nmr);
+```
 
 ## EPR — the canonical `spectra.epr` kind
 
@@ -139,16 +194,20 @@ Json epr = Json::object();
 Json g = Json::object();
 g.set("principal", Json::from_doubles({gx, gy, gz})).set("isotropic", g_iso);
 epr.set("g_tensor", g);
-epr.set("hyperfine", /* array of {atom_index, symbol, isotope, a_iso_mhz, a_tensor_mhz} */);
+epr.set("hyperfine", /* array of {atom_index, symbol, isotope, a_iso_mhz, a_tensor_mhz, a_principal_mhz} */);
 Json zfs = Json::object();
 zfs.set("d_mhz", d_value).set("e_mhz", e_value);
 epr.set("zero_field_splitting", zfs);
 w.add_spectrum("spectra.epr", epr);           // Python: w.add_spectrum("spectra.epr", payload=epr)
 ```
 
-Units follow EPR convention: g-values dimensionless, hyperfine and
-zero-field-splitting parameters in MHz. The payload shape is intentionally loose
-in v1 — emit whichever subset you computed.
+Units are fixed: g-values dimensionless, hyperfine and zero-field-splitting
+parameters in MHz. The fields are typed by `$defs/EprSpectrumPayload` (spec
+§ 5.4): `g_tensor` `{matrix (3×3), isotropic, principal}`, `hyperfine` entries
+(`atom_index` required), and `zero_field_splitting` `{d_mhz, e_mhz,
+tensor_mhz (3×3)}`, with tensors as three rows in the structure's Cartesian
+frame. The payload is permissive: every field is optional and unknown keys are
+allowed, so emit whichever subset you computed.
 
 **When to still reach for the vendor namespace.** `spectra.epr` covers the common
 g/A/D parameters. For genuinely non-standard data that has *no* canonical kind
@@ -187,10 +246,16 @@ w.set_dipole_moment(dip);
 Json prov = Json::object();
 prov.set("method", "DFT").set("functional", "B3LYP").set("basis", "def2-TZVP")
     .set("scf_converged", true);
-Json e = Json::object(); e.set("value", E_total).set("units", "Eh");
+Json e = Json::object(); e.set("value", E_total).set("units", "hartree");
 prov.set("scf_energy", e);
 w.set_provenance(prov);
 ```
+
+Leave `hostname` out of `provenance` (it is deprecated, spec § 3.2, and
+`set_provenance` drops it by default), and note that the `.inp` / `.out` you
+embed in `run.record` commonly carry absolute paths, user names, and node
+names — see "Sharing and sanitisation" in spec § 5.8 before an archive leaves
+your machine.
 
 ## Validate before you ship it
 
@@ -208,7 +273,9 @@ run means any QVF consumer — including vibe-view — will read your file.
 
 - [ ] `structure` from the geometry (Å).
 - [ ] `wavefunction.gto` from the GBW, with the normalization flag set correctly
-      and AO order permuted into QVF order.
+      and AO order permuted into QVF order; the `overlap` member written so the
+      validator can check both.
+- [ ] `basis.ecp` entries and `n_electrons` when the run used ECPs.
 - [ ] `spectra.*` for each spectrum the job produced.
 - [ ] `atom_properties`, `bond_orders`, `scf_history` as available.
 - [ ] Root `provenance`, `dipole_moment`, `thermochemistry`.

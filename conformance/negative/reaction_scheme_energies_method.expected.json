@@ -1,0 +1,10 @@
+{
+  "archive": "reaction_scheme_energies_method.qvf",
+  "description": "The two terms of step r1 come from different methods (HF/STO-3G and HF/6-31G); a reaction energy needs one method (spec \u00a7 5.14, Reaction energies).",
+  "expect": [
+    {
+      "code": "E_MEMBER_MALFORMED",
+      "severity": "error"
+    }
+  ]
+}

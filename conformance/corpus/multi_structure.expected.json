@@ -1,0 +1,237 @@
+{
+  "archive": "multi_structure.qvf",
+  "description": "Two structures (water, ammonia) in one archive. The volume.density and the wavefunction.gto each name their structure with a section-level structure_ref and the run.record that produced them with run_ref; group labels pair each structure with its data. The root metadata block carries a title, a fixed created_utc and uuid, the Apache-2.0 licence and keywords (spec \u00a7 3.5, \u00a7 4.1).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "run.record",
+    "structure",
+    "volume.density",
+    "wavefunction.gto"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "metadata",
+        "license"
+      ],
+      "equals": "Apache-2.0"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "uuid"
+      ],
+      "equals": "6f1c2a4e-8b3d-4c5e-9f70-1a2b3c4d5e6f"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "created_utc"
+      ],
+      "equals": "2026-10-07T12:00:00Z"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "title"
+      ],
+      "equals": "Water and ammonia: two structures in one archive"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "keywords",
+        1
+      ],
+      "equals": "multi-structure"
+    },
+    {
+      "manifest_pointer": [
+        "metadata",
+        "authors",
+        0,
+        "name"
+      ],
+      "equals": "QVF conformance suite"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "id"
+      ],
+      "equals": "h2o"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "id"
+      ],
+      "equals": "nh3"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        2,
+        "id"
+      ],
+      "equals": "run"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "id"
+      ],
+      "equals": "rho_h2o"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "id"
+      ],
+      "equals": "wf_nh3"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "group"
+      ],
+      "equals": "water"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        1,
+        "group"
+      ],
+      "equals": "ammonia"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "structure_ref"
+      ],
+      "equals": "h2o"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "run_ref"
+      ],
+      "equals": "run"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        3,
+        "group"
+      ],
+      "equals": "water"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "structure_ref"
+      ],
+      "equals": "nh3"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "run_ref"
+      ],
+      "equals": "run"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        4,
+        "group"
+      ],
+      "equals": "ammonia"
+    },
+    {
+      "section": "h2o",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        0,
+        "symbol"
+      ],
+      "equals": "O"
+    },
+    {
+      "section": "nh3",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        0,
+        "symbol"
+      ],
+      "equals": "N"
+    },
+    {
+      "section": "nh3",
+      "member": "structure",
+      "json_pointer": [
+        "atoms",
+        3,
+        "position",
+        0
+      ],
+      "equals": -0.8138,
+      "tol": 1e-09
+    },
+    {
+      "section": "wf_nh3",
+      "member": "basis",
+      "json_pointer": [
+        "structure_ref"
+      ],
+      "equals": "nh3"
+    },
+    {
+      "section": "wf_nh3",
+      "member": "basis",
+      "json_pointer": [
+        "n_ao"
+      ],
+      "equals": 4
+    },
+    {
+      "section": "wf_nh3",
+      "member": "mo_coefficients",
+      "binary_index": [
+        0,
+        0
+      ],
+      "equals": 1.0,
+      "tol": 1e-12
+    },
+    {
+      "section": "rho_h2o",
+      "member": "data",
+      "binary_index": [
+        1,
+        1,
+        1
+      ],
+      "equals": 0.4723665527410147,
+      "tol": 1e-06
+    },
+    {
+      "section": "run",
+      "member": "log",
+      "decode": "utf8",
+      "contains": "ammonia: SCF converged"
+    }
+  ]
+}

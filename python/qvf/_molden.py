@@ -1,0 +1,283 @@
+"""Bounded molecular Molden interchange; see docs/converters.md for conventions.
+
+The format documentation defines the component orders. The normalized-AO
+interpretation is independently exercised against PySCF's Molden reader/writer.
+No reference-program source is incorporated here.
+"""
+from __future__ import annotations
+
+import math
+import re
+
+from . import __version__
+from .convert import (_MAX_VALUES, _atom, _binary, _new_output, _number, _select,
+                      _structure, _text, _validated)
+from ._legacy_writer import BOHR_PER_ANGSTROM
+from .reader import Reader
+from .writer import Writer
+
+_SPINS = {"restricted", "restricted_open", "unrestricted"}
+_FLAGS = {"5d", "6d", "5d7f", "5d10f", "7f", "10f", "9g", "15g"}
+
+
+def _shell_norm(shell):
+    """Axial contracted-AO norm, Appendix A.1; no per-component scaling."""
+    es = shell["exponents"]; cs = shell["coefficients"]
+    if not 1 <= len(es) <= 512 or len(es) != len(cs):
+        raise ValueError("Molden requires 1-512 primitives per contraction")
+    if any(_number(e) <= 0 for e in es):
+        raise ValueError("Molden exponents must be positive")
+    # Ratio form avoids overflowing alpha_i * alpha_j or alpha_i + alpha_j.
+    norm2 = math.fsum(_number(a) * _number(b) *
+                     (2 * math.sqrt(min(x, y) / max(x, y)) /
+                      (1 + min(x, y) / max(x, y))) ** (shell["l"] + 1.5)
+                     for x, a in zip(es, cs) for y, b in zip(es, cs))
+    if not math.isfinite(norm2) or norm2 <= 1e-14:
+        raise ValueError("Molden requires a finite, nonzero contraction norm")
+    return math.sqrt(norm2)
+
+
+def _layout(shell):
+    """QVF indices in Molden order; QVF AO / unit-normalized Molden AO."""
+    angular = shell["l"]; pure = shell.get("pure", True)
+    if angular == 0:
+        return [0], [1.0]
+    if angular == 1:
+        return ([2, 0, 1] if pure else [0, 1, 2]), [1.0] * 3
+    if angular == 2:
+        if pure:
+            return [2, 3, 1, 4, 0], [1.0] * 5
+        return [0, 3, 5, 1, 2, 4], [1.0] * 3 + [1 / math.sqrt(3)] * 3
+    raise ValueError("Molden conversion supports s, p, sp and d shells only")
+
+
+def _sections(text):
+    sections = {}; name = None; omitted_comments = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('#'):
+            omitted_comments += 1
+            continue
+        header = re.fullmatch(r"\[([^]]+)\](.*)", line)
+        if header:
+            name = header[1].lower().strip()
+            if (not sections and name != "molden format") or name in sections:
+                raise ValueError("Molden needs its format header first and unique sections")
+            if name not in {"molden format", "atoms", "gto", "mo", "title"} | _FLAGS:
+                raise ValueError(f"unsupported Molden section {name!r}")
+            suffix = header[2].strip().lower().strip('()')
+            if (name == "atoms" and suffix not in {"au", "angs"}) or (name != "atoms" and suffix):
+                raise ValueError("Molden needs explicit Atoms AU/Angs units and plain section headers")
+            sections[name] = [suffix, []]
+        elif name is None:
+            raise ValueError("Molden needs its format header first")
+        else:
+            sections[name][1].append(line)
+    if not {"molden format", "atoms", "gto", "mo"} <= sections.keys():
+        raise ValueError("Molden requires Atoms, GTO and MO sections")
+    if any(sections[flag][1] for flag in _FLAGS & sections.keys()):
+        raise ValueError("Molden angular flags must have no payload")
+    pure_d = bool({"5d", "5d7f", "5d10f"} & sections.keys())
+    if pure_d and "6d" in sections:
+        raise ValueError("conflicting Molden d-shell conventions")
+    return sections, pure_d, omitted_comments
+
+
+def _parse(text, spin):
+    if spin not in _SPINS:
+        raise ValueError("Molden import requires explicit restricted, restricted_open or unrestricted spin")
+    sections, pure_d, comments = _sections(text)
+    atoms = []
+    factor = 1 / BOHR_PER_ANGSTROM if sections["atoms"][0] == "au" else 1
+    for line in sections["atoms"][1]:
+        fields = line.split()
+        if len(fields) != 6 or int(fields[1]) != len(atoms) + 1:
+            raise ValueError("Molden atoms require sequential 1-based indices and six fields")
+        atom = _atom(fields[0], [_number(v) * factor for v in fields[3:]])
+        if int(fields[2]) != atom["atomic_number"]:
+            raise ValueError("Molden ghost/ECP/effective nuclear charges are unsupported")
+        atoms.append(atom)
+    if not atoms:
+        raise ValueError("Molden has no atoms")
+    rows = sections["gto"][1]; index = 0; center = None; centers = set()
+    shells = []; norms = []; values = 0
+    while index < len(rows):
+        fields = rows[index].split(); index += 1
+        if re.fullmatch(r"[0-9]+", fields[0]):
+            center = int(fields[0]) - 1
+            if (len(fields) not in (1, 2) or (len(fields) == 2 and fields[1] != "0")
+                    or not 0 <= center < len(atoms) or center in centers):
+                raise ValueError("Molden GTO requires unique valid atom blocks")
+            centers.add(center)
+            continue
+        label = fields[0].lower()
+        if center is None or label not in {"s", "p", "sp", "d"} or len(fields) not in (2, 3):
+            raise ValueError("Molden conversion supports s, p, sp and d atom-centered contractions only")
+        if len(fields) == 3 and _number(fields[2]) != 1:
+            raise ValueError("non-unit Molden shell scale is ambiguous and unsupported")
+        count = int(fields[1]); values += count
+        if not 1 <= count <= 512 or index + count > len(rows) or values > _MAX_VALUES:
+            raise ValueError("invalid, truncated or oversized Molden contraction")
+        primitives = [[_number(v) for v in row.split()] for row in rows[index:index + count]]
+        index += count
+        if any(len(row) != (3 if label == "sp" else 2) for row in primitives):
+            raise ValueError("Molden primitive rows must match their contraction type")
+        for column, letter in enumerate(label if label == "sp" else [label], 1):
+            angular = "spd".index(letter)
+            shell = {"center": center, "l": angular, "pure": pure_d if angular == 2 else False,
+                     "exponents": [row[0] for row in primitives],
+                     "coefficients": [row[column] for row in primitives]}
+            norm = _shell_norm(shell)
+            if abs(norm * norm - 1) > 1e-5:
+                raise ValueError("Molden input contractions must already be normalized (squared norm within 1e-5)")
+            # Remove text-rounding drift exactly as a normalized-AO reader does.
+            shell["coefficients"] = [c / norm for c in shell["coefficients"]]
+            norms.append(norm); shells.append(shell)
+    if not shells or centers != set(range(len(atoms))):
+        raise ValueError("Molden requires a basis block for every atom")
+    order = []; scales = []
+    for shell in shells:
+        indices, factors = _layout(shell); offset = len(order)
+        order.extend(offset + i for i in indices); scales.extend(factors)
+    nao = len(order); orbitals = []; current = None; coefficients = {}
+
+    def finish():
+        if current is None:
+            return
+        if current.keys() != {"sym", "ene", "spin", "occup"} or set(coefficients) != set(range(1, nao + 1)):
+            raise ValueError("Molden MO requires Sym/Ene/Spin/Occup and each AO coefficient exactly once")
+        row = [0.0] * nao
+        for source, (target, scale) in enumerate(zip(order, scales), 1):
+            row[target] = coefficients[source] / scale
+        orbitals.append((current, row))
+
+    for line in sections["mo"][1]:
+        match = re.fullmatch(r"([A-Za-z]+)\s*=\s*(.+)", line)
+        if match:
+            key = match[1].lower(); value = match[2].strip()
+            if key == "sym":
+                finish(); current = {}; coefficients = {}
+            if current is None or key in current or key not in {"sym", "ene", "spin", "occup"} or coefficients:
+                raise ValueError("unsupported or repeated Molden MO header")
+            current[key] = _number(value) if key in {"ene", "occup"} else value
+        else:
+            fields = line.split()
+            if current is None or len(fields) != 2:
+                raise ValueError("Molden MO coefficient requires an index and one real value")
+            ao = int(fields[0])
+            if not 1 <= ao <= nao or ao in coefficients:
+                raise ValueError("Molden AO index is out of range or repeated")
+            coefficients[ao] = _number(fields[1])
+        if (len(orbitals) + 1) * nao > _MAX_VALUES:
+            raise ValueError("Molden coefficient limit exceeded")
+    finish()
+    if not orbitals:
+        raise ValueError("Molden has no orbitals")
+    channels = {"alpha": [], "beta": []}
+    for metadata, row in orbitals:
+        channel = metadata["spin"].lower()
+        if channel not in channels or not 0 <= metadata["occup"] <= (1 if spin == "unrestricted" else 2):
+            raise ValueError("Molden spin label or occupation conflicts with the declared spin")
+        channels[channel].append((metadata, row))
+    if not channels["alpha"] or (bool(channels["beta"]) != (spin == "unrestricted")):
+        raise ValueError("Molden single sets must be Alpha; unrestricted requires both Alpha and Beta")
+    return atoms, shells, channels, nao, norms, comments, sections
+
+
+def import_molden(source, destination, *, spin):
+    atoms, shells, channels, nao, norms, comments, sections = _parse(_text(source), spin)
+    metadata = {"spin": spin, "orbital_kind": "custom", "n_ao": nao}
+    with _new_output(destination) as temporary:
+        with Writer(temporary, "qvf.convert", __version__, "Molden orbital import") as writer:
+            _structure(writer, atoms, [False] * 3, None)
+            writer.add_section({"id": "wavefunction", "kind": "wavefunction.gto", "structure_ref": "structure"})
+            writer.add_json("wavefunction", "basis", {"structure_ref": "structure", "n_ao": nao, "shells": shells})
+            for channel, orbitals in channels.items():
+                if not orbitals:
+                    continue
+                payload = {"n_mo": len(orbitals), "energies": [m["ene"] for m, _ in orbitals],
+                           "occupations": [m["occup"] for m, _ in orbitals],
+                           "symmetry_labels": [m["sym"] for m, _ in orbitals]}
+                if spin == "unrestricted":
+                    metadata[channel] = payload
+                else:
+                    metadata.update(payload)
+                role = "mo_coefficients" + ("_" + channel if spin == "unrestricted" else "")
+                _binary(writer, "wavefunction", role, (v for _, row in orbitals for v in row), [len(orbitals), nao])
+            writer.add_json("wavefunction", "mo_metadata", metadata)
+        findings = _validated(temporary)
+    return {"format": "molden", "output": str(destination), "spin": spin, "n_ao": nao,
+            "findings": findings, "contraction_norms": norms, "omitted_comments": comments,
+            "omitted_text_lines": sum(len(sections.get(name, [None, []])[1]) for name in ("title", "molden format")),
+            "scope": "Molecular real s/p/d orbitals only. Orbital kind is custom: Molden does not establish its meaning. No method, charge, multiplicity, electron count, overlap matrix or job is inferred."}
+
+
+def export_molden(source, destination, *, section=None):
+    _validated(source)
+    with Reader(source) as reader:
+        selected = _select(reader, section, {"wavefunction.gto"})
+        basis = reader.json(selected.id, "basis"); metadata = reader.json(selected.id, "mo_metadata")
+        sid = selected.to_json().get("structure_ref") or basis["structure_ref"]
+        geometry = reader.json(sid, "structure")
+        if geometry.get("lattice_vectors") is not None or any(geometry.get("pbc", [False] * 3)):
+            raise ValueError("Molden conversion supports molecular geometry only")
+        spin = metadata["spin"]
+        if (spin not in _SPINS or metadata.get("complex") or metadata.get("coefficient_encoding", "real") != "real"
+                or metadata.get("occupation_semantics", "electron_occupation") != "electron_occupation"
+                or any(metadata.get("k_point", [0, 0, 0])) or basis.get("ecp")):
+            raise ValueError("Molden refuses ECP, complex/spinor, transition-weight and non-Gamma orbitals")
+        # Atomic units avoid a reader's different angstrom/bohr constant
+        # changing the geometry on which these atomic-unit orbitals are defined.
+        lines = ["[Molden Format]", "[Atoms] AU"]
+        for i, atom in enumerate(geometry["atoms"], 1):
+            checked = _atom(atom["symbol"], atom["position"])
+            lines.append(f"{checked['symbol']} {i} {checked['atomic_number']} " + ' '.join(format(_number(v * BOHR_PER_ANGSTROM), '.17g') for v in checked["position"]))
+        lines.append("[GTO]"); order = []; factors = []; norms = []; centers = set(); center = None; d_types = set()
+        for shell in basis["shells"]:
+            shell = dict(shell, pure=shell.get("pure", basis.get("pure", True)))
+            indices, scales = _layout(shell); offset = len(order); norm = _shell_norm(shell)
+            order.extend(offset + i for i in indices); factors.extend(norm * s for s in scales); norms.append(norm)
+            if shell["l"] == 2:
+                d_types.add(shell["pure"])
+            if center != shell["center"]:
+                center = shell["center"]
+                if center in centers:
+                    raise ValueError("Molden export requires contiguous basis shells per atom")
+                centers.add(center); lines.append(f"{center + 1} 0")
+            lines.append(f"{'spd'[shell['l']]} {len(shell['exponents'])} 1.00")
+            lines.extend(f"{e:.17g} {c / norm:.17g}" for e, c in zip(shell["exponents"], shell["coefficients"]))
+        if len(d_types) > 1 or not order or centers != set(range(len(geometry["atoms"]))):
+            raise ValueError("Molden requires one d-shell convention and a basis for every atom")
+        lines.extend(["[5D]" if True in d_types else "[6D]", "[MO]"])
+        generated_labels = 0; nao = len(order)
+        for channel in (["alpha", "beta"] if spin == "unrestricted" else [None]):
+            payload = metadata[channel] if channel else metadata
+            role = "mo_coefficients" + ("_" + channel if channel else "")
+            member = selected.member(role)
+            if math.prod(member.shape) > _MAX_VALUES:
+                raise ValueError("Molden coefficient limit exceeded")
+            matrix = reader.tensor(selected.id, role).tolist()
+            if not matrix or any(len(row) != nao for row in matrix):
+                raise ValueError("Molden requires nonempty real MO rows matching the basis")
+            labels = payload.get("symmetry_labels")
+            if labels is None:
+                labels = ["A"] * len(matrix); generated_labels += len(matrix)
+            for row, energy, occupation, label in zip(matrix, payload["energies"], payload["occupations"], labels):
+                if (not label.strip() or any(ord(c) < 32 for c in label)
+                        or label.splitlines() != [label]):
+                    raise ValueError("Molden symmetry labels must be nonempty single-line text")
+                if not 0 <= occupation <= (1 if spin == "unrestricted" else 2):
+                    raise ValueError("Molden requires electron occupations in the declared spin range")
+                lines.extend([f"Sym= {label}", f"Ene= {_number(energy):.17g}",
+                              f"Spin= {(channel or 'alpha').capitalize()}", f"Occup= {_number(occupation):.17g}"])
+                lines.extend(f"{i} {_number(row[index] * scale):.17g}" for i, (index, scale) in enumerate(zip(order, factors), 1))
+        with _new_output(destination) as temporary:
+            temporary.write_text('\n'.join(lines) + '\n', encoding="utf-8")
+        return {"format": "molden", "output": str(destination), "section": selected.id,
+                "spin": spin, "n_ao": nao, "contraction_norms": norms, "generated_symmetry_labels": generated_labels,
+                "omitted_sections": [s.id for s in reader.sections if s.id not in {selected.id, sid}],
+                "omitted_members": [role for role in selected.members if role not in
+                                    {"basis", "mo_metadata", "mo_coefficients", "mo_coefficients_alpha", "mo_coefficients_beta"}],
+                "scope": "Selected geometry, basis, energies, electron occupations, labels and real coefficients only. Orbital kind, method, charge, multiplicity, identities, bonds, jobs, overlap/density matrices and other QVF metadata are not retained. Supply the reported spin on reimport. Keep the original archive."}

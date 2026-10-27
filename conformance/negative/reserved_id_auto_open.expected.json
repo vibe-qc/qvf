@@ -1,0 +1,10 @@
+{
+  "archive": "reserved_id_auto_open.qvf",
+  "description": "A section id 'auto_open', a reserved viewer_defaults key (spec \u00a7 3.1).",
+  "expect": [
+    {
+      "code": "E_RESERVED_ID",
+      "severity": "error"
+    }
+  ]
+}
