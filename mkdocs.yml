@@ -57,10 +57,12 @@ nav:
       - Command line: cli.md
       - Converters: converters.md
       - PySCF adapter: adapters/pyscf.md
+      - xTB exporter: adapters/xtb.md
       - PySCF to QVF tutorial: tutorials/pyscf-to-qvf.md
       - C ABI: c_api.md
       - Fortran binding: fortran.md
       - Family workflow: family_workflow.md
+      - Reaction workflow interchange: reaction_workflow.md
       - ORCA integration: orca_integration.md
   - API reference:
       - Python: api/python.md

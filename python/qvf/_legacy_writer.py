@@ -291,7 +291,9 @@ def _energy(value: Any, units: str, what: str) -> dict[str, Any]:
         number, unit = value["value"], value["units"]
     else:
         number, unit = value, units
-    if isinstance(number, bool) or not isinstance(number, (int, float, np.number)):
+    # Python scalars must not load the optional NumPy convenience dependency.
+    from numbers import Real
+    if isinstance(number, bool) or not isinstance(number, Real):
         raise ValueError(f"{what} must be a number, got {number!r}")
     if not math.isfinite(float(number)):
         raise ValueError(f"{what} must be finite, got {number!r}")

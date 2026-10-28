@@ -89,6 +89,25 @@ def _parser():
         group.add_argument("--" + name, default=argparse.SUPPRESS)
         group.add_argument("--no-" + name, dest=name, action="store_const", const=None,
                            default=argparse.SUPPRESS, help=f"write explicit null for {name}")
+    command = commands.add_parser("export-xtb", help="package molecular xTB outputs as a new QVF")
+    command.add_argument("results", help="xtbout.json from the selected calculation")
+    command.add_argument("--geometry", required=True, help="matching final XYZ or molecular coord")
+    command.add_argument("-o", "--output", required=True, help="new archive (never overwritten)")
+    for option in ("trajectory", "wbo", "molden", "modes"):
+        command.add_argument("--" + option, help="explicit companion file from the same calculation")
+    command.add_argument("--spin", choices=("restricted", "restricted_open", "unrestricted"),
+                         help="required with --molden")
+    command.add_argument("--cube", nargs=2, action="append", default=[], metavar=("FILE", "KIND"),
+                         help="scalar cube and explicit QVF quantity, e.g. density.cub volume.density")
+    command.add_argument("--charge", type=int)
+    command.add_argument("--multiplicity", type=int)
+    command.add_argument("--run-status", choices=("converged", "failed"),
+                         help="status established independently; omitted by default")
+    command.add_argument("--canonical-orbitals", action="store_true",
+                         help="assert that the Molden orbitals are untransformed canonical xTB orbitals")
+    command = commands.add_parser("run-xtb", help="run an xTB bundle once and export a converged QVF")
+    command.add_argument("request", help="version-1 xtb-job.json beside coord and xcontrol")
+    command.add_argument("--binary", required=True, help="absolute registered xTB executable")
     commands.add_parser("schema", help="print the packaged normative JSON Schema")
     return parser
 
@@ -102,6 +121,7 @@ def _execute(args):
             _json(report)
         else:
             print(f"{args.level}: {'OK' if report['ok'] else 'FAILED'} ({report['n_sections']} sections)")
+            print(validate._context_summary(report))
             for finding in report["findings"]:
                 print(f"{finding['severity']} {finding['code']} {finding['where']}: {finding['message']}")
         return 0 if report["ok"] else 1
@@ -195,6 +215,16 @@ def _execute(args):
         else:
             raise ValueError("conversion must have QVF as exactly one endpoint")
         _json(result)
+    elif args.command == "export-xtb":
+        from .adapters.xtb import write_xtb
+        _json(write_xtb(args.results, args.geometry, args.output,
+                        trajectory=args.trajectory, wbo=args.wbo, molden=args.molden,
+                        spin=args.spin, modes=args.modes, cubes=args.cube,
+                        charge=args.charge, multiplicity=args.multiplicity,
+                        run_status=args.run_status, canonical_orbitals=args.canonical_orbitals))
+    elif args.command == "run-xtb":
+        from .adapters.xtb_run import run_xtb
+        _json(run_xtb(args.request, binary=args.binary))
     elif args.command == "prepare-job":
         from .jobs import prepare_job
         names = {name: getattr(args, name) for name in ("basis", "functional") if hasattr(args, name)}

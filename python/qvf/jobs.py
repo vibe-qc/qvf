@@ -69,6 +69,16 @@ def prepare_job(source, destination, *, job_type, method, task,
     with Reader(source, limits=limits) as reader:
         source_findings = _validated(reader, "source")
         manifest = deepcopy(reader.raw_manifest)
+        # Structural validation can establish that a critical vendor namespace
+        # is declared, but cannot establish that this consumer understands it.
+        # Keeping opaque bytes is insufficient when they change interpretation
+        # of the geometry or request that we are about to create (spec 7.4).
+        for namespace, declaration in manifest.get("extensions", {}).items():
+            if declaration.get("critical", False):
+                raise ValueError(f"prepare_job refuses unsupported critical extension: {namespace}")
+        for section in manifest["sections"]:
+            if section.get("critical", False) and section["kind"].startswith("x_"):
+                raise ValueError(f"prepare_job refuses unsupported critical section: {section['kind']}")
         # The reader accepts the withdrawn spelling 2; producers write v1.
         manifest["qvf_version"] = 1
         structures = reader.sections_of("structure")

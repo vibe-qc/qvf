@@ -85,7 +85,7 @@ def _sections(text):
     return sections, pure_d, omitted_comments
 
 
-def _parse(text, spin):
+def _parse(text, spin, *, unnormalized_primitives=False):
     if spin not in _SPINS:
         raise ValueError("Molden import requires explicit restricted, restricted_open or unrestricted spin")
     sections, pure_d, comments = _sections(text)
@@ -129,6 +129,12 @@ def _parse(text, spin):
             shell = {"center": center, "l": angular, "pure": pure_d if angular == 2 else False,
                      "exponents": [row[0] for row in primitives],
                      "coefficients": [row[column] for row in primitives]}
+            if unnormalized_primitives:
+                # QVF Appendix A.1. xTB printmold writes basis%cont with the
+                # axial primitive normalization already multiplied into it.
+                from ._legacy_writer import primitive_norm
+                shell["coefficients"] = [c / primitive_norm(e, angular) for e, c in
+                                         zip(shell["exponents"], shell["coefficients"])]
             norm = _shell_norm(shell)
             if abs(norm * norm - 1) > 1e-5:
                 raise ValueError("Molden input contractions must already be normalized (squared norm within 1e-5)")
@@ -140,6 +146,11 @@ def _parse(text, spin):
     order = []; scales = []
     for shell in shells:
         indices, factors = _layout(shell); offset = len(order)
+        if unnormalized_primitives:
+            # xTB cube.f90/primval uses R_atom-r; QVF uses r-R_atom.
+            # printmold emits those MO coefficients unchanged. Reverse odd-l
+            # phases while preserving Molden's Cartesian component scaling.
+            factors = [factor * (-1)**shell["l"] for factor in factors]
         order.extend(offset + i for i in indices); scales.extend(factors)
     nao = len(order); orbitals = []; current = None; coefficients = {}
 
@@ -186,8 +197,9 @@ def _parse(text, spin):
     return atoms, shells, channels, nao, norms, comments, sections
 
 
-def import_molden(source, destination, *, spin):
-    atoms, shells, channels, nao, norms, comments, sections = _parse(_text(source), spin)
+def import_molden(source, destination, *, spin, _unnormalized_primitives=False):
+    atoms, shells, channels, nao, norms, comments, sections = _parse(
+        _text(source), spin, unnormalized_primitives=_unnormalized_primitives)
     metadata = {"spin": spin, "orbital_kind": "custom", "n_ao": nao}
     with _new_output(destination) as temporary:
         with Writer(temporary, "qvf.convert", __version__, "Molden orbital import") as writer:

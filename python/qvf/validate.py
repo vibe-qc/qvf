@@ -2012,8 +2012,23 @@ class _Findings:
     """Collects findings; derives the legacy ``errors`` / ``warnings`` lists."""
 
     def __init__(self) -> None:
+        from ._legacy_writer import TOOLKIT_VERSION
         self.references = True
         self.items: list[dict[str, str]] = []
+        self.context = {"reader": "qvf-python", "reader_version": TOOLKIT_VERSION,
+                        "archive_format_version": None, "archive_schema_uri": None,
+                        "schema_toolkit_version": TOOLKIT_VERSION,
+                        "schema_id": None, "schema_sha256": None,
+                        "schema_checked": False, "supported_format_versions": [1],
+                        "unsupported_format_version": None,
+                        "scientific_validity": "not_assessed"}
+        try:
+            with open(_SCHEMA_PATH, "rb") as source:
+                raw = source.read()
+            self.context.update(schema_id=json.loads(raw).get("$id"),
+                                schema_sha256=hashlib.sha256(raw).hexdigest())
+        except (OSError, ValueError):
+            pass  # The existing schema-skipped finding remains authoritative.
 
     def error(self, code: str, where: str, message: str) -> None:
         self._add("error", code, where, message)
@@ -2034,7 +2049,20 @@ class _Findings:
         warnings = [f"{f['code']}: {f['message']}" for f in self.items
                     if f["severity"] == "warning"]
         return {"ok": not errors, "errors": errors, "warnings": warnings,
-                "n_sections": n_sections, "findings": list(self.items)}
+                "n_sections": n_sections, "findings": list(self.items),
+                "validation_context": dict(self.context)}
+
+
+def _context_summary(report):
+    context = report["validation_context"]
+    return (f"archive format={context['archive_format_version']!r}; "
+            f"reader={context['reader']} {context['reader_version']}; "
+            f"bundled schema={context['schema_id']} "
+            f"sha256={context['schema_sha256']}; "
+            f"schema checked={context['schema_checked']}. "
+            "Format version is not the toolkit release: compare the producer's "
+            "validator pin before attributing a cross-version rejection to the producer. "
+            "Numerical accuracy and electronic stability are not assessed.")
 
 
 def validate_qvf(path: str, *, limits: Optional[Limits] = None, level=Level.All) -> dict[str, Any]:
@@ -2207,6 +2235,9 @@ def _validate_open_zip(zf: zipfile.ZipFile, lim: Limits, out: _Findings,
 
     # Root sanity. The withdrawn version 2 is read as 1 (spec § 3.1).
     version = manifest.get("qvf_version")
+    out.context.update(archive_format_version=version,
+                       archive_schema_uri=manifest.get("schema_uri"),
+                       unsupported_format_version=isinstance(version, bool) or version not in (1, 2))
     checked_manifest = manifest
     if version == 2 and not isinstance(version, bool):
         out.warning("W_VERSION_WITHDRAWN", "/qvf_version",
@@ -2215,7 +2246,10 @@ def _validate_open_zip(zf: zipfile.ZipFile, lim: Limits, out: _Findings,
         checked_manifest = dict(manifest, qvf_version=1)
     elif isinstance(version, bool) or version != 1:
         out.error("E_VERSION", "/qvf_version",
-                  f"qvf_version must be 1, got {version!r}")
+                  f"unsupported archive format version {version!r}: "
+                  f"qvf-python {out.context['reader_version']} selects the bundled "
+                  "format-1 schema (withdrawn version 2 is read as 1); "
+                  "use a reader supporting the producer's format, not a rewritten archive")
     src = manifest.get("source", {})
     if not isinstance(src, dict):
         out.error("E_SOURCE", "/source", "source must be a JSON object")
@@ -2232,6 +2266,7 @@ def _validate_open_zip(zf: zipfile.ZipFile, lim: Limits, out: _Findings,
 
     # Optional full schema validation.
     validator = _load_schema_validator()
+    out.context["schema_checked"] = validator is not None
     if validator is not None:
         for err in validator.iter_errors(checked_manifest):
             loc = "/".join(str(p) for p in err.absolute_path) or "(root)"
@@ -2700,10 +2735,12 @@ def _main(argv: list[str]) -> int:
     if as_json:
         json.dump({"path": path, "ok": report["ok"],
                    "n_sections": report["n_sections"],
-                   "findings": report["findings"]}, sys.stdout, indent=2)
+                   "findings": report["findings"],
+                   "validation_context": report["validation_context"]}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         print(f"QVF validation: {path}")
+        print(f"  {_context_summary(report)}")
         print(f"  sections: {report['n_sections']}")
         for f in report["findings"]:
             print(f"  {f['code']}: {f['message']}")

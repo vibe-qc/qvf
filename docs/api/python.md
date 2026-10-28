@@ -42,6 +42,13 @@ shows it in use. It is unreleased and is not part of the v0.6.0 package.
 
 ::: qvf.adapters.pyscf
 
+The standard-library-only xTB companion exporter is described in the
+[xTB guide](../adapters/xtb.md). It is available from the development source.
+
+::: qvf.adapters.xtb
+
+::: qvf.adapters.xtb_run
+
 ## Compatibility writer
 
 `QvfWriter` is the original writer. It remains supported and is re-exported as

@@ -83,6 +83,29 @@ def test_preparation_preserves_drawing_sections_bytes_and_source(tmp_path):
                             "tasks": ["single_point"], "structure_ref": "molecule"}
 
 
+@pytest.mark.parametrize("critical_at", ["extension", "section"])
+def test_valid_but_unsupported_critical_content_is_refused(tmp_path, critical_at):
+    source = drawing(tmp_path / "drawing.qvf")
+
+    def critical(manifest, files):
+        manifest["extensions"] = {"x_example": {"version": "1"}}
+        if critical_at == "extension":
+            manifest["extensions"]["x_example"]["critical"] = True
+        else:
+            next(s for s in manifest["sections"] if s["id"] == "drawing")["critical"] = True
+
+    source = rewrite(source, tmp_path / "required.qvf", critical)
+    before = source.read_bytes()
+    with Reader(source) as reader:
+        assert reader.validate()["ok"]  # Valid format is not consumer support.
+    output = tmp_path / "pending.qvf"
+    with pytest.raises(ValueError, match="unsupported critical"):
+        prepare_job(source, output, **OPTIONS)
+    assert source.read_bytes() == before
+    assert not output.exists()
+    assert not list(tmp_path.glob(".qvf-output-*"))
+
+
 @pytest.mark.parametrize("changes,match", [
     ({"method": ""}, "method"), ({"method": 5}, "method"),
     ({"method": " rhf"}, "method"), ({"method": "rhf\n"}, "method"),

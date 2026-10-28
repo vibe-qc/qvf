@@ -28,11 +28,44 @@ sizes, CRC and SHA-256 before publishing that file.
 
 Exit status is **0** for success/equal, **1** for failed validation, differing
 archives or failed conformance, and **2** for usage or operational errors.
+
+Validation reports include `validation_context`: the archive format and stated
+schema URI, executing reader/toolkit version, selected bundled schema ID and
+SHA-256, and whether schema checking ran. The archive URI is informational;
+it does not select or download a schema. Format version 1 is not toolkit
+release 0.1: compatible toolkit releases can carry different schema additions.
+Compare the producer's pinned validator and schema digest when investigating
+cross-version rejections. An unsupported archive format is an `E_VERSION`
+error; other schema violations remain errors, not presumed version mismatches.
+Null `job.spec` basis/functional values mean the method takes neither input
+and are allowed by the current schema. This does not allow null in arbitrary
+typed fields. Format validation establishes neither numerical accuracy nor
+electronic stability.
 A partially verified extraction or archive rewrite is discarded. Output files
 must be new: `extract`, `repack`, `scrub` and `prepare-job` refuse existing paths, including
 the input and symlinks. They stage a sibling temporary file and publish it
 without replacing a concurrently created destination. No command edits an
 input archive in place.
+
+## Export xTB results (development source)
+
+The `export-xtb` command packages molecular GFN0/1/2-xTB output as a new QVF:
+
+```sh
+qvf export-xtb xtbout.json --geometry xtbopt.xyz --charge 0 \
+  --trajectory xtbopt.log --wbo wbo -o result.qvf
+```
+
+JSON output must be requested before running xTB. Optional `--molden` plus
+`--spin`, `--modes` and repeatable `--cube FILE KIND` arguments add orbitals,
+normal modes and scalar grids. The command validates before publishing and
+refuses existing destinations. It neither runs xTB nor infers convergence.
+See the [xTB exporter guide](adapters/xtb.md) for installation, accepted
+formats and data that cannot be recovered from JSON alone.
+
+`qvf run-xtb xtb-job.json --binary /opt/xtb/bin/xtb` executes a prepared
+serial bundle, checks xTB termination/convergence evidence and exports
+`result.qvf`. See the same guide for the request contract and failure behavior.
 
 ## Prepare one pending job (toolkit 0.6.0)
 

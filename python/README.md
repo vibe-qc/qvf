@@ -8,6 +8,13 @@ The package and its raw-buffer writer, reader and editor use only the standard
 library. Install optional dependencies for numeric convenience writers and
 full JSON Schema validation. Python 3.9+ is supported by the base package.
 
+The development source also includes `qvf export-xtb` and
+`qvf.adapters.xtb.write_xtb`: package molecular GFN0/1/2-xTB JSON, geometry
+and explicitly selected trajectory, bond-order, Molden, normal-mode and
+cube outputs as one validated QVF. See the
+[xTB exporter guide](https://github.com/vibe-qc/qvf/blob/main/docs/adapters/xtb.md).
+This adapter needs neither xTB nor NumPy at export time.
+
 ## Python release candidate
 
 `0.7.0rc1` is the first PyPI release candidate, including the PySCF adapter.

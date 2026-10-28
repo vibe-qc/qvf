@@ -77,7 +77,7 @@ def _codes(report):
 
 def test_report_keeps_legacy_keys_and_adds_findings(tmp_path):
     report = validate_qvf(_archive(tmp_path))
-    assert set(report) == {"ok", "errors", "warnings", "n_sections", "findings"}
+    assert set(report) == {"ok", "errors", "warnings", "n_sections", "findings", "validation_context"}
     assert report["ok"] and report["errors"] == [] and report["n_sections"] == 1
     for f in report["findings"]:
         assert set(f) == {"severity", "code", "where", "message"}

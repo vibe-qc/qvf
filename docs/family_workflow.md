@@ -10,6 +10,11 @@ This workflow uses the QVF **v0.6.0 toolkit** and **format version 1**. The
 consumer implements a subset. Conformance does not imply that every consumer
 can execute, display or preserve every section.
 
+The [reaction workflow profile](reaction_workflow.md) defines the continuous
+scientific interchange requirements, explicit energy selection and immutable
+parent hashes. It distinguishes current source contracts from released and
+scientifically demonstrated capability.
+
 The frozen QC 0.18, Sketch 0.6, View 3.0 and Queue 1.0 interfaces use the
 **v0.6.0 tag's bytes**, including its schema, rather than the current toolkit
 development tree or an optional dependency's minimum version. Keep those pins
