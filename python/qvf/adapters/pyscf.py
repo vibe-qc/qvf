@@ -12,9 +12,10 @@ a molecular ``gto.Mole`` (``RHF``, ``UHF``, ``ROHF``, ``RKS``, ``UKS``,
 spherical or a Cartesian basis.
 
 ``add_td`` and ``write_td`` add molecular closed-shell TDA/TDHF/TDDFT
-states and UV-visible sticks beside that SCF reference. Singlet TDA and
-full response can also carry paired natural transition orbitals. Full
-response retains both X and Y; triplet NTOs are not mapped (see ``add_td``).
+states and UV-visible sticks beside that SCF reference. Singlet and triplet
+TDA and full response also carry paired natural transition orbitals. Full
+response retains both X and Y; triplet NTOs are written as alpha and beta
+spin-orbital channels (see ``add_td``).
 
 PySCF is imported lazily: ``import qvf.adapters.pyscf`` works without it, and
 calling an export function then raises ``ImportError``. From a checkout
@@ -757,12 +758,9 @@ class _PreparedTD:
         self.singlet = bool(td.singlet)
         # CasidaTDDFT inherits both TDHF and TDA; it is a full-response method.
         self.tda = isinstance(td, rhf.TDA) and not isinstance(td, rhf.TDHF)
-        eligible_ntos = self.singlet
         if ntos is not None and not isinstance(ntos, bool):
             raise TypeError("ntos must be True, False or None")
-        if ntos is True and not eligible_ntos:
-            raise NotImplementedError("paired NTO export currently supports singlet RHF/RKS response only")
-        self.with_ntos = eligible_ntos if ntos is None else ntos
+        self.with_ntos = True if ntos is None else ntos
         self.method = "tddft" if _is_ks(mf) else ("cis" if self.tda else "tdhf")
         self.mf = mf
         self.states = []
@@ -803,6 +801,12 @@ class _PreparedTD:
                 # Keep the accepted TDA convention; neither path mutates X/Y.
                 transition = (x / math.sqrt(norm) if self.tda
                               else math.sqrt(2) * (x + y))
+                if not self.singlet:
+                    # The M_S = 0 triplet has spin-orbital amplitudes X(+Y)
+                    # for alpha and -X(-Y) for beta (PySCF's UHF response of
+                    # the same reference). Each spin channel carries T/sqrt(2);
+                    # _add_td writes the beta particles with the opposite sign.
+                    transition = transition / math.sqrt(2)
                 u, singular, vh = np.linalg.svd(transition, full_matrices=False)
                 self.ntos.append((coeff[:, occupied] @ u, coeff[:, virtual] @ vh.T,
                                   (singular * singular).tolist()))
@@ -823,9 +827,19 @@ def _add_td(writer, p, *, states_id, spectrum_id, nto_prefix, scf_options):
     for state, (hole, particle, weights) in zip(p.states, p.ntos):
         for role, coefficients, output in (("hole", hole, holes),
                                             ("particle", particle, particles)):
+            zeros = [0.0] * len(weights)
+            if p.singlet:
+                orbitals = dict(mo_coefficients=ref.map.coefficients(coefficients),
+                                occupations=weights, energies=zeros, spin="restricted")
+            else:
+                beta = -coefficients if role == "particle" else coefficients
+                orbitals = dict(
+                    mo_coefficients_alpha=ref.map.coefficients(coefficients),
+                    mo_coefficients_beta=ref.map.coefficients(beta),
+                    occupations_alpha=weights, occupations_beta=weights,
+                    energies_alpha=zeros, energies_beta=zeros, spin="unrestricted")
             sid = writer.add_wavefunction_gto(
-                ref.map.shells, mo_coefficients=ref.map.coefficients(coefficients),
-                occupations=weights, energies=[0.0] * len(weights), spin="restricted",
+                ref.map.shells, **orbitals,
                 pure=ref.map.pure, structure_ref=ids["structure"],
                 orbital_kind="nto", state_ref=states_id, state_index=state["index"],
                 nto_role=role, overlap=ref.overlap, ecp=_ecp_entries(ref.mol),
@@ -860,12 +874,12 @@ def add_td(writer, td, *, states_id: str = "excited_states", spectrum_id: str = 
     to rows of the full reference wavefunction. Contributions are the
     normalized X²−Y² weights, including negative terms when present.
 
-    ``ntos=None`` writes paired NTOs for singlet TDA and full response;
-    ``False`` omits them, and ``True`` requires a supported NTO result.
-    Triplet NTOs, unrestricted/open-shell references, complex amplitudes,
-    solvent and direct-RPA variants are not mapped. Source arrays are not
-    changed and no SCF or response iterations are run. NTO energies are
-    zero and their occupations are squared singular-value transition weights.
+    ``ntos=None`` and ``True`` write paired NTOs for singlet and triplet TDA
+    and full response; ``False`` omits them. Unrestricted/open-shell
+    references, complex amplitudes, solvent and direct-RPA variants are not
+    mapped. Source arrays are not changed and no SCF or response iterations
+    are run. NTO energies are zero and their occupations are squared
+    singular-value transition weights.
 
     TDA uses the normalized X matrix, with weights summing to one. Full
     response uses ``sqrt(2) * (X + Y)`` in PySCF's restricted convention,
@@ -874,6 +888,15 @@ def add_td(writer, td, *, states_id: str = "excited_states", spectrum_id: str = 
     Hermitian operators; their orbital-pair contraction times ``sqrt(2)``
     recovers the source length-gauge transition dipole. They do not encode
     the separate X/Y blocks needed for anti-Hermitian operators.
+
+    Triplet states are the ``M_S = 0`` component. Their charge transition
+    vanishes, so their NTOs use the unrestricted NTO layout of spec § 5.3:
+    each spin channel holds the spin-orbital transition ``T / sqrt(2)``,
+    with ``T`` the singlet-path matrix above, and the beta particles have
+    the opposite sign (alpha ``+``, beta ``-``). The two channels have
+    identical weights and orbitals up to that sign, and their sum over both
+    spins equals the singlet-path sum. The alpha minus beta pair contraction
+    is the spin (``S_z``) transition. The reference stays restricted.
 
     Root provenance/energies and the optional ``job.spec`` describe the
     **SCF reference**, not the excitation calculation. The excitation

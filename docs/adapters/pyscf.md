@@ -110,7 +110,7 @@ with Reader("h2-tddft.qvf") as reader:
 |---|---|---|
 | Singlet RHF/RKS TDA | Yes; RHF TDA is labelled `cis`, RKS TDA `tddft` with `tda: true` | Written by default |
 | Singlet TDHF/TDDFT, including pure-functional Casida response | Yes; `tda: false` | Written by default, retaining X and Y |
-| Triplet response from a closed-shell RHF/RKS reference | Yes; multiplicity 3, with PySCF's zero electric transition strengths | Omitted |
+| Triplet response from a closed-shell RHF/RKS reference | Yes; multiplicity 3, with PySCF's zero electric transition strengths | Written by default as α/β spin-orbital channels |
 | Unrestricted or restricted-open reference, spin-flip, complex or periodic response | Refused | Refused |
 | Solvent response or direct-RPA variants | Refused | Refused |
 
@@ -168,11 +168,25 @@ unchanged. NTO signs within each pair retain the source transition's phase.
 
 The adapter does **not** call PySCF 2.14's `get_nto`: that helper normalizes
 the stored X array in place and ignores Y in full TDHF/TDDFT. `ntos=False`
-omits NTOs; `ntos=True` requires a supported singlet result and otherwise
-raises `NotImplementedError`. Triplet NTOs remain deferred: the charge
-transition cancels between spins, and a spin-transition representation
-must be mapped explicitly. Unrestricted and restricted-open response
-also remain unsupported.
+omits NTOs; `ntos=None` and `ntos=True` write them for singlet and triplet
+results. Unrestricted and restricted-open response remain unsupported.
+
+**Triplet NTOs.** A restricted triplet result is the `M_S = 0` component.
+Its spin-orbital amplitudes are `X` (and `Y`) for α and `−X` (and `−Y`) for
+β, so the charge transition `α + β` cancels and a restricted NTO pair cannot
+represent it. The adapter therefore writes the existing unrestricted NTO
+layout of spec § 5.3: still two sections per state, with `spin:
+"unrestricted"`, while the reference wavefunction stays restricted. Each
+spin channel holds the spin-orbital transition `T / sqrt(2)`, where `T` is
+the singlet-path matrix above (`X / ||X||` for TDA, `sqrt(2) * (X + Y)` for
+full response). The α and β channels have the same hole orbitals and
+weights, and the β particle orbitals carry the opposite sign. Both spins
+together sum to one for TDA and to `2 * sum((X + Y)**2)` for full
+response, the same sums as the singlet path. The α minus β contraction of
+a real one-electron operator is its spin (`S_z`) transition property; the
+α plus β contraction, the charge transition, is zero, matching PySCF's zero
+triplet transition dipole. This is a mapping onto existing fields, without
+a new field or validator rule.
 
 The returned IDs include the `add_scf` entries plus `excited_states`,
 `spectrum`, `nto_holes` and `nto_particles`; the last two are ordered lists
@@ -247,21 +261,22 @@ convergence level. The OH comparison starts PySCF from the reference density,
 because the UHF π hole has two solutions of the same energy.
 
 `python/tests/test_adapter_pyscf_td.py` checks response conversion separately:
-RHF/RKS TDA and full response, the Casida class, triplet state tables,
+RHF/RKS TDA and full response, the Casida class, triplet state tables and NTOs,
 spherical/Cartesian bases, rectangular NTO spaces and frozen MO indices.
 It reads every archive back, checks validation, energies, transition
 properties and references, reconstructs the TDA or full-response transition
 and length-gauge moments from the stored NTOs, and verifies that source
 arrays are unchanged. Explicit-Y controls catch X-only, X−Y and
 unit-normalized mappings; cases retain weights both above and below a unit
-sum. Error cases include
+sum. Triplet NTO channels are compared with the α and β amplitudes of
+PySCF's independent spin-orbital UHF response of the same closed-shell
+reference, for TDA and TDHF. Error cases include
 unconverged roots and X amplitudes changed by PySCF's NTO helper. These are
 conversion checks, not a new scientific accuracy claim for either engine.
 
 ## Not yet covered
 
-Later WP-62 tranches: unrestricted/open-shell response, triplet NTOs,
-densities on a grid (`volume.density`) and periodic
+Later WP-62 tranches: unrestricted/open-shell response, densities on a grid (`volume.density`) and periodic
 Γ-point calculations. ECP projectors, solvent models (refused), GHF and
 relativistic two-component wavefunctions (refused) and ghost atoms (refused)
 are not mapped either.
