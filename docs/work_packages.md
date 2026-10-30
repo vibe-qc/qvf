@@ -435,8 +435,10 @@ RHF/RKS TDA and TDHF/TDDFT `excited_states` + `spectra.uvvis`, with paired
 singlet-TDA NTOs and source-amplitude preservation. Frozen MO indices map
 to the full reference wavefunction. Tranche 3 (#26) adds singlet full-response
 NTOs from PySCF's `sqrt(2)(X+Y)`, retaining non-unit squared singular-value
-weights and reconstructing the length-gauge transition moments. Triplet NTOs and
-unrestricted/open-shell response remain deferred; grid densities → `volume.density`;
+weights and reconstructing the length-gauge transition moments. Closed-shell
+triplet NTOs are written as unrestricted α/β spin-orbital channels (β particle
+sign reversed), checked against PySCF's UHF response. Unrestricted/open-shell
+response remains deferred; grid densities → `volume.density`;
 PBC Γ-point → periodic structure + Γ wavefunction; ECP projectors.
 
 ### WP-63 · vibe-qc links libqvf — L · Opus · maintainer note (low priority)
