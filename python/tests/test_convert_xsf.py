@@ -30,7 +30,8 @@ def test_grid_units_endpoint_storage_and_explicit_periodicity(tmp_path):
     src = tmp_path/'input.xsf'; src.write_text(GEOMETRY + GRID)
     archive = tmp_path/'out.qvf'; report = import_xsf(src, archive, kind='volume.density', periodic=(True, True, True))
     assert report['omitted_comments'] == 2
-    assert report['omitted'] == ['datagrid block and field labels']
+    assert report['omitted'] == []
+    assert report['grids'] == [{'section': 'volume', 'label': 'synthetic/samples'}]
     clean(archive)
     with Reader(archive) as reader:
         geometry = reader.json('structure', 'structure')
@@ -101,7 +102,9 @@ def test_molecule_and_finite_grid(tmp_path, prefix):
     GEOMETRY+GRID.replace('0 100 10', '0 inf 10'),
     GEOMETRY+GRID.replace('2 0.1 0.2\n', '0 0 0\n'),
     GEOMETRY+GRID.replace('BEGIN_BLOCK_DATAGRID_3D', 'BEGIN_BLOCK_DATAGRID_2D'),
-    GEOMETRY+GRID+GRID, GEOMETRY+GEOMETRY,
+    GEOMETRY+GRID.replace('END_BLOCK_DATAGRID_3D', '').replace('END_DATAGRID_3D\n', ''),
+    GEOMETRY+'BEGIN_BLOCK_DATAGRID_3D\nempty\nEND_BLOCK_DATAGRID_3D\n',
+    GEOMETRY+GEOMETRY,
 ])
 def test_unsupported_xsf_never_published(tmp_path, text):
     src = tmp_path/'invalid.xsf'; src.write_text(text)
@@ -224,3 +227,49 @@ def test_nonperiodic_cell_export_is_refused(tmp_path):
     with pytest.raises(ValueError, match='nonperiodic cell'):
         export_xsf(archive, tmp_path/'out.xsf')
     assert not (tmp_path/'out.xsf').exists()
+
+
+def test_forces_grids_and_conventional_cell(tmp_path):
+    from qvf.convert import export_xsf
+    text = (GEOMETRY.replace('# atoms\nPRIMCOORD', 'CONVVEC\n4 0 0\n0 8 0\n0 0 12\nPRIMCOORD')
+            .replace('6 0.1 0.2 0.3', '6 0.1 0.2 0.3 0 0 0.5')
+            .replace('H 1.1 1.2 1.3', 'H 1.1 1.2 1.3 0.01 -0.02 0.03'))
+    text += 'CONVCOORD\n1 1\nH 0 0 0\n'
+    second = GRID.replace('synthetic', 'other').replace('_samples', '_second')
+    src = tmp_path/'rich.xsf'; src.write_text(text + GRID + second)
+    out = tmp_path/'rich.qvf'
+    report = import_xsf(src, out)
+    assert run(out)['ok']
+    assert report['forces'] is True and report['conventional_cell_omitted'] is True
+    assert report['grids'] == [{'section': 'volume', 'label': 'synthetic/samples'},
+                               {'section': 'volume_2', 'label': 'other/second'}]
+    with Reader(out) as reader:
+        gradient = reader.tensor('forces', 'gradient').tolist()
+        assert [s.kind for s in reader.sections].count('volume.generic') == 2
+    bohr = 1.8897261246257702
+    assert gradient[-1] == pytest.approx([-0.01 / bohr, 0.02 / bohr, -0.03 / bohr])
+    exported = tmp_path/'rich-out.xsf'
+    report = export_xsf(out, exported, section='structure')
+    assert report['forces'] is True and 'forces' not in report['omitted_sections']
+    back = tmp_path/'back.qvf'
+    import_xsf(exported, back)
+    with Reader(back) as reader:
+        assert sum(reader.tensor('forces', 'gradient').tolist(), []) == pytest.approx(
+            sum(gradient, []))
+
+
+def test_independent_ase_reads_xsf_forces(tmp_path):
+    ase_io = pytest.importorskip('ase.io')
+    from ase import Atoms
+    from ase.calculators.singlepoint import SinglePointCalculator
+    atoms = Atoms('OH', positions=[[0, 0, 0], [0.96, 0, 0]], cell=[5, 5, 5], pbc=True)
+    atoms.calc = SinglePointCalculator(atoms, forces=[[0.5, -1, 2], [-0.5, 1, -2]])
+    src = tmp_path/'ase.xsf'
+    ase_io.write(str(src), atoms, format='xsf')
+    out = tmp_path/'ase.qvf'
+    assert import_xsf(src, out)['forces'] is True
+    from qvf.convert import export_xsf
+    exported = tmp_path/'out.xsf'
+    export_xsf(out, exported, section='structure')
+    back = ase_io.read(str(exported), format='xsf')
+    assert back.get_forces().ravel().tolist() == pytest.approx([0.5, -1, 2, -0.5, 1, -2])

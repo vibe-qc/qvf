@@ -12,7 +12,7 @@ The development source also includes `qvf export-xtb` and
 `qvf.adapters.xtb.write_xtb`: package molecular GFN0/1/2-xTB JSON, geometry
 and explicitly selected trajectory, bond-order, Molden, normal-mode and
 cube outputs as one validated QVF. See the
-[xTB exporter guide](https://github.com/vibe-qc/qvf/blob/main/docs/adapters/xtb.md).
+[xTB exporter guide](https://github.com/vibyverse/qvf/blob/main/docs/adapters/xtb.md).
 This adapter needs neither xTB nor NumPy at export time.
 
 ## Python release candidate
@@ -38,7 +38,7 @@ move consumers pinned to toolkit v0.6.0. That older tag has no PySCF adapter.
 For the existing stable toolkit, install the tagged source:
 
 ```sh
-python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibe-qc/qvf.git@v0.6.0#subdirectory=python"
+python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibyverse/qvf.git@v0.6.0#subdirectory=python"
 ```
 
 `qvf_writer` and `qvf_reader` remain importable with a `DeprecationWarning`;
@@ -71,9 +71,9 @@ Members are written as they are added, and the manifest is written last.
 The installed package contains the normative schema for structural checks.
 
 Start with the runnable
-[PySCF-to-QVF tutorial](https://github.com/vibe-qc/qvf/blob/main/docs/tutorials/pyscf-to-qvf.md).
+[PySCF-to-QVF tutorial](https://github.com/vibyverse/qvf/blob/main/docs/tutorials/pyscf-to-qvf.md).
 The optional adapter is included in this candidate; see the
-[adapter guide](https://github.com/vibe-qc/qvf/blob/main/docs/adapters/pyscf.md)
+[adapter guide](https://github.com/vibyverse/qvf/blob/main/docs/adapters/pyscf.md)
 for supported methods and limitations.
 
 ```sh

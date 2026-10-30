@@ -142,8 +142,8 @@ Or pull the independently versioned QVF repository without an install step.
 Its CMake project is at `cpp/` directly under the repository root. The
 source repository URL is a build setting. Set `QVF_SOURCE_REPOSITORY` to
 the repository you can access and configure Git credentials if needed. The
-public publication URL is `https://github.com/vibe-qc/qvf.git`; it becomes
-usable after the source snapshot is approved. Pin a reviewed revision explicitly:
+canonical source URL is `https://github.com/vibyverse/qvf.git`.
+Pin a released revision explicitly:
 
 ```cmake
 include(FetchContent)

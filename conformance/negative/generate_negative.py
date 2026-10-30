@@ -591,6 +591,20 @@ def _():
             _err("E_PAYLOAD_SCHEMA"), None)
 
 
+
+@case("structure_helix_class_on_sheet")
+def _():
+    a = Archive("secondary structure")
+    section = a.add_structure()
+    section["secondary_structure"] = [
+        {"type": "sheet", "chain": "A", "start_seq": 1, "end_seq": 3, "helix_class": 1}]
+    return (a.to_bytes(),
+            "A sheet secondary-structure range with a helix_class, which applies "
+            "only to helix ranges (spec § 5.1, Secondary-structure ranges). Only a "
+            "validator with a JSON Schema engine detects this; one without (it "
+            "reports W_SCHEMA_SKIPPED) accepts the archive.",
+            _err("E_SCHEMA"), None)
+
 # Member payloads that break their $defs definition (spec § 5.4, § 5.7). The
 # expected E_PAYLOAD_SCHEMA is a schema-engine code (Appendix B): a validator
 # without a JSON Schema engine reports W_SCHEMA_SKIPPED instead and need not

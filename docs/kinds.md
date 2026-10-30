@@ -4236,7 +4236,7 @@ One residue of a biomolecular `structure` section. `atom_indices` are 0-based in
 
 ### `BiomoleculeSecondaryStructure`
 
-One inclusive secondary-structure range on one chain. A producer knows things a consumer cannot infer from CA geometry alone (alpha vs pi vs 3-10 helix, beta bridge vs sheet), so a consumer that also has its own geometric assignment MUST prefer these ranges where they are supplied; see QVF spec § 5.1 (structure and bonds).
+One inclusive secondary-structure range on one chain. A producer knows things a consumer cannot infer from CA geometry alone (alpha vs pi vs 3-10 helix, beta bridge vs sheet), so a consumer that also has its own geometric assignment MUST prefer these ranges where they are supplied. Each end is the residue (`chain`, seq, insertion code); `helix_class` applies to helix ranges and `sheet_id` / `strand` to sheet ranges; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges.
 
 | Field | Required | Type | Description |
 |---|---|---|---|
@@ -4244,6 +4244,11 @@ One inclusive secondary-structure range on one chain. A producer knows things a 
 | `chain` | yes | string |  |
 | `start_seq` | yes | integer | First residue `seq` of the range, inclusive. |
 | `end_seq` | yes | integer | Last residue `seq` of the range, inclusive. |
+| `start_insertion_code` |  | string | Insertion code of the first residue (PDB HELIX col 26, SHEET col 27), e.g. "A" for a range starting at residue 10A. Absent means the first residue has no insertion code; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges. |
+| `end_insertion_code` |  | string | Insertion code of the last residue (PDB HELIX and SHEET col 38). Absent means the last residue has no insertion code; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges. |
+| `helix_class` |  | integer | PDB helix class (HELIX cols 39-40): 1 right-handed alpha, 2 right-handed omega, 3 right-handed pi, 4 right-handed gamma, 5 right-handed 3-10, 6 left-handed alpha, 7 left-handed omega, 8 left-handed gamma, 9 2-7 ribbon/helix, 10 polyproline. Only on a `helix` range; absent means not recorded; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges. |
+| `sheet_id` |  | string | Identifier of the sheet this strand belongs to (PDB SHEET cols 12-14). Only on a `sheet` range; strands with equal `sheet_id` on one structure form one sheet; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges. |
+| `strand` |  | integer | Strand number within its sheet (PDB SHEET cols 8-10), starting at 1. Only on a `sheet` range; see QVF spec § 5.1 (structure and bonds), under Secondary-structure ranges. |
 
 <a id="def-citationsreferences"></a>
 

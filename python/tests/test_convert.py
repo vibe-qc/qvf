@@ -67,8 +67,11 @@ def test_extxyz_skewed_variable_cell_trajectory(tmp_path):
 @pytest.mark.parametrize('text', [
     '', '1\ncomment\n', '1\nx\nH nan 0 0', '1\nx\nUnknown 0 0 0',
     '1\nx\nH 0 0 0 extra', XYZ + '1\nx\nHe 0 0 0\n',
-    '1\nProperties=species:S:1:pos:R:3:forces:R:3\nH 0 0 0 1 2 3',
-    '1\nProperties=species:S:1:pos:R:3 energy=-1\nH 0 0 0',
+    '1\nProperties=species:S:1:pos:R:3:forces:R:2\nH 0 0 0 1 2',
+    '1\nProperties=species:S:1:pos:R:3:Z:I:1\nH 0 0 0 2',
+    '1\nProperties=species:S:1:pos:R:3:forces:R:3\nH 0 0 0 1 2',
+    '1\nProperties=species:S:1:pos:R:3 stress="1 2 3"\nH 0 0 0',
+    '1\nProperties=species:S:1:pos:R:3:pos:R:3\nH 0 0 0 0 0 0',
     '1\nProperties=species:S:1:pos:R:3 pbc="T F F"\nH 0 0 0',
     '1\nProperties=species:S:1:pos:R:3 pbc="maybe F F"\nH 0 0 0',
     '1\nProperties=species:S:1:pos:R:3 Lattice="1 0 0"\nH 0 0 0',

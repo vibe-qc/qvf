@@ -1,0 +1,10 @@
+{
+  "archive": "structure_helix_class_on_sheet.qvf",
+  "description": "A sheet secondary-structure range with a helix_class, which applies only to helix ranges (spec \u00a7 5.1, Secondary-structure ranges). Only a validator with a JSON Schema engine detects this; one without (it reports W_SCHEMA_SKIPPED) accepts the archive.",
+  "expect": [
+    {
+      "code": "E_SCHEMA",
+      "severity": "error"
+    }
+  ]
+}

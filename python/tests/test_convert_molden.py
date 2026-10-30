@@ -163,7 +163,8 @@ def test_export_normalizes_basis_preserving_orbitals_and_reports(tmp_path):
 
 
 @pytest.mark.parametrize('shells', [
-    [dict(center=0,l=3,pure=True,exponents=[1],coefficients=[1])],
+    [dict(center=0,l=5,pure=True,exponents=[1],coefficients=[1])],
+    [dict(center=0,l=3,pure=p,exponents=[1],coefficients=[1]) for p in [True,False]],
     [dict(center=0,l=2,pure=p,exponents=[1],coefficients=[1]) for p in [True,False]],
     [dict(center=0,l=0,pure=True,exponents=[1],coefficients=[0])],
 ])
@@ -209,7 +210,9 @@ def test_cli_no_overwrite_and_no_optional_dependencies(tmp_path, capsys):
 
 
 def qvf_orbitals(path, points):
-    """Independent direct polynomial evaluation of Appendix A for s/p/d."""
+    """Independent direct evaluation of Appendix A for s to g: Cartesian
+    monomials in lexicographic order, and spherical S_lm from the Legendre
+    definition (no Condon-Shortley phase) for l >= 3."""
     np = pytest.importorskip('numpy')
     with Reader(path) as reader:
         atoms = reader.json('structure','structure')['atoms']
@@ -223,11 +226,22 @@ def qvf_orbitals(path, points):
                 angular = [np.ones(len(points))]
             elif l == 1:
                 angular = [y,z,x] if shell['pure'] else [x,y,z]
-            elif shell['pure']:
+            elif l == 2 and shell['pure']:
                 angular = [math.sqrt(3)*x*y,math.sqrt(3)*y*z,z*z-(x*x+y*y)/2,
                            math.sqrt(3)*x*z,math.sqrt(3)*(x*x-y*y)/2]
+            elif shell['pure']:
+                r = np.sqrt(r2); t = z/r; phi = np.arctan2(y,x)
+                legendre = np.polynomial.legendre.Legendre.basis(l)
+                angular = []
+                for m in range(-l,l+1):
+                    k = abs(m)
+                    p = (1-t*t)**(k/2) * legendre.deriv(k)(t) if k else legendre(t)
+                    scale = math.sqrt(2*math.factorial(l-k)/math.factorial(l+k)) if k else 1
+                    trig = 1 if m == 0 else (np.cos(k*phi) if m > 0 else np.sin(k*phi))
+                    angular.append(r**l * scale * p * trig)
             else:
-                angular = [x*x,x*y,x*z,y*y,y*z,z*z]
+                angular = [x**lx * y**ly * z**(l-lx-ly) for lx in range(l,-1,-1)
+                           for ly in range(l-lx,-1,-1)]
             columns.extend(v*radial for v in angular)
         ao = np.array(columns).T
         channels = ['alpha','beta'] if reader.json('wavefunction','mo_metadata')['spin'] == 'unrestricted' else [None]
@@ -247,7 +261,8 @@ def test_pyscf_independent_import_export_orbital_values(tmp_path, cart, spin):
     from pyscf.tools import molden
     lib.num_threads(1)
     mol = gto.M(atom='He 0 .2 -.1; He .7 -.3 1.1',unit='Bohr',cart=cart,verbose=0,
-                basis={'He':[[0,[2.3,.4],[.7,.6]],[1,[1.9,.6],[.5,.4]],[2,[1.3,.7],[.3,.4]]]})
+                basis={'He':[[0,[2.3,.4],[.7,.6]],[1,[1.9,.6],[.5,.4]],[2,[1.3,.7],[.3,.4]],
+                             [3,[1.1,.8],[.4,.3]],[4,[.9,1.]]]})
     nao = mol.nao_nr(); coeff = np.eye(nao) + np.arange(nao*nao).reshape(nao,nao)*.001
     points = np.array([[.2,.3,.4],[-.7,.2,.5],[1.1,-.3,-.8],[-.6,-.5,.9]])
     source_file = tmp_path / 'pyscf.molden'
@@ -267,3 +282,22 @@ def test_pyscf_independent_import_export_orbital_values(tmp_path, cart, spin):
     ao2 = independent.eval_gto('GTOval_cart' if cart else 'GTOval_sph',points)
     for matrix,reference in zip(matrices if spin == 'unrestricted' else [matrices],expected):
         np.testing.assert_allclose(ao2 @ matrix,reference,rtol=3e-12,atol=3e-13)
+
+
+@pytest.mark.parametrize('flags, expected', [
+    ('', {2: False, 3: False, 4: False}),
+    ('[5D]\n', {2: True, 3: True, 4: False}),
+    ('[5D10F]\n', {2: True, 3: False, 4: False}),
+    ('[7F]\n', {2: False, 3: True, 4: False}),
+    ('[5D7F]\n[9G]\n', {2: True, 3: True, 4: True}),
+    ('[6D]\n[15G]\n', {2: False, 3: False, 4: False}),
+    ('[5D]\n[10F]\n', None), ('[5D]\n[6D]\n', None), ('[9G]\n[15G]\n', None),
+])
+def test_shell_convention_flags(flags, expected):
+    from qvf._molden import _sections
+    text = '[Molden Format]\n[Atoms] AU\n[GTO]\n[MO]\n' + flags
+    if expected is None:
+        with pytest.raises(ValueError, match='conflicting'):
+            _sections(text)
+    else:
+        assert _sections(text)[1] == expected

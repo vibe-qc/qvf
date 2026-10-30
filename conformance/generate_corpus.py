@@ -4522,6 +4522,49 @@ def build_biomolecule_identity():
        "belongs to both conformers (spec § 5.1, Biomolecular atom identity).")
 
 
+
+def build_secondary_structure_ranges():
+    """structure_secondary_structure: typed range ends and classes (#28)."""
+    def ca(x, seq, **identity):
+        return {"symbol": "C", "position": [x, 0.0, 0.0], "atom_name": "CA",
+                "residue_name": "ALA", "residue_seq": seq, "chain_id": "A",
+                "hetero": False, **identity}
+    atoms = [ca(0.0, 10), ca(3.8, 10, insertion_code="A"), ca(7.6, 11),
+             ca(11.4, 12), ca(15.2, 13)]
+    w = QvfWriter(_PROGRAM, _VERSION, "secondary-structure ranges")
+    w.add_structure(atoms, biomolecule={
+        "chains": ["A"],
+        "residues": [
+            {"name": "ALA", "seq": 10, "chain": "A", "atom_indices": [0]},
+            {"name": "ALA", "seq": 10, "chain": "A", "insertion_code": "A",
+             "atom_indices": [1]},
+            {"name": "ALA", "seq": 11, "chain": "A", "atom_indices": [2]},
+            {"name": "ALA", "seq": 12, "chain": "A", "atom_indices": [3]},
+            {"name": "ALA", "seq": 13, "chain": "A", "atom_indices": [4]},
+        ],
+        "secondary_structure": [
+            {"type": "helix", "chain": "A", "start_seq": 10, "start_insertion_code": "A",
+             "end_seq": 11, "helix_class": 5},
+            {"type": "sheet", "chain": "A", "start_seq": 12, "end_seq": 14,
+             "sheet_id": "S1", "strand": 1},
+            {"type": "coil", "chain": "A", "start_seq": 10, "end_seq": 10},
+        ]}, name="alanine CA trace with typed ranges")
+    _write("structure_secondary_structure", w, [
+        {"manifest_pointer": ["sections", 0, "secondary_structure", 0,
+                              "start_insertion_code"], "equals": "A"},
+        {"manifest_pointer": ["sections", 0, "secondary_structure", 0, "helix_class"],
+         "equals": 5},
+        {"manifest_pointer": ["sections", 0, "secondary_structure", 1, "sheet_id"],
+         "equals": "S1"},
+        {"manifest_pointer": ["sections", 0, "secondary_structure", 1, "strand"],
+         "equals": 1},
+        {"manifest_pointer": ["sections", 0, "secondary_structure", 1, "end_seq"],
+         "equals": 14},
+    ], "A 3-10 helix (helix_class 5) from residue 10A to 11, distinct from residue "
+       "10 by its start insertion code; strand 1 of sheet S1 from 12 to 14, whose "
+       "end residue 14 the structure does not contain, which is allowed; and a "
+       "coil at residue 10 (spec § 5.1, Secondary-structure ranges).")
+
 def build_reaction_energies():
     """reaction_scheme_energies: 2 H2 + O2 -> 2 H2O with its energies (#16)."""
     import hashlib
@@ -4610,4 +4653,5 @@ if __name__ == "__main__":
     build_zero_spin()
     build_unrestricted_ntos()
     build_biomolecule_identity()
+    build_secondary_structure_ranges()
     build_reaction_energies()

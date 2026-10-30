@@ -54,6 +54,131 @@ The toolkit version is in [`VERSION`](VERSION) and the format version
 
 ### Added
 
+- WP-48 (#41): Molden f and g shells, spherical and Cartesian, in both
+  directions, with the `[5D]`, `[5D7F]`, `[5D10F]`, `[7F]`, `[9G]` and `[15G]`
+  conventions. Component order and Cartesian scaling are converted to QVF
+  Appendix A. PySCF-written f/g files give the same orbital values after
+  import and export. No format change.
+- WP-48 (#40): XSF forces, several datagrids and conventional-cell records.
+  Atom rows may carry forces (hartree/Å), which become a `forces` section
+  and are exported back. Every `DATAGRID_3D` in every block becomes its own
+  labelled volume section, and `CONVVEC`/`CONVCOORD` are accepted and
+  reported. ASE reads the exported forces with the same values. No format
+  change.
+- WP-48 (#39): extXYZ energy, forces and stress. `Properties` is parsed
+  generically. `energy`, `forces:R:3` and `stress` become the root energy or
+  trajectory energies, the gradient (a `forces` section or the trajectory
+  `gradient`) and the stress, in atomic units. `Z` is checked against the
+  species, and other header keys and columns are reported instead of
+  refused. extXYZ export writes them back in eV units, and ASE reads them
+  with the same values. No format change.
+- WP-48 (#38): opt-in generation of PDB `MTRIX` copies that the file does
+  not give (`import_pdb(..., expand_ncs=True)`, `qvf convert --expand-ncs`).
+  The deposited atoms and the copies form an `asymmetric_unit` section,
+  with chains named `<chain>-<serial>`. `REMARK 350` assemblies and the
+  unit-cell expansion are then built from it instead of being blocked. The
+  copies agree with gemmi's `expand_ncs`. No format change.
+- WP-48 (#37): mmCIF (PDBx) import and atom-site export (`import_mmcif`,
+  `export_mmcif`, `qvf convert --from mmcif` / `--to mmcif`, `--block`).
+  `_atom_site` rows keep the PDB atom-site identity, preferring the author
+  columns. Models, the cell and space group, helices and sheet strands, and
+  `_struct_conn` bonds follow the PDB import. Export writes an `_atom_site`
+  loop, plus `_cell` when periodic, without the PDB column limits. A
+  gemmi-written mmCIF imports like the PDB file it came from, and gemmi reads
+  the export. No format change.
+- WP-48 (#36): VASP CHGCAR-family import and export (`import_chgcar`,
+  `export_chgcar`, `qvf convert --from chgcar` / `--to chgcar`). The POSCAR
+  head becomes the periodic structure. The first grid becomes
+  `volume.density` in e/bohr³ on a periodic grid without the endpoint. A
+  collinear magnetization becomes `volume.spin` and a noncollinear one
+  `volume.vector`. PAW augmentation lines are skipped and counted, and the
+  report gives the integrated electron count. Export writes the density and
+  one magnetization on the same grid, without augmentation. ASE reads the
+  export and ASE-written files import to the same grid. No format change.
+- WP-48 (#35): VASP POSCAR/CONTCAR import and export (`import_poscar`,
+  `export_poscar`, `qvf convert --from poscar` / `--to poscar`, `--species`).
+  Import handles the scale (factor, volume or per-axis), VASP 5 species
+  lines (POTCAR labels reduced to the element) and, with an explicit species
+  list, VASP 4 files. Direct and Cartesian positions are read. Atoms fixed on
+  all three axes become `constraints.frozen_atoms`; partial flags and CONTCAR
+  velocities are reported, not stored. Export writes Direct coordinates in
+  archive order with one species entry per element run, and Selective
+  dynamics from `frozen_atoms`. ASE reads the export back. No format change.
+- WP-48 (#34): core crystallographic CIF import and P 1 CIF export
+  (`import_cif`, `export_cif`, `qvf convert --from cif` / `--to cif`,
+  `--block`). One data block's fractional sites are expanded to the whole
+  unit cell with the listed symmetry operations, or the Hall symbol, and
+  special-position copies are merged. The result is a periodic structure in
+  the standard orientation with a `structure.symmetry` section. Elements come
+  only from `_atom_site_type_symbol`. Labels, occupancy and isotropic
+  displacement are kept. The Hall-symbol parser matches gemmi for all 564
+  settings, and the unit cells match gemmi's. No new dependency and no
+  format change.
+- WP-48 (#33): opt-in PDB crystal symmetry expansion
+  (`import_pdb(..., expand_symmetry=True)`, `qvf convert --expand-symmetry`)
+  adds a periodic `unit_cell` structure with every space-group copy of the
+  first model, each shifted so its centre lies in the cell, and a `P 1`
+  symmetry section. Operators come from a built-in Hall-symbol parser for
+  the 65 chiral space groups under their wwPDB names and common settings,
+  each checked against gemmi; copies are named `<chain>-<n>`, and atoms on
+  symmetry elements are merged and counted. No new dependency and no
+  format change.
+- WP-48 (#32): each PDB `REMARK 350` biomolecule becomes its own
+  nonperiodic structure section `assembly_<n>`, with the `BIOMT` operators
+  applied to its chains. Copies under an identity operator keep their chain;
+  other copies are named `<chain>-<serial>`. Identity, bonds within each copy
+  and secondary-structure ranges are copied, and the deposited structure is
+  unchanged. `MTRIX` records are counted; when an NCS copy is not given, no
+  assembly is built and the report says why. Operators must be proper
+  rotations. Coordinates agree with gemmi's `make_assembly`. No format
+  change.
+- WP-48 (#31): PDB `SSBOND` and `LINK` records become structure bonds,
+  merged with the `CONECT` pairs without an order. Atoms resolve by
+  atom-site identity, following alternate locations; a missing, ambiguous or
+  self-bonded atom refuses the import, and records to a symmetry mate are
+  skipped and counted. Export with atom-site identity writes `SSBOND` for
+  cysteine SG-SG bonds and `LINK` for other inter-residue bonds involving a
+  hetero atom, alongside `CONECT`. gemmi reads them back as connections, and
+  gemmi-written records import to the same bonds. No format change.
+- WP-48 (#30): a PDB `CRYST1` cell becomes a periodic structure in the
+  PDB standard orientation, with a `structure.symmetry` section recording the
+  space group; symmetry mates are not generated, and the report gives Z. The
+  wwPDB placeholder cell means no cell. `SCALE1`-`SCALE3` must match the
+  standard orthogonalization, or the import is refused. Export writes `CRYST1`
+  and `SCALE` for a fully periodic structure whose lattice is in PDB
+  orientation, and refuses rotated lattices and partial periodicity instead
+  of rotating coordinates. gemmi reads the exported cell back. No format
+  change.
+- WP-48 (#29): PDB `CONECT` records become the structure section's own
+  `bonds` member. Each distinct atom pair is one bond with no inferred order;
+  repeated listings are counted, not read as bond orders. A dangling serial or
+  self-bond refuses the import, and ensembles resolve serials per model.
+  Export writes `CONECT` for every bond assigned to the structure (its member
+  or a `bonds` section, spec § 5.1), from both atoms, and counts the orders it
+  cannot write. RDKit reads the exported bonds back. No format change.
+- #28: typed secondary-structure range ends and classes. Additive under v1:
+  `$defs/BiomoleculeSecondaryStructure` gains optional
+  `start_insertion_code` / `end_insertion_code`, `helix_class` (PDB 1-10,
+  `helix` ranges only) and `sheet_id` / `strand` (`sheet` ranges only). Spec
+  § 5.1 (*Secondary-structure ranges*) makes range ends residues by the
+  (chain, seq, insertion code) key, and lets a range name an end that the
+  structure lacks. New corpus vectors: `structure_secondary_structure`
+  (must pass) and `structure_helix_class_on_sheet` (schema-only `E_SCHEMA`).
+  The PDB converter maps `HELIX`/`SHEET` records to these ranges on import
+  and back on export with atom-site identity, counts unresolved ends and
+  omitted `coil` ranges, and is checked against gemmi. See GOVERNANCE.md.
+- WP-48 (#27): PDB conversion keeps the atom-site identity of spec § 5.1.
+  Import records each atom's name, residue name and number, chain, insertion
+  code, alternate location, occupancy, temperature factor and
+  `ATOM`/`HETATM`, and lists the section's `chains` and `residues` keyed by
+  (chain, number, insertion code). Alternate locations are kept as separate
+  atoms instead of being refused, and nothing is selected by occupancy. A
+  multi-model ensemble becomes model 1 plus a `trajectory` when its models
+  share atoms and metadata, and one `structure` per model otherwise. Export
+  writes that identity back when every atom has a name, residue name and
+  number, and refuses values that do not fit the columns. Structures without
+  it keep the synthetic `UNL` records. gemmi and RDKit read the exported
+  files back in the optional tests. No schema, registry or validator change.
 - WP-62 tranche 3 (#26): paired singlet TDHF/TDDFT NTOs, including Casida
   response, from PySCF's `sqrt(2)(X+Y)` charge-transition matrix. Preserve
   squared singular-value weights without unit normalization and source

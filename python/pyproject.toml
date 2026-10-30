@@ -30,9 +30,9 @@ pyscf = ["pyscf>=2.14", "numpy>=1.20"]
 [project.urls]
 Homepage = "https://vibe-qc.com/docs/qvf/"
 Documentation = "https://vibe-qc.com/docs/qvf/"
-Source = "https://github.com/vibe-qc/qvf"
-Issues = "https://github.com/vibe-qc/qvf/issues"
-Changelog = "https://github.com/vibe-qc/qvf/blob/main/CHANGELOG.md"
+Source = "https://github.com/vibyverse/qvf"
+Issues = "https://github.com/vibyverse/qvf/issues"
+Changelog = "https://github.com/vibyverse/qvf/blob/main/CHANGELOG.md"
 
 [project.scripts]
 qvf = "qvf.cli:main"

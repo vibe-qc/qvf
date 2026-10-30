@@ -1,0 +1,60 @@
+{
+  "archive": "structure_secondary_structure.qvf",
+  "description": "A 3-10 helix (helix_class 5) from residue 10A to 11, distinct from residue 10 by its start insertion code; strand 1 of sheet S1 from 12 to 14, whose end residue 14 the structure does not contain, which is allowed; and a coil at residue 10 (spec \u00a7 5.1, Secondary-structure ranges).",
+  "source_program": "qvf-conformance",
+  "kinds": [
+    "structure"
+  ],
+  "checks": [
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "secondary_structure",
+        0,
+        "start_insertion_code"
+      ],
+      "equals": "A"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "secondary_structure",
+        0,
+        "helix_class"
+      ],
+      "equals": 5
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "secondary_structure",
+        1,
+        "sheet_id"
+      ],
+      "equals": "S1"
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "secondary_structure",
+        1,
+        "strand"
+      ],
+      "equals": 1
+    },
+    {
+      "manifest_pointer": [
+        "sections",
+        0,
+        "secondary_structure",
+        1,
+        "end_seq"
+      ],
+      "equals": 14
+    }
+  ]
+}

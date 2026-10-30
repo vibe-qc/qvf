@@ -35,7 +35,7 @@ vibe-qc family and merges what its programs already wrote or read.
 - ✅ Reference **writers** in Python and C++17 (zero-dependency, streaming, ZIP64, `open_for_update`, `repack`), **validators** in Python, C++ and JavaScript with the same stable finding codes; C++ and JavaScript check the schema with the checker generated from it (`scripts/gen_kinds.py`), so the three validators agree on the conformance corpus.
 - ✅ Sketch documents (2026-10-14): chemical identity on `structure` sections, `reaction.scheme`, `preview` with the member field `media_type`, job sets (`run.record` `job_ref`), one media type and macOS UTI for `.qvf`, `x_vibesketch` registered, and the withdrawn `qvf_version` 2 read as a warning.
 - ✅ Family data (2026-10-15, toolkit 0.3.0): `localization_reference_basis` and three deprecated `mo_metadata` keys, `null` for a `job.spec` `functional` or `basis`, the viewer hints `energy_window`, `camera` and `crossfade`, `structure_ref` on standalone `bonds` sections, and one rule for the withdrawn `qvf_version` 2; qvf is the single source of the format for the family.
-- ✅ **Conformance suite**: current main has 77 golden archives (canonical kinds, edge cases and compatibility), 117 must-fail archives and one legacy archive; toolkit 0.6.0 has 75 / 110 / 1. Python, C++ and JavaScript runners share the corpus. The additional main cases are Unreleased.
+- ✅ **Conformance suite**: current main has 78 golden archives (canonical kinds, edge cases and compatibility), 118 must-fail archives and one legacy archive; toolkit 0.6.0 has 75 / 110 / 1. Python, C++ and JavaScript runners share the corpus. The additional main cases are Unreleased.
 - ✅ Typed `Manifest` / `Section` / `MemberSpec` model in C++ and Python, generated kind and unit tables, single-header amalgamation, and `@qvf/core` reader. The complete C ABI covers every canonical kind and preserves all legacy symbols.
 - ✅ Governance: every contract change has a dated record in `GOVERNANCE.md` and a `registry.json` promotion; nothing bumped `qvf_version`.
 
@@ -70,7 +70,7 @@ contains the following **Unreleased** work:
 | Landed work | Compatibility and adoption boundary |
 |---|---|
 | Bounded molecular Molden conversion (WP-48) | Independently checked against PySCF; uses existing v1 structure/wavefunction members. |
-| Typed biomolecular atom-site identity (#18) | Optional insertion code, alternate location, occupancy and hetero fields. The existing PDB converter's bounded scope is unchanged. Consumers adopt the fields after pinning a release containing them. |
+| Typed biomolecular atom-site identity (#18) | Optional insertion code, alternate location, occupancy and hetero fields. The PDB converter now maps them (#27, Unreleased). Consumers adopt the fields after pinning a release containing them. |
 | Canonical reaction-step energies (#16) | Typed terms, method and run provenance, with shared validator checks. Frozen Sketch keeps `x_vibesketch.energies`; the canonical field requires a later release pin. |
 | Kind catalogue, documentation site and Python, C++ and C API references (WP-64, #19–#22) | Source and local build support landed; site publication remains separate work. |
 
@@ -82,7 +82,7 @@ pins](docs/family_workflow.md#check-the-packaged-qvf-runtime).
 
 ## Milestones and weekly reconciliation
 
-The canonical GitLab project tracks **Next toolkit - adoption readiness** and
+The canonical GitHub project tracks **Next toolkit - adoption readiness** and
 **Ecosystem adoption - Phase 4** as development milestones. The first groups
 the landed converters, drawing-preserving job preparation and installed
 consumer/packaging work for the next bounded release. The second tracks
@@ -170,7 +170,7 @@ The library other codes link. Core first, then the facades, then every binding o
 - 🔨 **WP-45** Fortran module over the complete C ABI and checked writers landed; Linux GNU 12 candidate and focused GNU 16/Python interoperability checks pass; other compiler/platform coverage remains
 - ✅ **WP-46** Python `qvf` package: model, streaming writer, lazy typed reader, editor, shims (D20)
 - ✅ **WP-47** CLI `qvf`: staged validate, info, cat, extract, numeric diff, repack, reported scrub, conformance, schema
-- 🔨 **WP-48** Converters: scalar cube and geometry-only XYZ/extXYZ with trajectories are in 0.5.0 ([guide](docs/converters.md)); static XSF primitive geometry/scalar grids and single-model PDB geometry are included in 0.6.0. Bounded real molecular s/p/sp/d Molden conversion is on main (Unreleased), with independent orbital-value checks. Broader Molden/XSF support, richer extXYZ properties, PDB biomolecular metadata, POSCAR/CHGCAR and CIF remain.
+- 🔨 **WP-48** Converters: scalar cube and geometry-only XYZ/extXYZ with trajectories are in 0.5.0 ([guide](docs/converters.md)); static XSF primitive geometry/scalar grids and single-model PDB geometry are included in 0.6.0. Bounded real molecular s/p/sp/d Molden conversion is on main (Unreleased), with independent orbital-value checks. PDB import/export of atom-site identity, alternate locations and model ensembles is on main (Unreleased, #27), with independent gemmi and RDKit read-back checks. PDB `HELIX`/`SHEET` ranges map to typed `secondary_structure` (#28) and `CONECT` to structure bonds (#29) and `CRYST1`/`SCALE` to a periodic cell with its space group (#30), `SSBOND`/`LINK` to structure bonds (#31), `REMARK 350` assemblies to expanded structures (#32), and opt-in crystal symmetry expansion to the unit cell (#33), all Unreleased. Core crystal CIF import (unit cell from the space group) and P 1 export (#34), VASP POSCAR/CONTCAR (#35) and CHGCAR (#36) and mmCIF (#37) import/export and opt-in PDB NCS copy generation (#38) are on main (Unreleased). extXYZ energy/forces/stress (#39) XSF forces/several grids (#40) and Molden f/g shells (#41) are on main (Unreleased).
 - 🔨 **WP-49** Packaging: CMake library-only options and pkg-config metadata landed; a local Conan 2 recipe, installed C/C++ consumers and release/adoption checklist are included in 0.6.0. PyPI trusted publishing, vcpkg and registry distribution remain.
 - ⬜ **WP-50** Fuzzing in CI, big-endian QEMU job
 

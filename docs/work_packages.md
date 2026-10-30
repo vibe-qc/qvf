@@ -361,7 +361,18 @@ ensembles and alternate locations, and reports metadata and precision losses.
 The Unreleased Molden slice supports real molecular s/p/sp/d orbitals with
 explicit spin, AO normalization/order conversion and loss reports. Independent
 PySCF import/export checks compare orbital values. Broader Molden dialects,
-richer extXYZ, the other periodic formats and biomolecular PDB metadata remain open.
+richer extXYZ and the other periodic formats remain open. PDB atom-site identity
+(names, residues, chains, insertion codes, alternate locations, occupancy,
+B-factors, `HETATM`) and model ensembles are on main (Unreleased, #27), and
+so are `HELIX`/`SHEET` secondary-structure ranges (#28), `CONECT` bonds
+(#29), `CRYST1`/`SCALE` cells with the space group (#30), `SSBOND`/`LINK`
+bonds (#31) and `REMARK 350` biological assemblies with `MTRIX` accounting
+(#32), and opt-in crystal symmetry expansion to the unit cell (#33); PDB NCS
+copy generation remains open. Core crystal CIF import with unit-cell expansion
+and P 1 CIF export (#34), VASP POSCAR/CONTCAR (#35) and CHGCAR (#36)
+import/export, mmCIF import/export (#37) and opt-in PDB NCS copy generation
+(#38) extXYZ energy/forces/stress (#39), XSF forces and several grids (#40) and
+Molden f/g shells (#41) are on main (Unreleased).
 **Scope.** `qvf.convert`: import/export Gaussian cube (↔ `volume.*`, with
 the endpoint rule), XYZ/extXYZ (↔ `structure`/`trajectory`), Molden
 (↔ `structure` + `wavefunction.gto`, with Appendix A normalization and

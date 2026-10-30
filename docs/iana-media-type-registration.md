@@ -49,10 +49,10 @@ entry named `manifest.json` is authoritative.
 ## Published specification
 
 The specification is the QVF format specification, including its JSON Schema
-and registry, maintained at [the QVF repository](https://github.com/vibe-qc/qvf).
+and registry, maintained at [the QVF repository](https://github.com/vibyverse/qvf).
 The intended immutable reference for this registration is
-[the toolkit 0.3.0 specification](https://github.com/vibe-qc/qvf/blob/v0.3.0/spec/qvf-format-spec.md),
-with its [schema](https://github.com/vibe-qc/qvf/blob/v0.3.0/spec/qvf_manifest.schema.json).
+[the toolkit 0.3.0 specification](https://github.com/vibyverse/qvf/blob/v0.3.0/spec/qvf-format-spec.md),
+with its [schema](https://github.com/vibyverse/qvf/blob/v0.3.0/spec/qvf_manifest.schema.json).
 The maintainer should submit once those public tag links are available, or use
 a later published release incorporating the same media type.
 

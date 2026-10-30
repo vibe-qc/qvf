@@ -92,6 +92,29 @@ proposed here first and released before the program writes it.
 Governance decisions that affect the on-disk contract are recorded here, in the
 open. Recording a mistake is part of the process working, not evidence against it.
 
+### 2026-10-30 — Typed secondary-structure range ends and classes (#28)
+
+**Decision.** `$defs/BiomoleculeSecondaryStructure` gains the optional typed
+fields `start_insertion_code` and `end_insertion_code`, `helix_class` (the PDB
+helix class 1-10, `helix` ranges only), and `sheet_id` and `strand` (`sheet`
+ranges only). Spec § 5.1 (*Secondary-structure ranges*) makes each range end a
+residue by the (`chain`, seq, insertion code) key of #18, and lets a range name
+an end that the structure does not contain. Added **under v1**: every field is
+optional, the additive case, so there is no `qvf_version` bump.
+
+**Rationale.** A range bounded by `start_seq` and `end_seq` alone cannot start
+at residue 10A once residues 10 and 10A are distinct (#18). The schema already
+asked consumers to prefer supplied ranges because a producer knows alpha from
+pi from 3-10 helices, but gave that knowledge no field. The PDB converter
+(WP-48) maps `HELIX`/`SHEET` records losslessly apart from strand sense and
+registration.
+
+**Compatibility.** An archive without the fields reads as before, and a
+consumer that ignores them reads each range by chain and numbers. vibe-view
+reads only `type`, `chain`, `start_seq` and `end_seq`, so the fields are safe
+for it. Strand sense and registration remain unrepresented. Consumers pin a
+qvf release before writing the fields.
+
 ### 2026-10-26 — Explicit real-solid-harmonic signs (#24)
 
 **Decision.** Appendix A.2 now states the real-solid-harmonic convention

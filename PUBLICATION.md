@@ -1,24 +1,25 @@
-# Public source snapshots
+# Source hosting and publication
 
-QVF's current source is portable and intended to be publishable without
-content rewriting or file exclusions. Private operational configuration and
-audit evidence belong outside product checkouts; see CONTRIBUTING.md.
+[github.com/vibyverse/qvf](https://github.com/vibyverse/qvf) is the canonical
+home for QVF development, issues, pull requests and releases. The former
+GitLab project is retained as a read-only historical archive.
 
-Private development history remains private. The public repository uses a
-separately constructed history containing only reviewed source snapshots.
-Never mirror the development Git database directly or use a shallow clone
-as a privacy boundary.
+The transition preserves the existing public GitHub history and immutable
+release tags. Earlier public snapshots have different commit identities from
+their private development source. Their provenance and inventory records
+remain in those historical commits. Current GitHub-native commits are the
+source identities; they do not require a separate mirror or snapshot publisher.
 
-The publication process checks every committed source file, including its
-path, bytes and mode, and scans all objects reachable from the selected
-public refs. It adds PUBLIC_SOURCE_PROVENANCE.json to identify the original
-source revision and PUBLIC_SOURCE_INVENTORY.json to record source and export
-hashes. These two publication records are generated outside this checkout.
-New snapshots must preserve all source bytes and modes; unresolved privacy
-findings block publication.
+Private pre-migration history and project records are preserved separately
+with restricted access. Never merge that private ancestry into this public
+repository or use a shallow clone as a privacy boundary.
 
-Public commit IDs differ from development commit IDs. Historical releases
-retain their separately reviewed snapshots. Corrections produce a new
-snapshot or patch release; existing release tags are not rewritten. See
-CONTRIBUTING.md for the existing contributor policy and SECURITY.md for
-private security reporting.
+Keep committed source public-safe, including filenames, binary fixtures,
+metadata and commit messages. Keep operational configuration, credentials and
+audit evidence outside product checkouts. Enable the privacy hook and follow
+CONTRIBUTING.md and SECURITY.md. Unresolved privacy findings block publication.
+
+Development commits use focused checks and skip full CI. Authorized release
+candidates run the GitHub candidate workflow. Registry uploads require explicit
+release authorization; changing hosts does not publish a package, change the
+format version or update consumer pins. Existing release tags are not rewritten.

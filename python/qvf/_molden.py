@@ -37,6 +37,19 @@ def _shell_norm(shell):
     return math.sqrt(norm2)
 
 
+# Molden's Cartesian component orders (exponents of x, y, z).
+_CARTESIAN = {
+    2: ["xx", "yy", "zz", "xy", "xz", "yz"],
+    3: ["xxx", "yyy", "zzz", "xyy", "xxy", "xxz", "xzz", "yzz", "yyz", "xyz"],
+    4: ["xxxx", "yyyy", "zzzz", "xxxy", "xxxz", "yyyx", "yyyz", "zzzx", "zzzy", "xxyy",
+        "xxzz", "yyzz", "xxyz", "yyxz", "zzxy"],
+}
+
+
+def _double_factorial(n):
+    return math.prod(range(n, 0, -2)) if n > 0 else 1
+
+
 def _layout(shell):
     """QVF indices in Molden order; QVF AO / unit-normalized Molden AO."""
     angular = shell["l"]; pure = shell.get("pure", True)
@@ -44,11 +57,22 @@ def _layout(shell):
         return [0], [1.0]
     if angular == 1:
         return ([2, 0, 1] if pure else [0, 1, 2]), [1.0] * 3
-    if angular == 2:
-        if pure:
-            return [2, 3, 1, 4, 0], [1.0] * 5
-        return [0, 3, 5, 1, 2, 4], [1.0] * 3 + [1 / math.sqrt(3)] * 3
-    raise ValueError("Molden conversion supports s, p, sp and d shells only")
+    if angular > 4:
+        raise ValueError("Molden conversion supports s, p, sp, d, f and g shells only")
+    if pure:
+        # Molden m = 0, +1, -1, ..., +l, -l; QVF m = -l, ..., +l.
+        ms = [0] + [s * k for k in range(1, angular + 1) for s in (1, -1)]
+        return [m + angular for m in ms], [1.0] * len(ms)
+    qvf = [(lx, ly, angular - lx - ly) for lx in range(angular, -1, -1)
+           for ly in range(angular - lx, -1, -1)]
+    indices, factors = [], []
+    for name in _CARTESIAN[angular]:
+        powers = tuple(name.count(a) for a in "xyz")
+        indices.append(qvf.index(powers))
+        # QVF Cartesian AOs carry the axial normalization (Appendix A.1).
+        factors.append(math.sqrt(math.prod(_double_factorial(2 * n - 1) for n in powers)
+                                 / _double_factorial(2 * angular - 1)))
+    return indices, factors
 
 
 def _sections(text):
@@ -79,16 +103,21 @@ def _sections(text):
         raise ValueError("Molden requires Atoms, GTO and MO sections")
     if any(sections[flag][1] for flag in _FLAGS & sections.keys()):
         raise ValueError("Molden angular flags must have no payload")
-    pure_d = bool({"5d", "5d7f", "5d10f"} & sections.keys())
-    if pure_d and "6d" in sections:
-        raise ValueError("conflicting Molden d-shell conventions")
-    return sections, pure_d, omitted_comments
+    flags = _FLAGS & sections.keys()
+    pure_d = bool({"5d", "5d7f", "5d10f"} & flags)
+    # [5D] also means spherical f; [5D10F] keeps f Cartesian.
+    pure_f = bool({"5d", "5d7f", "7f"} & flags)
+    pure_g = "9g" in flags
+    if (pure_d and "6d" in flags) or (pure_f and {"10f", "5d10f"} & flags) \
+            or (pure_g and "15g" in flags):
+        raise ValueError("conflicting Molden shell conventions")
+    return sections, {2: pure_d, 3: pure_f, 4: pure_g}, omitted_comments
 
 
 def _parse(text, spin, *, unnormalized_primitives=False):
     if spin not in _SPINS:
         raise ValueError("Molden import requires explicit restricted, restricted_open or unrestricted spin")
-    sections, pure_d, comments = _sections(text)
+    sections, pure, comments = _sections(text)
     atoms = []
     factor = 1 / BOHR_PER_ANGSTROM if sections["atoms"][0] == "au" else 1
     for line in sections["atoms"][1]:
@@ -113,8 +142,9 @@ def _parse(text, spin, *, unnormalized_primitives=False):
             centers.add(center)
             continue
         label = fields[0].lower()
-        if center is None or label not in {"s", "p", "sp", "d"} or len(fields) not in (2, 3):
-            raise ValueError("Molden conversion supports s, p, sp and d atom-centered contractions only")
+        if center is None or label not in {"s", "p", "sp", "d", "f", "g"} or len(fields) not in (2, 3):
+            raise ValueError("Molden conversion supports s, p, sp, d, f and g atom-centered "
+                             "contractions only")
         if len(fields) == 3 and _number(fields[2]) != 1:
             raise ValueError("non-unit Molden shell scale is ambiguous and unsupported")
         count = int(fields[1]); values += count
@@ -125,8 +155,8 @@ def _parse(text, spin, *, unnormalized_primitives=False):
         if any(len(row) != (3 if label == "sp" else 2) for row in primitives):
             raise ValueError("Molden primitive rows must match their contraction type")
         for column, letter in enumerate(label if label == "sp" else [label], 1):
-            angular = "spd".index(letter)
-            shell = {"center": center, "l": angular, "pure": pure_d if angular == 2 else False,
+            angular = "spdfg".index(letter)
+            shell = {"center": center, "l": angular, "pure": pure.get(angular, False),
                      "exponents": [row[0] for row in primitives],
                      "coefficients": [row[column] for row in primitives]}
             if unnormalized_primitives:
@@ -246,23 +276,32 @@ def export_molden(source, destination, *, section=None):
         for i, atom in enumerate(geometry["atoms"], 1):
             checked = _atom(atom["symbol"], atom["position"])
             lines.append(f"{checked['symbol']} {i} {checked['atomic_number']} " + ' '.join(format(_number(v * BOHR_PER_ANGSTROM), '.17g') for v in checked["position"]))
-        lines.append("[GTO]"); order = []; factors = []; norms = []; centers = set(); center = None; d_types = set()
+        lines.append("[GTO]"); order = []; factors = []; norms = []; centers = set(); center = None
+        types = {2: set(), 3: set(), 4: set()}
         for shell in basis["shells"]:
             shell = dict(shell, pure=shell.get("pure", basis.get("pure", True)))
             indices, scales = _layout(shell); offset = len(order); norm = _shell_norm(shell)
             order.extend(offset + i for i in indices); factors.extend(norm * s for s in scales); norms.append(norm)
-            if shell["l"] == 2:
-                d_types.add(shell["pure"])
+            if shell["l"] in types:
+                types[shell["l"]].add(shell["pure"])
             if center != shell["center"]:
                 center = shell["center"]
                 if center in centers:
                     raise ValueError("Molden export requires contiguous basis shells per atom")
                 centers.add(center); lines.append(f"{center + 1} 0")
-            lines.append(f"{'spd'[shell['l']]} {len(shell['exponents'])} 1.00")
+            lines.append(f"{'spdfg'[shell['l']]} {len(shell['exponents'])} 1.00")
             lines.extend(f"{e:.17g} {c / norm:.17g}" for e, c in zip(shell["exponents"], shell["coefficients"]))
-        if len(d_types) > 1 or not order or centers != set(range(len(geometry["atoms"]))):
-            raise ValueError("Molden requires one d-shell convention and a basis for every atom")
-        lines.extend(["[5D]" if True in d_types else "[6D]", "[MO]"])
+        if any(len(t) > 1 for t in types.values()) or not order \
+                or centers != set(range(len(geometry["atoms"]))):
+            raise ValueError("Molden requires one convention per d, f and g and a basis for "
+                             "every atom")
+        pure_d, pure_f = True in types[2], True in types[3]
+        cart_f = False in types[3]
+        flags = ["[5D10F]" if pure_d and cart_f else "[5D]" if pure_d and not cart_f
+                 else "[7F]" if pure_f else "[6D]"]
+        if types[4]:
+            flags.append("[9G]" if True in types[4] else "[15G]")
+        lines.extend(flags + ["[MO]"])
         generated_labels = 0; nao = len(order)
         for channel in (["alpha", "beta"] if spin == "unrestricted" else [None]):
             payload = metadata[channel] if channel else metadata

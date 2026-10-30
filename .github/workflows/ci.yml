@@ -1,14 +1,10 @@
-# Continuous integration for the public GitHub mirror.
-#
-# .gitlab-ci.yml is the in-house Linux pipeline. This workflow runs the same
-# checks and widens them to macOS, Windows (MSVC) and more Python versions.
-# When a check is added or changed, change both files.
+# Release-candidate qualification for the canonical GitHub repository.
 name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: ['release-candidate/**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,6 +17,7 @@ concurrency:
 jobs:
   # The reference Python writer/reader and the packaging invariants.
   python:
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
     name: python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -33,7 +30,7 @@ jobs:
       matrix:
         # 3.9 is the oldest supported (requires-python), 3.14 the newest.
         # If the runner image ever lacks 3.14, use 3.13 here and say so.
-        # Test the support boundaries; GitLab also checks Python 3.13.
+        # Test the supported Python version boundaries.
         python-version: ["3.9", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +44,7 @@ jobs:
       - name: Install
         run: pip install -e "python/[numpy,validate]" pytest
       # Keep the oldest Python endpoint free of the optional chemistry engine.
-      # Match GitLab's adapter coverage at the accepted minimum PySCF version.
+      # Exercise the accepted minimum PySCF version.
       - name: Install PySCF adapter dependencies
         if: matrix.python-version == '3.14'
         run: pip install --only-binary=pyscf -e "python/[pyscf]" "pyscf==2.14.0"
@@ -61,6 +58,7 @@ jobs:
   # warnings as errors. Warning flags go in through CXXFLAGS (not
   # -DCMAKE_CXX_FLAGS) so CMake keeps its own MSVC defaults such as /EHsc.
   cpp:
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
     name: cpp (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -123,6 +121,7 @@ jobs:
   # -fno-sanitize-recover makes an UBSan finding fail the job rather than only
   # print a diagnostic.
   sanitizers:
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
     name: sanitizers (clang, ASan + UBSan)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -155,6 +154,7 @@ jobs:
   # cpp/qvf_single.hpp is generated; a stale copy silently diverges from the
   # sources an adopter would otherwise vendor.
   js:
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
     name: JavaScript reader (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
@@ -178,6 +178,7 @@ jobs:
         working-directory: js
 
   amalgamation:
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
     name: amalgamation up to date
     runs-on: ubuntu-latest
     timeout-minutes: 10

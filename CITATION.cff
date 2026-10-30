@@ -17,7 +17,7 @@ authors:
     website: "https://vibe-qc.com/"
 version: 0.6.0
 url: "https://vibe-qc.com/docs/qvf/"
-repository-code: "https://github.com/vibe-qc/qvf"
+repository-code: "https://github.com/vibyverse/qvf"
 license: Apache-2.0
 keywords:
   - file format

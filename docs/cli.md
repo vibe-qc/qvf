@@ -251,7 +251,9 @@ trajectory. Scalar cube import/export supports explicit kind and periodic
 endpoint choices. Toolkit 0.6.0 also supports static XSF geometry
 and scalar grids, plus single-model PDB geometry with explicit element
 columns and no alternate locations. The development checkout adds bounded
-molecular Molden conversion; imports require an explicit `--spin` interpretation.
+molecular Molden conversion, where imports require an explicit `--spin`
+interpretation, and PDB atom-site identity, alternate locations and model
+ensembles.
 Every operation returns a conversion report and requires a new output path.
 See [supported subsets and
 examples](converters.md).

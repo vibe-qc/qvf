@@ -13,6 +13,10 @@ implementations. Contributions use this repository's Apache-2.0 license.
 | Libraries and examples | [library guide](docs/library_guide.md), `python/`, `cpp/`, `js/` |
 | Shared contract | `conformance/` |
 
+GitHub (`vibyverse/qvf`) is the canonical development and issue tracker.
+The former GitLab project is a read-only archive. Never merge private
+pre-migration ancestry into public history.
+
 ## Role boundaries
 
 - **Dev/fixers:** develop, run a focused source or functionality check, and push
@@ -54,8 +58,8 @@ do not prevent the daily candidate build; never report unverified science as PAS
   authorized contribution path. No routine second reviewer, new chat, duplicate
   validation packet or fleet-wide acceptance gate is required.
 - Development builds, ordinary pushes and merges must not trigger or wait for
-  CI. Use `[skip ci]` and `git push -o ci.skip` where supported. Full CI belongs
-  to release candidates. Do not request manual, API or scheduled CI on dev refs.
+  CI. Use `[skip ci]`; GitHub does not support GitLab's `ci.skip` push option.
+  Full CI belongs to release candidates. Do not request manual, API or scheduled CI on dev refs.
 - Keep coordination on the issue/MR. Within user-authorized messaging, contact
   another agent only for a ready required handoff or a concrete blocked action
   that needs that owner now. No speculative repair notices, FYIs, broadcasts or

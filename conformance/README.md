@@ -211,6 +211,13 @@ GLY 10A, distinct by `insertion_code`, a `hetero` water, and SER 10 OG at
 alternate locations A and B with occupancies 0.6 and 0.4 as two atoms. A
 consumer that keys residues by chain and number alone merges 10 and 10A.
 
+`structure_secondary_structure.qvf` (#28) holds **typed secondary-structure
+ranges** (spec § 5.1, *Secondary-structure ranges*): a 3-10 helix
+(`helix_class` 5) that starts at residue 10A (`start_insertion_code`), strand 1
+of sheet `S1` whose end residue 14 is absent from the structure (allowed), and
+a coil. A consumer that drops the insertion code starts the helix one residue
+early.
+
 `zip64.qvf` and `data_descriptor.qvf` hold the same calculation (water:
 structure with bonds, `atom_properties`, an IR spectrum) with the same member
 bytes as an ordinary archive; only the container differs. The properties of
@@ -314,7 +321,8 @@ and `reserved_id_crossfade.qvf` (`E_RESERVED_ID`), which every validator
 rejects, and the schema-only `payload_localization_reference_basis_empty.qvf`
 (`E_PAYLOAD_SCHEMA`). The schema-only `structure_occupancy_range.qvf`
 (an atom with `occupancy` 1.5, `E_PAYLOAD_SCHEMA`) covers the atom-site
-identity fields.
+identity fields, and the schema-only `structure_helix_class_on_sheet.qvf` (a
+`sheet` range with a `helix_class`, `E_SCHEMA`) the typed range fields.
 
 The wavefunction rules of spec § 5.3 have three archives:
 `wavefunction_normalization.qvf` (an `overlap` whose `d_xy` diagonal is 1, three

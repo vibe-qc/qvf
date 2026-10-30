@@ -58,7 +58,7 @@ publication is still planned; `qvf-writer` is the distribution name, and
 `qvf` is the import and command name.
 
 ```sh
-python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibe-qc/qvf.git@v0.6.0#subdirectory=python"
+python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibyverse/qvf.git@v0.6.0#subdirectory=python"
 ```
 
 From an existing checkout, use `python -m pip install './python[numpy,validate]'`;

@@ -7,7 +7,7 @@
 site_name: QVF
 site_description: The QVF quantum-chemistry archive format and its toolkit
 site_url: https://vibe-qc.com/docs/qvf/
-repo_url: https://github.com/vibe-qc/qvf
+repo_url: https://github.com/vibyverse/qvf
 edit_uri: ""
 copyright: QVF is Apache-2.0; see LICENSE and NOTICE.
 docs_dir: docs

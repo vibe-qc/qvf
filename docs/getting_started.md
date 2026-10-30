@@ -15,7 +15,7 @@ with Python 3.9 or later and Git:
 python -m venv .venv
 # POSIX shells; on Windows use .venv\Scripts\Activate.ps1 in PowerShell.
 . .venv/bin/activate
-python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibe-qc/qvf.git@v0.6.0#subdirectory=python"
+python -m pip install "qvf-writer[numpy,validate] @ git+https://github.com/vibyverse/qvf.git@v0.6.0#subdirectory=python"
 python -m qvf --version
 ```
 

@@ -234,7 +234,7 @@ the electron count; the stored densities equal PySCF's. An AO evaluator
 written from Appendix A alone, with SciPy's spherical harmonics, reproduces
 every PySCF orbital on random points, which also catches a sign or order
 error inside a spherical shell that the overlap diagonal cannot see.
-Candidate CI installs PySCF 2.14.0 on GitLab's Python 3.13 job and GitHub's
+Candidate CI installs PySCF 2.14.0 on GitHub's
 Python 3.14 job so these tests run; the Python 3.9 job keeps PySCF optional.
 
 `scripts/pyscf_cross_producer.py REFERENCE.qvf` rebuilds the molecule of any

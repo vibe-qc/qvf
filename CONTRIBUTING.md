@@ -1,9 +1,9 @@
 # Contributing to QVF
 
-QVF uses the toolset's existing
-[contribution and verification process](https://github.com/vibe-qc/vibe-qc/blob/main/CONTRIBUTING.md).
-Keep patches focused, explain the expected behavior, and include relevant
-tests and conformance results. QVF contributions are under this repository's
+QVF development, issues and pull requests are hosted at
+[github.com/vibyverse/qvf](https://github.com/vibyverse/qvf).
+Keep patches focused, explain the expected behavior, and include the relevant
+source tests or conformance cases. Contributions use this repository's
 **Apache-2.0** license; see [LICENSE](LICENSE).
 
 Keep real machine configuration, credentials, account names and private
@@ -22,24 +22,23 @@ snapshot. Report security and privacy issues privately per [SECURITY.md](SECURIT
 
 ### Continuous integration
 
-Ordinary development pushes and merges use `[skip ci]` and the supported
-`ci.skip` push option. Run only the focused source checks for a development
-change. Full CI belongs to authorized release candidates, using
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and
-[`.gitlab-ci.yml`](.gitlab-ci.yml). Keep their checks aligned. GitLab runs the
-matrix automatically only on `release-candidate/*`; explicit web qualification
-requires `QVF_FULL_VALIDATION=1`. Main pushes and merge requests do not start
-full GitLab CI. The public GitHub mirror retains its push/PR entry points.
+Ordinary development pushes and merges use `[skip ci]` and focused local
+source checks. Full CI belongs to authorized release candidates. The
+[GitHub workflow](.github/workflows/ci.yml) runs on `release-candidate/*`
+pushes or an explicit manual dispatch on a candidate branch. Main pushes
+and pull requests do not start the full matrix. Do not pass GitLab's
+`ci.skip` push option to GitHub.
+
 Candidate CI checks:
 
-- **Python tests** on the supported endpoints (3.9 and 3.14 on GitHub), with
-  Python 3.13 on GitLab, including the privacy hook self-test. The suite already
+- **Python tests** on the supported endpoints (3.9 and 3.14 on GitHub),
+  including the privacy hook self-test. The suite already
   runs the reference conformance runner over positive, negative and legacy
-  archives; there is no duplicate standalone conformance job. GitLab's 3.13
-  job and GitHub's 3.14 job install PySCF 2.14.0 to exercise the optional
+  archives; there is no duplicate standalone conformance job. The 3.14 job
+  installs PySCF 2.14.0 to exercise the optional
   adapter tests, with OpenMP and BLAS limited to one thread. The 3.9 job
   checks the package without PySCF.
-- **JavaScript tests** on Node 20 and 24 on GitHub and Node 22 on GitLab.
+- **JavaScript tests** on Node 20 and 24 on GitHub.
   `npm test` builds and checks the source once; CI separately checks the script
   and test TypeScript project.
 - **C++ build and tests** on Linux (gcc and clang), macOS (clang) and Windows
@@ -62,10 +61,10 @@ repository root. Run native commands under your native-build lock; keep
 operational logs outside the source tree.
 
 ```sh
-# Python tests (GitHub uses 3.9 and 3.14; GitLab uses 3.13)
+# Python tests (GitHub uses 3.9 and 3.14)
 python .githooks/test_privacy_hook.py -q
 pip install -e "python/[numpy,validate]" pytest
-# Include the optional adapter on the Python 3.13/3.14 candidate jobs:
+# Include the optional adapter on the Python 3.14 candidate job:
 pip install --only-binary=pyscf -e "python/[pyscf]" "pyscf==2.14.0"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 python -m pytest python/tests -q

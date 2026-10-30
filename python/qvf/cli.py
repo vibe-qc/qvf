@@ -67,9 +67,16 @@ def _parser():
     command = commands.add_parser("convert", help="convert XYZ/extXYZ, PDB, XSF, scalar cube or Molden through QVF")
     command.add_argument("input")
     command.add_argument("-o", "--output", required=True)
-    command.add_argument("--from", dest="input_format", choices=("qvf", "xyz", "extxyz", "cube", "xsf", "pdb", "molden"), required=True)
-    command.add_argument("--to", dest="output_format", choices=("qvf", "xyz", "extxyz", "cube", "xsf", "pdb", "molden"), required=True)
+    command.add_argument("--from", dest="input_format", choices=("qvf", "xyz", "extxyz", "cube", "xsf", "pdb", "cif", "mmcif", "poscar", "chgcar", "molden"), required=True)
+    command.add_argument("--to", dest="output_format", choices=("qvf", "xyz", "extxyz", "cube", "xsf", "pdb", "cif", "mmcif", "poscar", "chgcar", "molden"), required=True)
     command.add_argument("--section", help="QVF section to export")
+    command.add_argument("--block", help="CIF/mmCIF import: data block name (without data_)")
+    command.add_argument("--species", nargs="+", metavar="ELEMENT",
+                         help="POSCAR/CHGCAR import: elements of a VASP 4 file, one per count")
+    command.add_argument("--expand-ncs", action="store_true",
+                         help="PDB import: also generate MTRIX copies the file does not give")
+    command.add_argument("--expand-symmetry", action="store_true",
+                         help="PDB import: also write the unit cell with every space-group copy")
     command.add_argument("--kind", help="scalar volume kind asserted on cube/XSF import (default volume.generic)")
     command.add_argument("--periodic", nargs=3, choices=("true", "false"), help="cube/XSF scalar grid periodic axes")
     command.add_argument("--no-endpoint", action="store_true", help="cube import spans n voxels rather than n-1")
@@ -182,15 +189,29 @@ def _execute(args):
             raise ValueError("--kind and --periodic apply only to cube/XSF import")
         if args.input_format != "cube" and args.no_endpoint:
             raise ValueError("--no-endpoint applies only to cube import")
+        if args.input_format not in ("cif", "mmcif") and args.block is not None:
+            raise ValueError("--block applies only to CIF/mmCIF import")
+        if args.input_format not in ("poscar", "chgcar") and args.species is not None:
+            raise ValueError("--species applies only to POSCAR/CHGCAR import")
+        if args.input_format != "pdb" and (args.expand_symmetry or args.expand_ncs):
+            raise ValueError("--expand-symmetry and --expand-ncs apply only to PDB import")
         if args.input_format != "molden" and args.spin is not None:
             raise ValueError("--spin applies only to Molden import")
-        if args.input_format == "qvf" and args.output_format in ("xyz", "extxyz", "cube", "xsf", "pdb", "molden"):
+        if args.input_format == "qvf" and args.output_format in ("xyz", "extxyz", "cube", "xsf", "pdb", "cif", "mmcif", "poscar", "chgcar", "molden"):
             if args.output_format == "cube":
                 result = convert.export_cube(args.input, args.output, section=args.section)
             elif args.output_format == "xsf":
                 result = convert.export_xsf(args.input, args.output, section=args.section)
             elif args.output_format == "pdb":
                 result = convert.export_pdb(args.input, args.output, section=args.section)
+            elif args.output_format == "mmcif":
+                result = convert.export_mmcif(args.input, args.output, section=args.section)
+            elif args.output_format == "chgcar":
+                result = convert.export_chgcar(args.input, args.output, section=args.section)
+            elif args.output_format == "poscar":
+                result = convert.export_poscar(args.input, args.output, section=args.section)
+            elif args.output_format == "cif":
+                result = convert.export_cif(args.input, args.output, section=args.section)
             elif args.output_format == "molden":
                 result = convert.export_molden(args.input, args.output, section=args.section)
             else:
@@ -207,7 +228,17 @@ def _execute(args):
                 result = convert.import_xsf(args.input, args.output, kind=args.kind,
                     periodic=tuple(v == "true" for v in args.periodic) if args.periodic else None)
             elif args.input_format == "pdb":
-                result = convert.import_pdb(args.input, args.output)
+                result = convert.import_pdb(args.input, args.output,
+                                            expand_symmetry=args.expand_symmetry,
+                                            expand_ncs=args.expand_ncs)
+            elif args.input_format == "mmcif":
+                result = convert.import_mmcif(args.input, args.output, block=args.block)
+            elif args.input_format == "chgcar":
+                result = convert.import_chgcar(args.input, args.output, species=args.species)
+            elif args.input_format == "poscar":
+                result = convert.import_poscar(args.input, args.output, species=args.species)
+            elif args.input_format == "cif":
+                result = convert.import_cif(args.input, args.output, block=args.block)
             elif args.input_format == "molden":
                 result = convert.import_molden(args.input, args.output, spin=args.spin)
             else:

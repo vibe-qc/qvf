@@ -1295,7 +1295,7 @@ understand them **MUST** ignore them.
 |---|---|---|
 | `chains` | array of chain-id strings, in presentation order | — |
 | `residues` | array of `{name, seq, chain, insertion_code?, atom_indices}` | `$defs/BiomoleculeResidue` |
-| `secondary_structure` | array of `{type, chain, start_seq, end_seq}`, `type` in `helix`/`sheet`/`coil`, ranges inclusive | `$defs/BiomoleculeSecondaryStructure` |
+| `secondary_structure` | array of `{type, chain, start_seq, end_seq, start_insertion_code?, end_insertion_code?, helix_class?, sheet_id?, strand?}`, `type` in `helix`/`sheet`/`coil`, ranges inclusive | `$defs/BiomoleculeSecondaryStructure` |
 | `b_factors` | array of number, one per atom, parallel to the payload's `atoms` order | — |
 
 `atom_indices` are **0-based** into the `structure` member payload's `atoms`
@@ -1363,6 +1363,35 @@ single conformer, and residues are keyed by (`chain_id`, `residue_seq`) alone.
 
 These fields were added under **v1**: an optional member is the additive case
 and does not bump `qvf_version` (see `GOVERNANCE.md`).
+
+#### Secondary-structure ranges
+
+A `secondary_structure` entry is one inclusive range of residues on one chain.
+Its ends are residues by the key above: (`chain`, `start_seq`,
+`start_insertion_code`) and (`chain`, `end_seq`, `end_insertion_code`), an
+absent insertion code being its own value. So a helix from residue 10A to 20
+starts at the residue with insertion code `A`, not at residue 10. The range
+covers the residues of `chain` from its first to its last residue in chain
+order (the order of `residues`, or of the payload's atoms), which need not be
+numerically monotonic. Five further **OPTIONAL** typed fields carry what PDB
+`HELIX` and `SHEET` records state:
+
+| Field | Type | PDB source | Meaning |
+|---|---|---|---|
+| `start_insertion_code` | non-empty string, no whitespace | HELIX col 26, SHEET col 27 | Insertion code of the first residue. |
+| `end_insertion_code` | non-empty string, no whitespace | HELIX and SHEET col 38 | Insertion code of the last residue. |
+| `helix_class` | integer 1-10 | HELIX cols 39-40 | Helix class: 1 right-handed α, 2 right-handed ω, 3 right-handed π, 4 right-handed γ, 5 right-handed 3₁₀, 6 left-handed α, 7 left-handed ω, 8 left-handed γ, 9 2₇ ribbon/helix, 10 polyproline. |
+| `sheet_id` | non-empty string, no whitespace | SHEET cols 12-14 | The sheet this strand belongs to; strands with equal `sheet_id` form one sheet. |
+| `strand` | integer ≥ 1 | SHEET cols 8-10 | Strand number within its sheet. |
+
+`helix_class` is valid only on a `helix` range, and `sheet_id` and `strand`
+only on a `sheet` range; the schema rejects them elsewhere. Absent means not
+recorded. A range **MAY** name an end that the structure does not contain,
+such as a disordered residue absent from the coordinates; a consumer resolves
+ranges against the residues it has and ignores what it cannot place, without
+rejecting the archive. A consumer that does not understand the five fields
+**MUST** ignore them: the range then reads by `chain`, `start_seq` and
+`end_seq` as before. They were added under **v1**, the additive case.
 
 #### Chemical identity
 

@@ -2,7 +2,8 @@
 
 The `qvf.convert` Python API and `qvf convert` command started in
 toolkit **0.5.0**; XSF and PDB geometry joined in **0.6.0**. The development
-checkout also supports the Molden subset below. They use the standard library;
+checkout also supports the Molden, core-CIF, mmCIF, POSCAR and CHGCAR subsets
+below. They use the standard library;
 NumPy is optional. Install the `validate` extra for JSON Schema checks as well
 as the always-on reference checks.
 
@@ -30,15 +31,38 @@ vary by frame. No molecular charge, multiplicity, energy, job or calculation
 status is inferred. A geometry import alone is not a runnable queue job;
 add an explicit request as described in the [family workflow](family_workflow.md).
 
-The supported extXYZ geometry subset has `Properties=species:S:1:pos:R:3`
-(or the two property groups reversed), optional `Lattice` with nine quoted,
-space-separated row-vector components in angstrom, and optional `pbc` with
-three booleans. With a cell and no `pbc`, all axes are periodic; with neither,
-all are nonperiodic. This follows the [extXYZ geometry conventions](https://github.com/libAtoms/extxyz#reading-aseatomsatoms-from-this-format).
-Other header properties, atom columns and array syntaxes are refused. Plain
-XYZ comments are counted as omitted, not copied into archive metadata.
+extXYZ `Properties` is read as `name:type:count` triplets (types `S`, `R`,
+`I`, `L`) and must include `species:S:1` and `pos:R:3`, in any order. Optional
+`Lattice` has nine quoted, space-separated row-vector components in angstrom,
+and optional `pbc` has three booleans. With a cell and no `pbc`, all axes are
+periodic; with neither, all are nonperiodic. This follows the [extXYZ
+conventions](https://github.com/libAtoms/extxyz#reading-aseatomsatoms-from-this-format).
+
+The usual calculator results are kept (Unreleased, #39), converted from the
+ASE units extXYZ uses to atomic units:
+
+* the header `energy` (eV) becomes, for one frame, the root
+  `energies.total` (hartree), and for several frames, the trajectory metadata
+  `energies` when every frame has one;
+* the `forces:R:3` column (eV/Å) becomes the energy gradient (hartree/bohr,
+  negated): for one frame a `forces` section for the structure, and for
+  several frames the trajectory `gradient` member when every frame has
+  forces;
+* the header `stress` (nine values, eV/Å³, the ASE sign convention) becomes
+  that section's `stress` (hartree/bohr³) for one periodic frame.
+
+A `Z:I:1` column must agree with the species. Other per-atom columns, such
+as `tags` or `magmoms`, and other header keys, such as `config_type`, are
+parsed and reported in `omitted`, not refused or stored. So are energies or
+forces that only some frames carry, and the stress of a trajectory. Plain XYZ
+comments are counted as omitted, not copied into archive metadata.
 Unknown/ghost symbols, nonfinite values and degenerate periodic cells are
 refused. Plain XYZ export refuses cells or periodicity; extXYZ retains them.
+extXYZ export also writes `energy`, a `forces` column and `stress` in eV
+units: for a structure, from the root energies when it is the archive's
+first structure and from the one `forces` section assigned to it; for a
+trajectory, from its metadata `energies` and `gradient` member. ASE reads
+them back with the same values.
 
 An archive with more than one structure/trajectory candidate requires
 `--section ID`, including an imported multi-frame archive. This avoids
@@ -96,8 +120,18 @@ It accepts one primitive geometry (`PRIMVEC`/`PRIMCOORD`) with `CRYSTAL`,
 `MOLECULE`. Periodic structure axes must be the leading cell axes (three,
 two or one respectively); the converter never permutes axes. Atom identities
 may be symbols or atomic numbers. Positions and cell rows remain angstrom.
+Atom rows may carry forces (`Fx Fy Fz` in hartree/Å, the XSF convention) on
+every row or none; they become a `forces` section whose gradient is in
+hartree/bohr (negated). Structure export writes the forces of the one
+`forces` section assigned to the structure back, and ASE reads them with the
+same values. `CONVVEC` and `CONVCOORD` (the conventional cell) are accepted,
+checked and reported in `conventional_cell_omitted`; the primitive geometry
+is the one imported.
 
-One named scalar `DATAGRID_3D` in one block is supported. Grid origin and
+Every named scalar `DATAGRID_3D`, in one or several `BEGIN_BLOCK_DATAGRID_3D`
+blocks, becomes its own volume section (`volume`, `volume_2`, …) labelled
+`<block>/<grid>`; `--kind` and `--periodic` apply to all of them, and the
+report's `grids` lists them. Grid origin and
 spanning vectors convert from angstrom to bohr. Each voxel row is its span
 divided by `n - 1`, so both boundary planes remain present. Values move from
 XSF's X-fastest order to QVF's Z-fastest order without changing samples.
@@ -114,47 +148,428 @@ Export reports kind and field periodicity because XSF cannot encode those
 QVF declarations; supply them again when reimporting. On nonperiodic axes,
 QVF's endpoint flag has no effect; XSF always retains the sampled extent.
 
-Animation, forces, conventional-cell sections, multiple grids/blocks, 2D
-and band grids, degenerate boxes and unknown records are refused. Comments
-between sections and grid labels are reported as omitted. A nonperiodic
+Animation (`ANIMSTEPS`), 2D and band grids, empty grid blocks, degenerate
+boxes and unknown records are refused. Comments between sections are
+reported as omitted. A nonperiodic
 structure with a cell cannot be exported by this molecular subset. As with
 other converters, a file containing both a structure and a grid requires
 `--section` on export. No charge, multiplicity or job is inferred.
 
-## PDB geometry (toolkit 0.6.0)
+## PDB structures (toolkit 0.6.0; atom-site identity Unreleased)
 
 ```sh
-qvf convert molecule.pdb --from pdb --to qvf -o geometry.qvf
-qvf convert geometry.qvf --from qvf --to pdb -o geometry-export.pdb
+qvf convert molecule.pdb --from pdb --to qvf -o structure.qvf
+qvf convert crystal.pdb --from pdb --to qvf --expand-symmetry -o crystal.qvf
+qvf convert virus.pdb --from pdb --to qvf --expand-ncs -o virus.qvf
+qvf convert structure.qvf --from qvf --to pdb -o structure-export.pdb
 ```
 
 This bounded subset follows the [wwPDB coordinate records](https://www.wwpdb.org/documentation/file-format-content/format33/sect9.html)
 and [fixed-column conventions](https://www.wwpdb.org/documentation/file-format-content/format33/sect1.html).
-Import retains only explicit elements (columns 77–78) and Cartesian angstrom
-coordinates (columns 31–54, `Real(8.3)`) from `ATOM` and `HETATM`, in source
-order. Names such as `CA` never determine the element. ASCII records, unique
-positive decimal serials and recognized element symbols are required;
-isotope labels such as `D`, hybrid-36 serials and missing elements are refused.
+Import reads `ATOM` and `HETATM` records in source order: explicit elements
+(columns 77–78) and Cartesian angstrom coordinates (columns 31–54,
+`Real(8.3)`). Names such as `CA` never determine the element. ASCII records,
+unique positive decimal serials within a model and recognized element
+symbols are required; isotope labels such as `D`, hybrid-36 serials or
+residue numbers, and missing elements are refused.
 
-One geometry is accepted, optionally enclosed in one `MODEL`/`ENDMDL` pair.
-Every nonblank alternate-location indicator and every multi-model ensemble
-is refused; prepare a deliberately selected conformation/model externally.
-No highest-occupancy or first-model choice occurs. Occupancy does not filter
-atoms. The report counts omitted metadata records and atom-charge fields;
-it also lists dropped atom/residue/chain names, occupancy and temperature
-factors. Standard metadata such as `CONECT`, `CRYST1` and symmetry records
-is reported but not interpreted. Unknown records fail. Output is nonperiodic:
-no cell, bonds, assembly, protonation, charge, multiplicity or job is inferred.
-Keep the original PDB for biomolecular and crystallographic information.
+Toolkit 0.6.0 kept only elements and coordinates and refused alternate
+locations and ensembles. The development checkout also keeps each atom's
+atom-site identity in the typed fields of spec § 5.1 (*Biomolecular atom
+identity*):
+
+| PDB columns | Per-atom field |
+|---|---|
+| 13–16 | `atom_name` |
+| 17 | `alt_loc` |
+| 18–20 | `residue_name` |
+| 22 | `chain_id` |
+| 23–26 | `residue_seq` (signed decimal) |
+| 27 | `insertion_code` |
+| 55–60 | `occupancy` (0 to 1; outside is refused) |
+| 61–66 | `b_factor` |
+| `ATOM` / `HETATM` | `hetero` (`false` / `true`) |
+
+`HELIX` and `SHEET` records become the section's `secondary_structure` ranges
+(spec § 5.1, *Secondary-structure ranges*), in file order: `helix` ranges with
+their `helix_class` (columns 39–40, 1–10) and `sheet` ranges with `sheet_id`
+(columns 12–14) and `strand` (columns 8–10). Each end keeps its insertion code
+as `start_insertion_code` / `end_insertion_code`, so a helix from 10A starts at
+10A. A range must start and end on one chain. A range whose end is not among
+the imported residues, such as a disordered loop, is kept as written; the
+report counts these in `secondary_structure_unresolved`. Helix identifiers,
+comments and lengths, and strand sense and registration, are not kept.
+
+`CONECT` records become the structure section's own `bonds` member
+(`$defs/BondsPayload`, spec § 5.1): each distinct pair of bonded atoms is one
+bond, as 0-based atom positions, sorted. PDB defines no bond order, so
+`order` stays absent (meaning 1). A pair listed again from the same atom, a
+convention some tools use for multiple bonds, is counted in
+`conect_repeated_listings` and not read as an order. A `CONECT` that names a
+serial with no atom, or bonds an atom to itself, refuses the import. The
+obsolete hydrogen-bond and salt-bridge columns 32–61 are counted in
+`conect_hydrogen_bond_fields_omitted`. In an ensemble written as one structure
+per model, serials resolve within each model, and a serial missing from any
+model refuses the import. In the structure-plus-trajectory case the bonds sit
+on the structure, which names every frame's atoms.
+
+`SSBOND` and `LINK` records add their bonds to the same member, merged with
+the `CONECT` pairs, again without an order. Which record listed a bond is not
+kept; the report's `ssbond` and `link` give each record count, the distinct
+bonds it resolved to, and how many of those `CONECT` also lists. Atoms
+resolve by atom-site identity: chain, residue number, insertion code, residue
+name and atom name, with `SSBOND` naming the `SG` atom of each cysteine. A
+blank alternate location names every alternate of the atom, and a given one
+names that alternate, or the atom if it has no alternates; alternates bond
+only to the same alternate or to an atom without alternates, so a disulfide
+between two two-conformer cysteines is two bonds, A–A and B–B. An atom that
+is absent or ambiguous, a self-bond, or two ends with no common alternate
+refuses the import. A bond pair cannot point to a periodic image, so a record
+whose symmetry operator is not `1555` (blank means `1555`) is skipped and
+counted, with its operators, in `symmetry_mate_bonds_skipped`. Serial
+numbers and the distance column are not kept. Ensembles resolve the records
+within each model, as for `CONECT`.
+
+A `CRYST1` cell makes the structure periodic: `lattice_vectors` in the PDB
+standard orientation (a along x, b in the xy-plane, c completing a
+right-handed cell) and `pbc` `[true, true, true]`. A `structure.symmetry`
+section (`symmetry`, or `symmetry_<section>` per model) names the structure
+and records the CRYST1 space group as `space_group_symbol`. PDB coordinates
+are usually the asymmetric unit: symmetry mates are **not** generated, and the
+report's `cell` says so and gives Z. The wwPDB placeholder
+`1.000 1.000 1.000 90.00 90.00 90.00 P 1` (Z 1 or blank), written by NMR,
+cryo-EM and model files, means no cell: the structure stays nonperiodic and
+`placeholder_cell` is true. `SCALE1`–`SCALE3`, when present, must equal the
+standard orthogonalization of the cell (relative tolerance 1e-4) with zero
+translation. A different matrix puts the coordinates in another frame, so it
+refuses the import, as do SCALE records without CRYST1, a second CRYST1, or
+angles that describe no cell. In an ensemble every model gets the cell; the
+structure-plus-trajectory case also writes a per-frame `lattice` member.
+
+Each `REMARK 350` biomolecule becomes its own nonperiodic `structure` section,
+`assembly_<n>`, labelled `Biological assembly <n>`; the deposited structure is
+left unchanged. QVF has no field for assembly operators, so the assembly is
+written out: every `BIOMT` operator of an `APPLY THE FOLLOWING TO CHAINS`
+block (with its `AND CHAINS` continuations) is applied to the atoms of those
+chains, block by block and operator by operator, with coordinates rounded to
+1e-6 Å. A copy under an identity operator keeps its chain id; any other copy
+is named `<chain>-<BIOMT serial>`, such as `A-2`, so each atom's origin stays
+readable and residues stay distinct. Atom-site identity is copied, bonds are
+copied when both atoms are in the same copy, and secondary-structure ranges
+are copied to the renamed chains. Assemblies are built from the first model
+of an ensemble. The report's `assemblies` gives each section, its atom count
+and its copies with chains and the 3×4 operator `[R | t]`; the operators are
+not stored in the archive. An operator that is not a proper rotation, a
+missing `BIOMT` row, a chain with no atoms, or a chain copied twice under one
+name refuses the import. Other `REMARK 350` lines, such as how the unit was
+determined, are not kept.
+
+`MTRIX` records (non-crystallographic symmetry) are counted in the report's
+`mtrix`. With `iGiven` 1 the copy is already in the file. When a copy is not
+given, the file holds only part of the asymmetric unit: the structure stays
+as deposited, NCS copies are not generated, no assembly is built, and
+`assemblies_not_built` says why. An `MTRIX` operator that is not a proper
+rotation, or whose rows disagree on `iGiven`, refuses the import.
+
+Generating the missing copies is opt-in: `import_pdb(..., expand_ncs=True)`
+or `--expand-ncs`. Each `MTRIX` operator whose copy is not given (skipping an
+identity) is applied to the deposited atoms of the first model,
+x′ = R x + t. The deposited atoms followed by the copies form a new
+`structure` section, `asymmetric_unit`, labelled
+`Asymmetric unit (MTRIX copies generated)`, with the deposited cell and its
+own `structure.symmetry` section; the deposited structure is unchanged.
+Copied chains are named `<chain>-<MTRIX serial>`, and bonds and
+secondary-structure ranges are copied with them. `REMARK 350` assemblies
+and the opt-in unit-cell expansion are then built from this completed
+asymmetric unit instead of being blocked. Assemblies still apply their
+`BIOMT` operators only to the chains `REMARK 350` lists. The report's
+`ncs_expansion` gives the section, its atom count and each operator. The
+copies agree with gemmi's `expand_ncs`.
+
+Crystal symmetry expansion is opt-in: `import_pdb(..., expand_symmetry=True)`
+or `qvf convert --from pdb --to qvf --expand-symmetry`. It adds a periodic
+`structure` section, `unit_cell`, labelled `Unit cell (<group> expanded)`,
+with the deposited lattice and every copy of the first model under the
+space group's operators, plus a `structure.symmetry` section
+`symmetry_unit_cell` recording `P 1`; the deposited structure is unchanged.
+Each copy is shifted by whole lattice vectors so its fractional centre lies
+in [0, 1), so molecules stay intact. The operators come from a built-in Hall
+symbol parser (Hall, 1981) and cover the 65 chiral space groups under their
+wwPDB names, with the settings `I 1 2 1`, `A 1 2 1`, the other axis orders of
+`P 2 2 21` and `P 21 21 2`, `H 3`/`H 3 2` (hexagonal axes) and `R 3`/`R 3 2`
+(rhombohedral axes), and the short `P 2`, `P 21`, `C 2` and `I 2`. Every
+table entry is checked against gemmi. Copy 1 is the identity and keeps its
+chains; copy *n* is named `<chain>-<n>` (`-<n>` for a blank chain). Identity,
+bonds within each copy and secondary-structure ranges are copied. A copy of
+an atom that lands within 0.1 Å of an earlier copy of the same atom, modulo
+the lattice (an atom on a symmetry element), is merged and counted in
+`special_position_atoms_merged`; a bond to it is kept when the two copies
+coincide in place and otherwise counted in `bonds_dropped`. The report's
+`symmetry_expansion` gives the group, Hall symbol, operator and atom counts.
+Expansion is refused without a real `CRYST1` cell, for a space group outside
+the table, and when an `MTRIX` copy is not given unless `expand_ncs`
+generates it first. A large cell can hold
+hundreds of thousands of atoms: 5,000 atoms in `F 41 3 2` (96 operators)
+take about 30 s and 21 MB.
+
+A blank column is left absent, never written as a placeholder. When every
+atom has a residue name and number, the section also lists `chains` (first
+appearance order, blank chain ids excluded) and `residues` in file order,
+keyed by (chain, residue number, insertion code). So residues 10 and 10A are
+two residues, and a site whose alternate locations carry different residue
+names is one. Every alternate location is its own atom with its own
+occupancy. Nothing is selected or dropped by `alt_loc` or occupancy; select a
+conformer in the consumer, as a view.
+
+One `MODEL`/`ENDMDL` block, or none, gives one `structure`. A multi-model
+ensemble is imported whole. When every model has the same ordered atoms with
+the same per-atom metadata, model 1 is the `structure` and a `trajectory`
+(`structure_ref: "structure"`) holds every model's coordinates, with the model
+serials in its metadata `model_serials`. Otherwise each model is its own
+`structure` section, `model_<serial>`, labelled `MODEL <serial>`. A `NUMMDL`
+record must agree with the model count, and atoms outside `MODEL`/`ENDMDL`
+are refused once models are used.
+
+The report gives the sections written, the model serials, the number of
+alternate-location atoms, whether residues were listed, counts of omitted
+metadata records, atom-charge fields, and the secondary-structure ranges.
+Every model's structure section carries the same ranges. Standard metadata
+such as `ORIGX`, `SEQRES`, `CISPEP` and other `REMARK` records is counted but
+not interpreted, and unknown records fail. No crystal symmetry expansion
+(unless requested), NCS copy, bond order, protonation, charge, multiplicity or job is inferred. Atom serials, segment identifiers and atom charges are not kept.
+Keep the original PDB for crystallographic and deposition information.
 
 Export selects one structure, with `--section` required if a trajectory or
-another structure is also present. Trajectories, cells and periodicity are
-refused. It writes up to 9,999 atoms as synthetic `HETATM` records: one `UNL`
-residue per atom, element-based names, occupancy 1.00 and temperature factor
-0.00. These are placeholders, not biological or experimental metadata.
-Coordinates round to 0.001 angstrom; the report gives the maximum rounding
-error. Values that overflow the eight-column fields are refused. This is a
-geometry interchange file, not a deposition-ready PDB or a metadata round trip.
+another structure is also present; for an imported ensemble, export one
+model at a time. Trajectories are refused. A structure periodic on all three
+axes is exported with `CRYST1` and `SCALE1`–`SCALE3` when its lattice is in
+the PDB standard orientation (off-diagonal upper entries within 1e-4 Å, a
+positive diagonal). The space group comes from a `structure.symmetry` section
+assigned to it, else `P 1`. The report gives the space group and the largest
+cell rounding error. A rotated lattice, partial periodicity, or a cell
+without periodicity is refused; coordinates are never rotated, and extXYZ
+remains the export for those. When every
+atom has `atom_name`, `residue_name` and `residue_seq`, export writes the
+identity back: `HETATM` for atoms marked `hetero` (otherwise `ATOM`), the
+standard atom-name alignment, chain, insertion code, alternate location, and
+occupancy and temperature factor, left blank where the archive records none.
+The section's `helix` and `sheet` ranges become `HELIX` and `SHEET` records
+before the atoms, with residue names taken from the atoms (blank for an end
+the structure does not contain). Strand 1 gets sense 0 and other strands a
+blank sense; a sheet range without `sheet_id` becomes its own one-strand
+sheet. `coil` ranges have no PDB record and are counted in
+`coil_ranges_omitted`.
+
+Both forms of export write the structure's bonds as `CONECT` records after
+the atoms. The bonds are the structure's own `bonds` member plus every
+`bonds` section that § 5.1 assigns to it. Each bond is listed from both
+atoms, four partners per record, by sequential serial. Bond orders are not
+written: the report counts orders other than 1 in `bond_orders_not_written`,
+and the remark says `CONECT, NO BOND ORDERS`. A bond whose atom index is
+outside the structure is refused. With atom-site identity, export also writes
+a bond between different residues as `SSBOND` when it joins the `SG` atoms
+of two cysteines (one record per residue pair, so the two conformer bonds
+of a disulfide become one record) and as `LINK`, with alternate locations,
+when another such bond involves a hetero atom. Both come before the atoms,
+with operators `1555` and the bond distance as the length; the report counts
+them in `ssbond_records` and `link_records`. Peptide and other bonds between
+standard residues stay `CONECT` only. gemmi reads both back as connections.
+It writes up to 99,999 atoms with sequential serials. Values that do not fit
+their columns are refused rather than truncated: names over four characters,
+residue names over three, multi-character chain ids (so an assembly with
+copied chains such as `A-2` is refused; export it to extXYZ instead), or
+residue numbers outside −999..9999. `REMARK 350` is not written. Importing that file again reproduces the structure
+payload and its `chains`/`residues`. A structure without that identity is
+written as before: up to 9,999 synthetic `HETATM` records, one `UNL` residue
+per atom, element-based names, occupancy 1.00 and temperature factor 0.00.
+These are placeholders, not biological or experimental metadata. Coordinates
+round to 0.001 angstrom, and the report gives the maximum rounding error and
+whether atom-site identity was written. Neither output is a deposition-ready
+PDB.
+
+## Crystal CIF structures (Unreleased)
+
+```bash
+qvf convert crystal.cif --from cif --to qvf -o crystal.qvf
+qvf convert several.cif --from cif --to qvf --block rutile -o rutile.qvf
+qvf convert crystal.qvf --from qvf --to cif -o crystal-p1.cif
+```
+
+Import reads core crystallographic CIF 1.1, the small-molecule and inorganic
+dialect: the syntax with comments, quoted values and semicolon text fields,
+data blocks and loops. `save_` frames and `global_` blocks are refused, and
+mmCIF (PDBx) categories are not interpreted. One data block is imported: the
+only one with an `_atom_site_label` loop, or the one named by `block=` /
+`--block` (case-insensitive, without `data_`). Several candidates without a
+choice refuse the import.
+
+The block needs the six `_cell_length_*` / `_cell_angle_*` values and an
+atom-site loop with `_atom_site_label`, `_atom_site_type_symbol` and
+`_atom_site_fract_x`/`y`/`z`; sites given only in Cartesian coordinates are
+refused. A number's standard uncertainty, as in `4.5937(3)`, is dropped. The
+element comes from `_atom_site_type_symbol` with any charge stripped (`Fe3+`
+is Fe, counted in `charges_omitted`); a missing or non-element type symbol
+refuses the import, because no element is guessed from labels. The label
+becomes the atom's `atom_name`, `_atom_site_occupancy` its `occupancy` (in
+(0, 1]; partial sites are counted in `partial_occupancy_sites`), and
+`_atom_site_B_iso_or_equiv`, or 8π² × `_atom_site_U_iso_or_equiv`, its
+`b_factor`. Every site is imported; disordered alternatives are not resolved.
+
+The structure is the whole unit cell. The symmetry operations come from
+`_space_group_symop_operation_xyz` (or the older `_symmetry_equiv_pos_as_xyz`).
+They must be distinct, include `x,y,z` and form a group. Otherwise they come
+from `_space_group_name_Hall` (or `_symmetry_space_group_name_Hall`) through
+the built-in Hall-symbol parser, which reproduces gemmi's operators for all
+564 settings in its table. Without either, only a group named `P 1` (or
+number 1) is accepted. Each operation is applied to each fractional site and
+the result is wrapped into [0, 1). An image within 0.1 Å (minimum image) of
+an earlier image of the same site, a site on a special position, is merged and
+counted in `special_position_atoms_merged`. Different sites at one place are
+kept. The lattice is in the standard orientation (a along x, b in the
+xy-plane) with `pbc` `[true, true, true]`, and Cartesian positions are rounded
+to 1e-6 Å. A `structure.symmetry` section `symmetry` keeps the space-group
+symbol, number and Hall symbol the block gives. The report gives the block,
+the operator count and source (`listed`, `hall` or `p1`), the atom count and
+the number of other tags not read (`unused_tags`). Bonds, anisotropic
+displacement, geometry tables and experimental metadata are not kept.
+
+Export writes one structure periodic on all three axes as a P 1 CIF: the
+cell lengths and angles (6 decimals), the identity operation and fractional
+coordinates (8 decimals) for every atom, with `_atom_site_occupancy` and
+`_atom_site_B_iso_or_equiv` columns when any atom has them (`?` where one
+does not). Labels are the atoms' `atom_name` values when they are unique and
+CIF-safe, else element plus a running number (`Ti1`, `O1`, …); the report
+says which. Any lattice orientation is accepted, but a reader places the cell
+in its own standard orientation, so Cartesian coordinates may come back
+rotated; the report gives the largest coordinate rounding error. A
+structure without full periodicity is refused. gemmi reads the export back,
+and importing it again reproduces the positions.
+
+## mmCIF (PDBx) structures (Unreleased)
+
+```bash
+qvf convert 1abc.cif --from mmcif --to qvf -o 1abc.qvf
+qvf convert 1abc.qvf --from qvf --to mmcif -o 1abc-export.cif
+```
+
+Import reads one mmCIF data block with an `_atom_site` category: the only
+one, or the one named by `block=` / `--block`. It uses the CIF syntax rules
+of the core-CIF import. Each `_atom_site` row becomes an atom with the PDB
+atom-site identity of spec § 5.1. The author columns are preferred, as in
+PDB files: `auth_atom_id`, `auth_comp_id`, `auth_seq_id` and `auth_asym_id`,
+falling back to the `label_*` columns. With them come `pdbx_PDB_ins_code`,
+`label_alt_id`, `occupancy`, `B_iso_or_equiv` and `hetero` from `group_PDB`.
+The element comes only from `type_symbol`, and positions from
+`Cartn_x`/`y`/`z`. Rows are grouped by `pdbx_PDB_model_num` and follow the
+PDB ensemble rules: one structure, a structure plus a `trajectory` when every
+model has the same atoms and metadata, or one `model_<n>` section per model.
+`_cell` with `_symmetry.space_group_name_H-M` (or
+`_space_group.name_H-M_alt`) becomes the periodic cell and
+`structure.symmetry` section exactly as `CRYST1` does, including the
+placeholder rule. `_struct_conf` helices (`HELX_*`) and `_struct_sheet_range`
+strands become `secondary_structure` ranges with insertion codes, helix
+class, sheet id and strand number; other `_struct_conf` types, such as turns,
+are counted. `_struct_conn` `disulf`, `covale` and `metalc` connections become
+bonds resolved like `SSBOND` and `LINK`. `hydrog` rows are counted in
+`hydrogen_bonds_omitted`, and connections to a symmetry mate (an operator
+other than `1_555`) in `symmetry_mate_bonds_skipped`. Assemblies
+(`pdbx_struct_assembly_gen`), entities, label numbering and the rest of the
+dictionary are not interpreted. A gemmi-written mmCIF of a PDB file imports
+to the same structure, residues and symmetry as the PDB import of that file.
+
+Export writes one structure as an `_atom_site` loop. The label columns repeat
+the author identity, ids are sequential, the model number is 1, and Cartesian
+coordinates have 4 decimals. A structure periodic on all three axes, with its
+lattice in PDB orientation, also gets `_cell` and
+`_symmetry.space_group_name_H-M` (from its `structure.symmetry`, else
+`P 1`). Values are quoted as CIF requires. Unlike PDB, there is no limit on
+chain-id length or atom count, so an assembly with copied chains such as
+`A-2` can be exported. Bonds and secondary structure are not written. gemmi
+reads the export back, and importing it again reproduces the structure.
+
+## VASP POSCAR/CONTCAR structures (Unreleased)
+
+```bash
+qvf convert POSCAR --from poscar --to qvf -o cell.qvf
+qvf convert POSCAR-vasp4 --from poscar --to qvf --species Ga N -o cell.qvf
+qvf convert cell.qvf --from qvf --to poscar -o POSCAR.out
+```
+
+Import reads one VASP POSCAR or CONTCAR as a periodic `structure`
+(`pbc` `[true, true, true]`), labelled with the comment line. The scale line
+is one factor, a negative value giving the cell volume in Å³, or three
+per-axis factors (VASP 6); the lattice rows, and Cartesian positions, are
+multiplied by it. Elements come from the VASP 5 species line, where POTCAR
+labels such as `Ga_d` or `Si/1a2b` reduce to their element. A VASP 4 file,
+with counts only, needs `species=` / `--species`, one element per count; it is
+never guessed from the comment. A species line that disagrees with
+`species=` refuses the import. Positions are Direct (fractional) unless the
+mode line starts with C or K (Cartesian), as in VASP. Trailing labels on a
+position line are ignored.
+
+`Selective dynamics` flags have no per-axis QVF field. An atom fixed on all
+three axes (`F F F`) goes into the root `constraints.frozen_atoms` (spec
+§ 3.3), which optimizers read; an atom fixed on only some axes is counted in
+`partially_fixed_atoms_omitted` and not stored. A CONTCAR's velocity block,
+with or without a coordinate-mode line, must have a row of three numbers per
+atom. It is reported in `velocities_omitted` and not stored. A
+`Lattice velocities and vectors` block is reported too, and the
+predictor-corrector lines after the velocities are counted. Any other
+content after the positions refuses the import, as do zero or missing
+counts, a zero scale, linearly dependent lattice vectors, malformed flags and
+too few position lines. Magnetic moments, charge and the job are not
+inferred.
+
+Export writes one structure periodic on all three axes in VASP 5 layout:
+the section label (or id) as comment, scale `1.0`, the archive's lattice
+rows unrotated, and Direct coordinates with 10 decimals in archive order.
+The species and count lines have one entry per consecutive run of an
+element, so `Si O Si` is written as three runs rather than reordered. When
+the archive's root `constraints.frozen_atoms` applies, because the exported
+structure is the archive's first, the file gets `Selective dynamics` with
+`F F F` for those atoms and `T T T` for the rest. Constraints that cannot be
+written are listed in `constraints_not_written`. The report gives the
+species runs and the largest coordinate rounding error. ASE reads the export
+back with the same cell, positions and fixed atoms, and ASE-written POSCAR
+files import to the same structure.
+
+## VASP CHGCAR charge densities (Unreleased)
+
+```bash
+qvf convert CHGCAR --from chgcar --to qvf -o density.qvf
+qvf convert density.qvf --from qvf --to chgcar -o CHGCAR.out
+```
+
+CHGCAR, CHG, AECCAR0/1/2 and PARCHG share one layout, and all import the
+same way. The POSCAR head becomes the periodic `structure` under the POSCAR
+rules above, including `species=` / `--species` for a VASP 4 head and
+`frozen_atoms` from Selective dynamics. Each grid follows a line with its
+three point counts; its values are ρ·V_cell (V in Å³), x fastest. The first
+grid becomes the `volume.density` section `density` in e/bohr³ (divided by
+the cell volume in bohr³). Its grid is periodic on all three axes, starts at
+the origin and has `includes_endpoint` false, so `voxel_vectors[a]` is
+lattice vector a over `shape[a]` (spec § 5.2). A spin-polarized file has a
+second grid, the magnetization density ρ↑ − ρ↓, which becomes the
+`volume.spin` section `magnetization` in the same unit. A noncollinear file
+has three more grids (mx, my, mz), which become one `volume.vector` section
+`magnetization` of shape `[nx, ny, nz, 3]`. Any other number of grids, grids
+of different shapes, or too few values refuse the import. PAW augmentation
+occupancies and per-atom moment lines between grids are skipped and counted
+in `lines_skipped`. The report gives the spin case, the cell volume, the
+integrated electron count (`electrons`, the mean of ρ·V over the grid) and
+the integrated magnetization. Grids are limited to five million points.
+
+Export selects one `volume.density` whose grid spans its periodic structure
+CHGCAR-style: periodic on all three axes, origin at 0, `includes_endpoint`
+false and `voxel_vectors[a] × shape[a]` equal to lattice vector a. Other
+grids are refused. The structure is written as in the POSCAR export, then
+the density as ρ·V_cell, five values per line. A single `volume.spin` or
+`volume.vector` section on the identical grid is appended as the
+magnetization; with several candidates none is written, and the report
+lists them. No augmentation occupancies are written, so the file is for
+analysis and visualization tools, not a VASP restart. ASE's
+`VaspChargeDensity` reads the export back with the same densities, and
+ASE-written CHGCAR files import to the same grid.
 
 ## Molecular Molden orbitals (Unreleased)
 
@@ -165,8 +580,15 @@ qvf convert orbitals.qvf --from qvf --to molden --section wavefunction -o orbita
 
 This subset follows the [Molden format description](https://www.theochem.ru.nl/molden/molden_format.html)
 for molecular geometry, atom-centered Gaussian contractions and real orbitals.
-It supports `s`, `p`, combined `sp`, spherical `5D` and Cartesian `6D` shells.
-The default d convention is Cartesian; explicit spherical flags are honored.
+It supports `s`, `p`, combined `sp`, `d`, `f` and `g` shells, each spherical
+or Cartesian. The default is Cartesian; `[5D]` and `[5D7F]` make d and f
+spherical, `[5D10F]` makes d spherical and keeps f Cartesian, `[7F]` makes f
+spherical, and `[9G]` / `[15G]` make g spherical or Cartesian (Unreleased,
+#41 for f and g). Conflicting flags are refused. Spherical components in
+Molden order (m = 0, +1, −1, …, +l, −l) map to QVF's m = −l … +l without sign
+changes. Cartesian components in Molden's `10F`/`15G` orders map to QVF's
+lexicographic order, rescaled from Molden's unit-normalized components to
+QVF's axial normalization (Appendix A.1).
 Atoms need sequential indices and matching element/nuclear-charge values.
 Coordinates require `AU` or `Angs`; basis exponents and orbital energies use
 atomic units. Every orbital needs `Sym`, `Ene`, `Spin`, `Occup` and one real
@@ -189,12 +611,14 @@ contractions and compensates MO coefficients so orbital values are preserved;
 it does not orthogonalize orbitals or claim a wavefunction is physically valid.
 Export writes coordinates in bohr to avoid a second angstrom conversion.
 
-ECP/core sections, ghosts, Slater functions, f and higher shells, complex or
+ECP/core sections, ghosts, Slater functions, h and higher shells, complex or
 spinor coefficients, periodic geometry, transition-weight occupations and
 unknown sections are refused. Non-unit shell scale factors and unnormalized
 input contractions are refused instead of guessing a producer's dialect.
 Export requires a basis for every atom, contiguous shells per atom and one
-d convention. More than one wavefunction requires `--section`.
+convention each for d, f and g, and writes the matching flags. PySCF-written
+f and g files give the same orbital values at off-axis points after import
+and after export. More than one wavefunction requires `--section`.
 
 Import reports omitted comments/title text. Export reports its selected spin,
 contraction norms, omitted sections/members and generated `A` symmetry labels
@@ -210,7 +634,9 @@ from qvf.convert import import_xyz, export_xyz, import_cube, export_cube
 # Since toolkit 0.6.0:
 from qvf.convert import import_xsf, export_xsf, import_pdb, export_pdb
 # In the development checkout (Unreleased):
-from qvf.convert import import_molden, export_molden
+from qvf.convert import import_molden, export_molden, import_cif, export_cif
+from qvf.convert import import_poscar, export_poscar, import_chgcar, export_chgcar
+from qvf.convert import import_mmcif, export_mmcif
 
 report = import_xyz("molecule.xyz", "molecule.qvf")
 report = export_xyz("molecule.qvf", "geometry.xyz", extended=True)
@@ -224,7 +650,7 @@ values to five million; Molden limits coefficient matrices to five million
 entries and contractions to 512 primitives each.
 These initial converters parse bounded inputs in memory; they are not a
 replacement for the streaming QVF reader/writer for large datasets. QVF
-reader limits also apply on export. Unsupported formats remain in WP-48:
-POSCAR/CHGCAR and CIF; broader Molden dialects, richer extXYZ properties and
-biomolecular PDB metadata mappings also remain future work. No QVF schema, canonical kind or
-finding code changes.
+reader limits also apply on export. Remaining WP-48 work: Molden h shells
+and ECP sections, XSF animation, bonds to symmetry mates, centrosymmetric
+space groups in the PDB expansion, mmCIF assemblies and writing `REMARK 350`
+back. No QVF schema, canonical kind or finding code changes.

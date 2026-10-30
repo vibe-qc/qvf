@@ -43,7 +43,7 @@ then adds a **pending GitHub Trusted Publisher** at
 | Field | Value |
 | --- | --- |
 | PyPI project name | `qvf-writer` |
-| GitHub owner | `vibe-qc` |
+| GitHub owner | `vibyverse` |
 | Repository | `qvf` |
 | Workflow filename | `publish-python.yml` |
 | Environment | `pypi` |
@@ -59,10 +59,9 @@ Pending publishers do not reserve names. See
 
 1. Freeze and qualify the exact Python candidate, including the relevant
    Python candidate checks. Preserve the existing toolkit tags and pins.
-2. Publish the clean source through the project's approved public-source
-   publication process. Verify that the public snapshot includes this
-   workflow and the exact candidate source. Do not push private development
-   ancestry to the public repository.
+2. Land the clean candidate source on the canonical GitHub repository.
+   Verify that the candidate includes this workflow and the exact qualified
+   source. Do not push private pre-migration ancestry to the public repository.
 3. Create the immutable public package tag `python-v0.7.0rc1` at that verified
    snapshot. This is a Python distribution tag, not a replacement toolkit tag.
 4. Manually run **Python package release** from the trusted default branch,

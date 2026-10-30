@@ -61,6 +61,11 @@ struct BiomoleculeSecondaryStructure {
     std::string chain{};
     int64_t start_seq{};
     int64_t end_seq{};
+    std::optional<std::string> start_insertion_code{};
+    std::optional<std::string> end_insertion_code{};
+    std::optional<int64_t> helix_class{};
+    std::optional<std::string> sheet_id{};
+    std::optional<int64_t> strand{};
     std::map<std::string, Json> extra;
     Json to_json() const {
         Json out = codec::Value<std::map<std::string, Json>>::encode(extra);
@@ -72,6 +77,16 @@ struct BiomoleculeSecondaryStructure {
         codec::put(out, "start_seq", start_seq);
         if (out.has("end_seq")) throw std::invalid_argument("use the typed field, not extra: end_seq");
         codec::put(out, "end_seq", end_seq);
+        if (out.has("start_insertion_code")) throw std::invalid_argument("use the typed field, not extra: start_insertion_code");
+        if (start_insertion_code) codec::put(out, "start_insertion_code", *start_insertion_code);
+        if (out.has("end_insertion_code")) throw std::invalid_argument("use the typed field, not extra: end_insertion_code");
+        if (end_insertion_code) codec::put(out, "end_insertion_code", *end_insertion_code);
+        if (out.has("helix_class")) throw std::invalid_argument("use the typed field, not extra: helix_class");
+        if (helix_class) codec::put(out, "helix_class", *helix_class);
+        if (out.has("sheet_id")) throw std::invalid_argument("use the typed field, not extra: sheet_id");
+        if (sheet_id) codec::put(out, "sheet_id", *sheet_id);
+        if (out.has("strand")) throw std::invalid_argument("use the typed field, not extra: strand");
+        if (strand) codec::put(out, "strand", *strand);
         return out;
     }
     static BiomoleculeSecondaryStructure from_json(const Json& j) {
@@ -81,7 +96,12 @@ struct BiomoleculeSecondaryStructure {
         out.chain = codec::get<std::string>(j, "chain");
         out.start_seq = codec::get<int64_t>(j, "start_seq");
         out.end_seq = codec::get<int64_t>(j, "end_seq");
-        for (const auto& kv : j.items()) if (kv.first != "type" && kv.first != "chain" && kv.first != "start_seq" && kv.first != "end_seq") out.extra[kv.first] = kv.second;
+        if (j.has("start_insertion_code")) out.start_insertion_code.emplace(codec::get<std::string>(j, "start_insertion_code"));
+        if (j.has("end_insertion_code")) out.end_insertion_code.emplace(codec::get<std::string>(j, "end_insertion_code"));
+        if (j.has("helix_class")) out.helix_class.emplace(codec::get<int64_t>(j, "helix_class"));
+        if (j.has("sheet_id")) out.sheet_id.emplace(codec::get<std::string>(j, "sheet_id"));
+        if (j.has("strand")) out.strand.emplace(codec::get<int64_t>(j, "strand"));
+        for (const auto& kv : j.items()) if (kv.first != "type" && kv.first != "chain" && kv.first != "start_seq" && kv.first != "end_seq" && kv.first != "start_insertion_code" && kv.first != "end_insertion_code" && kv.first != "helix_class" && kv.first != "sheet_id" && kv.first != "strand") out.extra[kv.first] = kv.second;
         return out;
     }
 };
